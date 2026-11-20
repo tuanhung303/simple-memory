@@ -1,0 +1,869 @@
+//! Each pattern runs on the regex crate, which has no backtrack limit to hit and no lookaround.
+//! Every lookaround of Python's pattern is a check in code, and each one is exact because it
+//! looks at one char or a fixed-length text (argued at each pattern below):
+//! - A lookbehind on one char class goes into the regex as `(?:\A|[^X])`; the core of each such
+//!   pattern starts with a char of X, so the core start is the match start (`\A`) or one char on.
+//! - `\b` before a word char (`\bBearer`, `\bsig=`, ...) is `(?<!\w)`, with Python's `\w` from
+//!   `py::str`, and `\s` is Python's `\s`.
+//! - re.IGNORECASE letters are sre's sets (`py::str::ci_chars`): `i` also matches U+0130 and
+//!   U+0131, `k` U+212A, `s` U+017F. A pattern that matches less than Python's leaks a secret.
+//! - key_value and the `<private>` tag are scanners: Python's backtracking over them is
+//!   deterministic once the spans are fixed (see `key_value_find`), and a scan is linear where
+//!   Python's search is quadratic on a long run of key chars.
+
+use std::sync::LazyLock;
+
+use indexmap::IndexMap;
+use regex::Regex;
+
+use crate::core::item::{Item, compute_content_hash};
+use crate::core::refs::{RefsArg, extract_refs, split_refs};
+use crate::py::str::{S_INNER, W_INNER, ci_chars, ci_set, is_word, isspace};
+
+/// Counts per kind, in the order Python's dict gets them.
+pub type Counts = IndexMap<String, i64>;
+
+pub const PRIVATE_MARK: &str = "[REDACTED:private]";
+
+fn char_at(t: &str, i: usize) -> Option<char> {
+    t[i..].chars().next()
+}
+
+/// The end of the run of chars that pass `pred` from `i`, and its length in chars.
+fn run(t: &str, i: usize, pred: impl Fn(char) -> bool) -> (usize, usize) {
+    let mut n = 0;
+    for (off, c) in t[i..].char_indices() {
+        if !pred(c) {
+            return (i + off, n);
+        }
+        n += 1;
+    }
+    (t.len(), n)
+}
+
+/// An ASCII literal under re.IGNORECASE, one sre set per char.
+fn ci_seq(lit: &str) -> Vec<Vec<char>> {
+    lit.chars().map(ci_chars).collect()
+}
+
+/// Does `t` at `i` start with the IGNORECASE literal `seq`? Gives the end.
+fn ci_at(t: &str, i: usize, seq: &[Vec<char>]) -> Option<usize> {
+    let mut it = t[i..].char_indices();
+    for set in seq {
+        let (_, c) = it.next()?;
+        if !set.contains(&c) {
+            return None;
+        }
+    }
+    Some(it.next().map_or(t.len(), |(off, _)| i + off))
+}
+
+/// A pattern `(?<![X])core`: the regex is `(?:\A|[^X])(?:core)`.
+struct Guarded {
+    re: Regex,
+    /// X, the class of the lookbehind. The first char of every core match is in X.
+    in_x: fn(char) -> bool,
+    /// For a fixed-length core with a trailing `(?![Y])`: a char of Y.
+    in_y: Option<fn(char) -> bool>,
+}
+
+fn alnum(c: char) -> bool {
+    c.is_ascii_alphanumeric()
+}
+
+fn alnum_us_dash(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_' || c == '-'
+}
+
+impl Guarded {
+    fn new(
+        x_inner: &str,
+        core: &str,
+        in_x: fn(char) -> bool,
+        in_y: Option<fn(char) -> bool>,
+    ) -> Guarded {
+        let re = Regex::new(&format!("(?:\\A|[^{x_inner}])(?:{core})"))
+            .expect("redact pattern compiles");
+        Guarded { re, in_x, in_y }
+    }
+
+    /// The first match whose core starts at or after `pos`.
+    fn find(&self, t: &str, pos: usize) -> Option<(usize, usize)> {
+        // the char before `pos` is the lookbehind's char for a core at `pos`, so the regex may
+        // consume it; a core cannot start before `pos`, since its own lookbehind char would sit
+        // before the search start (`\A` matches only at 0)
+        let mut from = t[..pos]
+            .chars()
+            .next_back()
+            .map_or(0, |c| pos - c.len_utf8());
+        loop {
+            let m = self.re.find_at(t, from)?;
+            let first = char_at(t, m.start())?;
+            let s = if m.start() == 0 && (self.in_x)(first) {
+                0
+            } else {
+                m.start() + first.len_utf8()
+            };
+            let e = m.end();
+            match (self.in_y, char_at(t, e)) {
+                // a fixed-length core has no shorter match at `s`; Python goes on at `s` + 1, and a
+                // core there would have the X char at `s` before it, so the search resumes past it
+                (Some(in_y), Some(next)) if in_y(next) => from = s + char_at(t, s)?.len_utf8(),
+                _ => return Some((s, e)),
+            }
+        }
+    }
+}
+
+enum Matcher {
+    Plain(Regex),
+    Guarded(Guarded),
+    KeyValue,
+}
+
+impl Matcher {
+    fn find(&self, t: &str, pos: usize) -> Option<(usize, usize)> {
+        match self {
+            Matcher::Plain(re) => re.find_at(t, pos).map(|m| (m.start(), m.end())),
+            Matcher::Guarded(g) => g.find(t, pos),
+            Matcher::KeyValue => key_value_find(t, pos),
+        }
+    }
+}
+
+/// The patterns in Python's order. A trailing `(?![X])` after a greedy run of a class that holds
+/// X always holds at the run's end and is left out (github_token, slack_token, sk_key, jwt);
+/// after a fixed-length core it is `in_y` (aws_key, google_api_key). bearer's
+/// `(?!\[REDACTED:)` is left out: `[` is not in the value class, so the value fails there anyway.
+static SECRET_PATTERNS: LazyLock<Vec<(&'static str, Matcher)>> = LazyLock::new(|| {
+    let w = &*W_INNER;
+    let s_inner = &*S_INNER;
+    let an = "A-Za-z0-9";
+    let word = |core: &str| Matcher::Guarded(Guarded::new(w, core, is_word, None));
+    vec![
+        (
+            "private_key",
+            Matcher::Plain(
+                Regex::new("(?s)-----BEGIN [A-Z0-9 _-]*PRIVATE KEY-----.*?-----END [A-Z0-9 _-]*PRIVATE KEY-----")
+                    .expect("redact pattern compiles"),
+            ),
+        ),
+        ("aws_key", Matcher::Guarded(Guarded::new(an, "AKIA[0-9A-Z]{16}", alnum, Some(alnum)))),
+        (
+            "github_token",
+            Matcher::Guarded(Guarded::new(an, "gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{20,}", alnum, None)),
+        ),
+        ("slack_token", Matcher::Guarded(Guarded::new(an, "xox[abposr]-[A-Za-z0-9-]{10,}", alnum, None))),
+        ("google_api_key", Matcher::Guarded(Guarded::new(an, "AIza[0-9A-Za-z_-]{35}", alnum, Some(alnum)))),
+        (
+            "sk_key",
+            Matcher::Guarded(Guarded::new("A-Za-z0-9_\\-", "sk-(?:ant-|proj-)?[A-Za-z0-9_-]{32,}", alnum_us_dash, None)),
+        ),
+        (
+            "jwt",
+            Matcher::Guarded(Guarded::new(
+                an,
+                "eyJ[A-Za-z0-9_-]{5,}\\.eyJ[A-Za-z0-9_-]{5,}\\.[A-Za-z0-9_-]{5,}",
+                alnum,
+                None,
+            )),
+        ),
+        ("bearer", word(&format!("Bearer[{s_inner}]+[A-Za-z0-9._~+/=-]{{8,}}"))),
+        ("url_credentials", word(&format!("[A-Za-z][A-Za-z0-9+.-]*://[^{s_inner}/:@\"']+:[^{s_inner}/@\"']+@"))),
+        ("azure_sas", word("sig=[A-Za-z0-9%+/=_-]{16,}")),
+        ("azure_key", word("(?:AccountKey|SharedAccessKey)=[A-Za-z0-9+/=]{16,}")),
+        ("key_value", Matcher::KeyValue),
+    ]
+});
+
+// ---------------------------------------------------------------- key_value
+
+/// `[A-Za-z0-9_.-]` under re.IGNORECASE (adds U+0130, U+0131, U+017F, U+212A).
+static KEY_SET: LazyLock<Vec<char>> = LazyLock::new(|| {
+    ci_set(
+        ('A'..='Z')
+            .chain('a'..='z')
+            .chain('0'..='9')
+            .chain(['_', '.', '-']),
+    )
+});
+
+fn key_char(c: char) -> bool {
+    if c.is_ascii() {
+        c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-')
+    } else {
+        KEY_SET.binary_search(&c).is_ok()
+    }
+}
+
+/// `(?:password|...|apikey)(?:_key|key|_value|s)?` as IGNORECASE char sets, every word with every
+/// suffix (and none).
+static KEY_TAILS: LazyLock<Vec<Vec<Vec<char>>>> = LazyLock::new(|| {
+    let words = ["password", "passwd", "secret", "token", "api_key", "apikey"];
+    let suffixes = ["", "_key", "key", "_value", "s"];
+    words
+        .iter()
+        .flat_map(|w| suffixes.iter().map(move |s| ci_seq(&format!("{w}{s}"))))
+        .collect()
+});
+
+/// `\[REDACTED:` under re.IGNORECASE.
+static REDACTED_SEQ: LazyLock<Vec<Vec<char>>> = LazyLock::new(|| ci_seq("[REDACTED:"));
+
+/// `_V`: `[^\s"'`\],;}{]` (no char in it has a case).
+fn is_v(c: char) -> bool {
+    !isspace(c) && !matches!(c, '"' | '\'' | '`' | ']' | ',' | ';' | '}' | '{')
+}
+
+/// `_BARE_V`: `_V` without `:` and `/`.
+fn is_bare_v(c: char) -> bool {
+    is_v(c) && c != ':' && c != '/'
+}
+
+fn skip_space(t: &str, i: usize) -> usize {
+    run(t, i, isspace).0
+}
+
+/// Does the key run end with a key word and an optional suffix?
+fn key_tail(seg: &str) -> bool {
+    let tail: Vec<char> = seg.chars().rev().take(14).collect();
+    KEY_TAILS.iter().any(|seq| {
+        seq.len() <= tail.len() && seq.iter().rev().zip(&tail).all(|(set, c)| set.contains(c))
+    })
+}
+
+/// `(?!\[REDACTED:)(?![0-9]+(?!V))V{8,}["']?` at `w`: the end of the match.
+fn kv_value(t: &str, w: usize) -> Option<usize> {
+    if ci_at(t, w, &REDACTED_SEQ).is_some() {
+        return None;
+    }
+    // `[0-9]+(?!V)`: digits are V, so only the longest digit run can end before a non-V char
+    let (d_end, digits) = run(t, w, |c| c.is_ascii_digit());
+    if digits > 0 && !char_at(t, d_end).is_some_and(is_v) {
+        return None;
+    }
+    let (end, n) = run(t, w, is_v);
+    if n < 8 {
+        return None;
+    }
+    // V holds no quote, so the greedy run is followed by the optional quote or by nothing
+    Some(end + usize::from(matches!(t.as_bytes().get(end), Some(b'"' | b'\''))))
+}
+
+/// `_BARE_COLON` after its `:`, at `i`: the end of the match.
+fn kv_bare(t: &str, i: usize) -> Option<usize> {
+    let b = t.as_bytes();
+    // a shorter `[ \t]*`, or no backtick, leaves a space or a backtick where a BV char must be
+    let mut w = run(t, i, |c| c == ' ' || c == '\t').0;
+    if b.get(w) == Some(&b'`') {
+        w += 1;
+    }
+    if ci_at(t, w, &REDACTED_SEQ).is_some() {
+        return None;
+    }
+    // `(?!m_[0-9A-Z]{26}(?!V))`, case-sensitive
+    if b[w..].starts_with(b"m_")
+        && b.len() >= w + 28
+        && b[w + 2..w + 28]
+            .iter()
+            .all(|x| x.is_ascii_digit() || x.is_ascii_uppercase())
+        && !char_at(t, w + 28).is_some_and(is_v)
+    {
+        return None;
+    }
+    // `(?=BV*[0-9])` and the upper and lower ones: digits and ASCII letters are BV, so each
+    // holds when the BV run from `w` has one
+    let (mut digit, mut upper, mut lower, mut n) = (false, false, false, 0usize);
+    let mut end = t.len();
+    for (off, c) in t[w..].char_indices() {
+        if !is_bare_v(c) {
+            end = w + off;
+            break;
+        }
+        digit |= c.is_ascii_digit();
+        upper |= c.is_ascii_uppercase();
+        lower |= c.is_ascii_lowercase();
+        n += 1;
+    }
+    // `BV{12,}(?!V|:)`: a shorter run is followed by a BV char, which is V, so only the longest
+    // run can pass, and a char after it that is not BV is V only when it is `:` or `/`
+    if n < 12 || !(digit && upper && lower) || matches!(b.get(end), Some(b':' | b'/')) {
+        return None;
+    }
+    Some(end)
+}
+
+/// The value part after the key run that ends at `e`: the end of the match. Each choice here is
+/// forced: a quote after the key is taken (else no `:` or `=` follows), and `\s*` is greedy
+/// (else a space stands where `:` or `=` must be).
+fn kv_after_key(t: &str, e: usize) -> Option<usize> {
+    let b = t.as_bytes();
+    let q = e + usize::from(matches!(b.get(e), Some(b'"' | b'\'')));
+    let v = skip_space(t, q);
+    match b.get(v) {
+        Some(b':') => {
+            let w = skip_space(t, v + 1);
+            let quoted = if matches!(b.get(w), Some(b'"' | b'\'')) {
+                kv_value(t, w + 1)
+            } else {
+                None
+            };
+            quoted.or_else(|| kv_bare(t, v + 1))
+        }
+        Some(b'=') => {
+            let w = skip_space(t, v + 1);
+            kv_value(
+                t,
+                w + usize::from(matches!(b.get(w), Some(b'"' | b'\'' | b'`'))),
+            )
+        }
+        _ => None,
+    }
+}
+
+/// The first key_value match from `pos`.
+///
+/// `_KEY` is `["']?K*(?:word)(?:suffix)?(?!K)["']?` with K the key class, and word and suffix
+/// are K chars, so from a start the key covers the K run through its end `e` whatever split K*
+/// takes, and all that follows depends on `e` alone. So a run matches from its first char when
+/// it ends with a word and suffix and the value part matches after `e`, from a quote just before
+/// it the same, and from any later char of the run never. The scan visits each run once.
+fn key_value_find(t: &str, pos: usize) -> Option<(usize, usize)> {
+    let b = t.as_bytes();
+    let mut i = pos;
+    while i < t.len() {
+        let (r0, _) = run(t, i, |c| !key_char(c));
+        if r0 == t.len() {
+            return None;
+        }
+        let (e, _) = run(t, r0, key_char);
+        if key_tail(&t[r0..e])
+            && let Some(end) = kv_after_key(t, e)
+        {
+            let start = if r0 > pos && matches!(b[r0 - 1], b'"' | b'\'') {
+                r0 - 1
+            } else {
+                r0
+            };
+            return Some((start, end));
+        }
+        i = e;
+    }
+    None
+}
+
+// ---------------------------------------------------------------- private blocks
+
+/// `private` under re.IGNORECASE.
+static PRIVATE_SEQ: LazyLock<Vec<Vec<char>>> = LazyLock::new(|| ci_seq("private"));
+
+/// One `<private>` tag: its byte span and whether it closes.
+struct Tag {
+    start: usize,
+    end: usize,
+    close: bool,
+}
+
+/// `_PRIVATE_TAG_RE.finditer`: `<(/?)private\b[^>]*>` under re.IGNORECASE. `\b` after `e` is
+/// "no word char next", and `[^>]*>` ends at the first `>`.
+fn private_tags(text: &str) -> Vec<Tag> {
+    let b = text.as_bytes();
+    let mut out = Vec::new();
+    let mut pos = 0;
+    while let Some(off) = text[pos..].find('<') {
+        let start = pos + off;
+        pos = start + 1;
+        let close = b.get(pos) == Some(&b'/');
+        let Some(k) = ci_at(text, pos + usize::from(close), &PRIVATE_SEQ) else {
+            continue;
+        };
+        if char_at(text, k).is_some_and(is_word) {
+            continue;
+        }
+        // no `>` after this tag means none after any later `<` either
+        let Some(gt) = text[k..].find('>') else { break };
+        let end = k + gt + 1;
+        out.push(Tag { start, end, close });
+        pos = end;
+    }
+    out
+}
+
+/// `_strip_private`: drop each `<private>` block through the close tag that balances it.
+fn strip_private(
+    text: &str,
+    mut counts: Option<&mut Counts>,
+    mut removed: Option<&mut Vec<String>>,
+) -> String {
+    let mut out = String::new();
+    let mut pos = 0;
+    let tags = private_tags(text);
+    let mut i = 0;
+    while i < tags.len() {
+        if tags[i].close {
+            i += 1;
+            continue;
+        }
+        let mut depth: i64 = 0;
+        let mut end_idx = None;
+        let mut last_close = None;
+        for (j, tag) in tags.iter().enumerate().skip(i) {
+            depth += if tag.close { -1 } else { 1 };
+            if tag.close {
+                last_close = Some(j);
+            }
+            if depth == 0 {
+                end_idx = Some(j);
+                break;
+            }
+        }
+        let Some(end_idx) = end_idx.or(last_close) else {
+            break;
+        };
+        out.push_str(&text[pos..tags[i].start]);
+        out.push_str(PRIVATE_MARK);
+        if let Some(r) = removed.as_deref_mut() {
+            r.push(text[tags[i].start..tags[end_idx].end].to_string());
+        }
+        pos = tags[end_idx].end;
+        if let Some(c) = counts.as_deref_mut() {
+            *c.entry("private".into()).or_insert(0) += 1;
+        }
+        i = end_idx + 1;
+    }
+    out.push_str(&text[pos..]);
+    out
+}
+
+/// `pat.subn(repl, text)` for a literal replacement.
+fn subn(pat: &Matcher, repl: &str, text: &str) -> (String, i64) {
+    let mut out = String::new();
+    let mut last = 0;
+    let mut n = 0;
+    // no pattern matches empty, so the next search starts at the end of the last match
+    while let Some((s, e)) = pat.find(text, last) {
+        out.push_str(&text[last..s]);
+        out.push_str(repl);
+        last = e;
+        n += 1;
+    }
+    out.push_str(&text[last..]);
+    (out, n)
+}
+
+/// `redact_text(text, counts, removed)`.
+pub fn redact_text(
+    text: &str,
+    mut counts: Option<&mut Counts>,
+    removed: Option<&mut Vec<String>>,
+) -> String {
+    if text.is_empty() {
+        return String::new();
+    }
+    let mut out = strip_private(text, counts.as_deref_mut(), removed);
+    for (kind, pat) in SECRET_PATTERNS.iter() {
+        let (next, n) = subn(pat, &format!("[REDACTED:{kind}]"), &out);
+        out = next;
+        if n != 0
+            && let Some(c) = counts.as_deref_mut()
+        {
+            *c.entry((*kind).into()).or_insert(0) += n;
+        }
+    }
+    out
+}
+
+/// `redact_for_store(item, counts)`: title, body and evidence redacted, and refs that are
+/// secret-shaped or came only from a removed private block dropped.
+pub fn redact_for_store(item: &Item, mut counts: Option<&mut Counts>) -> Item {
+    let mut removed: Vec<String> = Vec::new();
+    let title = redact_text(&item.title, counts.as_deref_mut(), Some(&mut removed));
+    let body = redact_text(&item.body, counts.as_deref_mut(), Some(&mut removed));
+    let evidence = redact_text(&item.evidence, counts, Some(&mut removed));
+    let joined = removed.join("\n");
+    let kept_text = format!("{title}\n{body}\n{evidence}");
+    let in_kept: std::collections::HashSet<String> =
+        extract_refs(Some(&kept_text)).into_iter().collect();
+    let private_refs: std::collections::HashSet<String> = extract_refs(Some(&joined))
+        .into_iter()
+        .filter(|r| !in_kept.contains(r))
+        .collect();
+    let all_refs = split_refs(Some(&RefsArg::Str(&item.refs)));
+    let kept: Vec<&String> = all_refs
+        .iter()
+        .filter(|r| !private_refs.contains(*r) && redact_text(r, None, None) == **r)
+        .collect();
+    let refs = if kept.len() != all_refs.len() {
+        kept.iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>()
+            .join(" ")
+    } else {
+        item.refs.clone()
+    };
+    if title == item.title && body == item.body && evidence == item.evidence && refs == item.refs {
+        return item.clone();
+    }
+    let content_hash = if body != item.body {
+        compute_content_hash(&body)
+    } else {
+        item.content_hash.clone()
+    };
+    // dataclasses.replace runs __init__ again, so __post_init__ runs on the new fields
+    Item {
+        title,
+        body,
+        evidence,
+        refs,
+        content_hash,
+        ..item.clone()
+    }
+    .post_init()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Made-up values in the shape each kind has; none is a real credential or id.
+    fn fake_sk() -> String {
+        format!("sk-ant-api03-{}", "Abc123xyz_".repeat(4))
+    }
+    fn fake_gh() -> String {
+        format!("ghp_{}", "a1B2c3D4e5".repeat(4))
+    }
+    const FAKE_ULID_ID: &str = "m_01ABCDEFGHJKMNPQRSTVWXYZ00";
+    const FAKE_SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    fn counted(text: &str) -> (String, Counts) {
+        let mut c = Counts::new();
+        let out = redact_text(text, Some(&mut c), None);
+        (out, c)
+    }
+
+    fn counts(pairs: &[(&str, i64)]) -> Counts {
+        pairs.iter().map(|(k, v)| ((*k).to_string(), *v)).collect()
+    }
+
+    #[test]
+    fn replaces_keys_and_private_blocks() {
+        let (out, c) = counted(&format!(
+            "key {} and {}; <private>client figure 42</private> end",
+            fake_sk(),
+            fake_gh()
+        ));
+        assert_eq!(
+            out,
+            "key [REDACTED:sk_key] and [REDACTED:github_token]; [REDACTED:private] end"
+        );
+        assert_eq!(
+            c,
+            counts(&[("private", 1), ("sk_key", 1), ("github_token", 1)])
+        );
+        // dict order: private first, then the pattern order
+        assert_eq!(
+            c.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["private", "github_token", "sk_key"]
+        );
+    }
+
+    #[test]
+    fn leaves_ids_shas_task_ids_and_refs() {
+        let text = format!(
+            "see {FAKE_ULID_ID} at {FAKE_SHA} and 1a2b3c4; task:20261101-090000-aabbccdd-redact-test-1a2b; \
+             refs R5 D9 src/simple_memory/store/items.py:120 tokens=4 sk-short"
+        );
+        assert_eq!(counted(&text), (text.clone(), Counts::new()));
+    }
+
+    #[test]
+    fn private_blocks_nested_unclosed_and_case() {
+        let r = |t: &str| redact_text(t, None, None);
+        assert_eq!(
+            r("a <PRIVATE note='x'>b</Private> c"),
+            "a [REDACTED:private] c"
+        );
+        assert_eq!(
+            r("a <private>b<private>c</private>d</private> e"),
+            "a [REDACTED:private] e"
+        );
+        assert_eq!(
+            r("a <private>b<private>c</private>d"),
+            "a [REDACTED:private]d"
+        );
+        assert_eq!(r("explain the <private> tag"), "explain the <private> tag");
+        assert_eq!(r("a </private> b"), "a </private> b");
+        assert_eq!(r(""), "");
+        // Python's re.I: U+0130 and U+0131 match i; `private\b` needs a non-word char after
+        assert_eq!(r("a <PRİVATE>b</prıvate> c"), "a [REDACTED:private] c");
+        assert_eq!(
+            r("a <privates>b</privates> c"),
+            "a <privates>b</privates> c"
+        );
+        let mut removed = Vec::new();
+        redact_text(
+            "x <private>p1</private> y <private>p2</private>",
+            None,
+            Some(&mut removed),
+        );
+        assert_eq!(removed, ["<private>p1</private>", "<private>p2</private>"]);
+    }
+
+    #[test]
+    fn colon_sas_and_connection_string_forms() {
+        let (out, c) = counted(
+            "password: Hunter2Secret99\napi_key: AbCdEf1234567890xyz\nAZURE_CLIENT_SECRET: Abc8Q~def.Ghij-Klmn_Opqr12\n",
+        );
+        assert_eq!(
+            out,
+            "[REDACTED:key_value]\n[REDACTED:key_value]\n[REDACTED:key_value]\n"
+        );
+        assert_eq!(c, counts(&[("key_value", 3)]));
+        assert_eq!(
+            redact_text(
+                "use `password: Hunter2Secret99` or `token=AbCdEf1234567890xyz`",
+                None,
+                None
+            ),
+            "use `[REDACTED:key_value]` or `[REDACTED:key_value]`"
+        );
+        assert_eq!(
+            redact_text(
+                "https://acct.blob.core.windows.net/c/f.csv?sv=2022-11-02&sp=r&sig=AbCdEfGh1234%2BijKlMnOp%3D",
+                None,
+                None
+            ),
+            "https://acct.blob.core.windows.net/c/f.csv?sv=2022-11-02&sp=r&[REDACTED:azure_sas]"
+        );
+        assert_eq!(
+            redact_text(
+                "DefaultEndpointsProtocol=https;AccountName=acct;AccountKey=AbCdEf1234567890ghIJ+/kl==;EndpointSuffix=core.windows.net",
+                None,
+                None
+            ),
+            "DefaultEndpointsProtocol=https;AccountName=acct;[REDACTED:azure_key];EndpointSuffix=core.windows.net"
+        );
+        assert_eq!(
+            redact_text(
+                "Endpoint=sb://ns.example.invalid/;SharedAccessKeyName=Root;SharedAccessKey=AbCdEf1234567890ghIJ+/kl==",
+                None,
+                None
+            ),
+            "Endpoint=sb://ns.example.invalid/;SharedAccessKeyName=Root;[REDACTED:azure_key]"
+        );
+    }
+
+    #[test]
+    fn ignorecase_and_python_classes_catch_what_the_regex_crate_would_miss() {
+        // each is redacted by Python 3.15.1; a plain [iI] class would leave the first two, and the
+        // regex crate's \s would leave the Bearer one
+        assert_eq!(
+            redact_text("APİ_KEY=Zx9Qw8Er7Ty6", None, None),
+            "[REDACTED:key_value]"
+        );
+        assert_eq!(
+            redact_text("apı_key=Zx9Qw8Er7Ty6", None, None),
+            "[REDACTED:key_value]"
+        );
+        assert_eq!(
+            redact_text("PAſſWORD: Hunter2Secret99", None, None),
+            "[REDACTED:key_value]"
+        );
+        assert_eq!(
+            redact_text("to\u{212a}en=Zx9Qw8Er7Ty6", None, None),
+            "[REDACTED:key_value]"
+        );
+        // U+0130 is in the key's [A-Za-z0-9_.-] under re.I: it joins the key before, and it
+        // blocks the key's end after (Python leaves the second one)
+        assert_eq!(
+            redact_text("\u{130}_password=Zx9Qw8Er7Ty6", None, None),
+            "[REDACTED:key_value]"
+        );
+        assert_eq!(
+            redact_text("pa\u{17f}\u{17f}word\u{130}=Zx9Qw8Er7Ty6", None, None),
+            "pa\u{17f}\u{17f}word\u{130}=Zx9Qw8Er7Ty6"
+        );
+        // \x1c is \s to Python between the key and `=`
+        assert_eq!(
+            redact_text("token\x1c=Zx9Qw8Er7Ty6", None, None),
+            "[REDACTED:key_value]"
+        );
+        // \x1c is whitespace to Python's \s
+        assert_eq!(
+            redact_text("Bearer\x1cAbCdEf123456", None, None),
+            "[REDACTED:bearer]"
+        );
+        // [redacted: counts as already redacted under re.I; Bearer's check is case-sensitive
+        assert_eq!(
+            redact_text("toKen=[redacted:x]Zx9Qw8Er7Ty6", None, None),
+            "toKen=[redacted:x]Zx9Qw8Er7Ty6"
+        );
+        // ² is a word char, so `\bBearer` does not start after it
+        assert_eq!(
+            redact_text("\u{b2}Bearer AbCdEf123456", None, None),
+            "\u{b2}Bearer AbCdEf123456"
+        );
+    }
+
+    #[test]
+    fn leaves_digit_values_prose_timestamps_ids_and_paths() {
+        let text = "max_tokens=32000000 \"tokens\": 1200 max_tokens: 4500000000 \"max_tokens\": \"64000000\"\n\
+                    password: requirements are listed below\n\
+                    token: 2026-11-04T03:49:00+00:00\n\
+                    design=signature1234567890 sigma=AbCdEf1234567890\n\
+                    set `max_tokens=32000000` and `tokens: 1200`; color tokens: `#1a2b3c`\n\
+                    tasklog token: 20261029-145946-9ba58a1c\n\
+                    secrets: s3cr3t/path/file.yaml\n\
+                    tokens: claude-haiku-4-5\n\
+                    secret: 1Password vault\n\
+                    secrets: Kv2026/Prod/AppConfig.yaml\n\
+                    secret: KeyVaultReference\n\
+                    token: m_01ABCDEFGHJKMNPQRSTVWXYZ00\n\
+                    token: 01ABCDEFGHJKMNPQRSTVWXYZ00\n\
+                    token: 12345678-abcd-ef01-2345-6789abcdef01\n\
+                    token: 12345678-ABCD-EF01-2345-6789ABCDEF01\n";
+        assert_eq!(counted(text), (text.to_string(), Counts::new()));
+        assert_eq!(
+            redact_text("token: \"20261029-145946-9ba58a1c\"", None, None),
+            "[REDACTED:key_value]"
+        );
+        assert_eq!(
+            redact_text("tokens=claude-haiku-4-5", None, None),
+            "[REDACTED:key_value]"
+        );
+    }
+
+    #[test]
+    fn runs_over_a_million_chars_redact_as_python_does() {
+        // fancy-regex's 1M-entry backtrack stack panicked on each of these; Python 3.15.1 gives
+        // the right side (review w23-core block row)
+        let r = |t: &str| redact_text(t, None, None);
+        assert_eq!(
+            r(&format!("ghp_{}", "a".repeat(1_200_000))),
+            "[REDACTED:github_token]"
+        );
+        assert_eq!(
+            r(&format!("sk-{}", "a".repeat(1_200_000))),
+            "[REDACTED:sk_key]"
+        );
+        assert_eq!(
+            r(&format!("token: {}", "aA1".repeat(400_000))),
+            "[REDACTED:key_value]"
+        );
+        assert_eq!(
+            r(&format!("password={}x", "1".repeat(1_200_000))),
+            "[REDACTED:key_value]"
+        );
+        assert_eq!(
+            r(&format!("<private>{}</private>", "a".repeat(1_200_000))),
+            "[REDACTED:private]"
+        );
+        let open = format!("<private{}", "a".repeat(1_200_000));
+        assert_eq!(r(&open), open);
+        // a long key run with no value: Python's search is quadratic here, the scan is not
+        let run = format!("token {}", "a1".repeat(600_000));
+        assert_eq!(r(&run), run);
+    }
+
+    #[test]
+    fn lookarounds_checked_in_code_match_python() {
+        // expected values from Python 3.15.1 redact_text
+        let r = |t: &str| redact_text(t, None, None);
+        // a fixed-length core with an alnum after it is no match at that start
+        assert_eq!(r("AKIAABCDEFGHIJKLMNOPQ"), "AKIAABCDEFGHIJKLMNOPQ");
+        assert_eq!(r("AKIAAKIAABCDEFGHIJKLMNOP"), "AKIAAKIAABCDEFGHIJKLMNOP");
+        assert_eq!(
+            r("xAKIAABCDEFGHIJKLMNOP AKIAABCDEFGHIJKLMNOP"),
+            "xAKIAABCDEFGHIJKLMNOP [REDACTED:aws_key]"
+        );
+        assert_eq!(
+            r(&format!("AIza{}b", "a".repeat(35))),
+            format!("AIza{}b", "a".repeat(35))
+        );
+        assert_eq!(
+            r(&format!("-AIza{}", "a".repeat(35))),
+            "-[REDACTED:google_api_key]"
+        );
+        // the lookbehind char may sit inside a run: `sk-` after `-` is no start, after the run start is
+        assert_eq!(r(&format!("sk-sk-{}", "a".repeat(40))), "[REDACTED:sk_key]");
+        assert_eq!(
+            r(&format!("xsk-{}", "a".repeat(40))),
+            format!("xsk-{}", "a".repeat(40))
+        );
+        // key_value: a quote before the run starts the match; a key mid-run takes the whole run
+        assert_eq!(r("\"token\": \"abcdefgh1\""), "[REDACTED:key_value]");
+        assert_eq!(r("xxpassword=Zx9Qw8Er7Ty6"), "[REDACTED:key_value]");
+        assert_eq!(
+            r("xpassword_valuex=Zx9Qw8Er7Ty6"),
+            "xpassword_valuex=Zx9Qw8Er7Ty6"
+        );
+        assert_eq!(r("'apikey'='abcdefgh'tail"), "[REDACTED:key_value]tail");
+        // bare colon: an m_ id of exactly 26, a `/` or `:` after, and fewer than 12 chars stay
+        assert_eq!(
+            r("secret: m_01ABCDEFGHJKMNPQRSTVWXYZ00"),
+            "secret: m_01ABCDEFGHJKMNPQRSTVWXYZ00"
+        );
+        assert_eq!(
+            r("secret: m_01ABCDEFGHJKMNPQRSTVWXYZ00X"),
+            "[REDACTED:key_value]"
+        );
+        assert_eq!(r("token: Ab1cdefghijk/"), "token: Ab1cdefghijk/");
+        assert_eq!(r("token: Ab1cdefghijk:"), "token: Ab1cdefghijk:");
+        assert_eq!(r("token: Ab1cdefghij"), "token: Ab1cdefghij");
+        assert_eq!(r("token=12345678 "), "token=12345678 ");
+        assert_eq!(r("token=12345678x"), "[REDACTED:key_value]");
+        assert_eq!(r("Bearer  [REDACTED:x]"), "Bearer  [REDACTED:x]");
+        // `private\b` and a tag with no `>` after it
+        assert_eq!(
+            r("a <privatex>b</private> <private>c</private>"),
+            "a <privatex>b</private> [REDACTED:private]"
+        );
+        assert_eq!(r("a <private b </private>"), "a <private b </private>");
+        assert_eq!(r("<privateaaaaaaaaaa"), "<privateaaaaaaaaaa");
+    }
+
+    #[test]
+    fn redact_for_store_drops_private_and_secret_refs_and_rehashes() {
+        let item = Item {
+            refs: format!("docs/a.md docs/b.md {} R5", fake_gh()),
+            evidence: format!("curl -H 'Authorization: Bearer {}'", fake_sk()),
+            ..Item::bare(
+                FAKE_ULID_ID,
+                "a",
+                "fact",
+                "Title",
+                "keep docs/a.md <private>hidden docs/b.md</private>",
+                "assumed",
+            )
+        }
+        .post_init();
+        let mut c = Counts::new();
+        let out = redact_for_store(&item, Some(&mut c));
+        assert_eq!(
+            out.evidence,
+            "curl -H 'Authorization: Bearer [REDACTED:sk_key]'"
+        );
+        assert_eq!(out.body, "keep docs/a.md [REDACTED:private]");
+        assert_eq!(out.refs, "docs/a.md R5");
+        assert_eq!(
+            out.content_hash,
+            compute_content_hash("keep docs/a.md [REDACTED:private]")
+        );
+        assert_eq!(out.id, FAKE_ULID_ID);
+        assert_eq!(c, counts(&[("private", 1), ("sk_key", 1)]));
+
+        let clean = Item {
+            refs: FAKE_SHA.into(),
+            ..Item::bare("m_x", "a", "fact", "T", &format!("b {FAKE_SHA}"), "assumed")
+        }
+        .post_init();
+        assert_eq!(redact_for_store(&clean, None), clean);
+        // a redacted title alone keeps the body's hash
+        let t = Item::bare("m_y", "a", "fact", "token=Zx9Qw8Er7Ty6", "body", "assumed").post_init();
+        let out = redact_for_store(&t, None);
+        assert_eq!(
+            (out.title.as_str(), out.content_hash.as_str()),
+            ("[REDACTED:key_value]", t.content_hash.as_str())
+        );
+    }
+}

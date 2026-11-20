@@ -1,0 +1,28 @@
+{
+  "name": "simple-memory-linux-arm64",
+  "version": "0.5.0",
+  "description": "Prebuilt simple-memory (sm) binary for Linux arm64 (glibc)",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/tuanhung303/simple-memory.git"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "libc": [
+    "glibc"
+  ],
+  "preferUnplugged": true,
+  "files": [
+    "bin/sm",
+    "LICENSE",
+    "README.md"
+  ]
+}

@@ -1,0 +1,14 @@
+__pycache__/
+*.db
+*.db-wal
+*.db-shm
+rust/target/
+.DS_Store
+*.swp
+.env
+.env.*
+node_modules/
+*.tgz
+npm/.stage/
+npm/simple-memory/vendor/
+npm/platforms/*/bin/

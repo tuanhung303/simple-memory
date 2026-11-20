@@ -1,0 +1,59 @@
+name: rust
+
+on:
+  push:
+    branches: [main, ci]
+  pull_request: {}
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: rust
+    steps:
+      - uses: actions/checkout@v7
+      # rust/rust-toolchain.toml pins 1.99.1 with clippy and rustfmt; with no argument rustup installs that one
+      - run: rustup toolchain install
+      - run: cargo fmt --check
+      - run: cargo build --release --locked
+      - run: target/release/sm --version
+      # fails when the default build compiles an item only tests or the parity feature reach;
+      # it checks in target/, so the script tests below reuse its dependencies
+      - name: dead-code scan
+        run: CARGO_TARGET_DIR="$PWD/target" TMPDIR="$RUNNER_TEMP" bash ../scripts/dead_code_scan.sh .
+      # fresh temp HOME and SIMPLE_MEMORY_HOME, no claude on PATH
+      - name: smoke
+        run: TMPDIR="$RUNNER_TEMP" bash ../scripts/smoke.sh target/release/sm
+      - name: script tests
+        run: TMPDIR="$RUNNER_TEMP" bash ../scripts/test_scripts.sh
+      - name: npm wrapper tests
+        working-directory: .
+        run: node --test npm/test/npm_wrapper.test.mjs
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo clippy --all-targets --locked --features parity -- -D warnings
+      # the tests write under HOME and SIMPLE_MEMORY_HOME, so both point at a scratch folder;
+      # RUSTUP_HOME and CARGO_HOME stay on the real ones
+      - name: cargo test
+        run: |
+          scratch="$RUNNER_TEMP/sm-home"
+          mkdir -p "$scratch/.simple-memory"
+          env RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}" CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}" \
+            HOME="$scratch" SIMPLE_MEMORY_HOME="$scratch/.simple-memory" \
+            cargo test --locked --features parity --no-fail-fast
+      - name: cargo test (+05:30)
+        run: |
+          scratch="$RUNNER_TEMP/sm-home-tz"
+          mkdir -p "$scratch/.simple-memory"
+          env SM_UTC_OFFSET="+05:30" RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}" CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}" \
+            HOME="$scratch" SIMPLE_MEMORY_HOME="$scratch/.simple-memory" \
+            cargo test --locked --features parity --no-fail-fast

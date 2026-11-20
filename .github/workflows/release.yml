@@ -1,0 +1,181 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Run npm publish preflight with --dry-run and skip GitHub Release creation"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    timeout-minutes: 10
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Check staging script syntax
+        run: bash -n scripts/stage_npm.sh
+      - name: Run npm wrapper tests
+        run: node --test npm/test/npm_wrapper.test.mjs
+      - name: Verify release tag matches package versions
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          tag_ver="${GITHUB_REF_NAME#v}"
+          python3 - "$tag_ver" <<'PY'
+          import json
+          import re
+          import sys
+
+          tag_ver = sys.argv[1]
+          in_pkg = False
+          cargo_ver = None
+          with open("rust/Cargo.toml", encoding="utf-8") as f:
+              for raw in f:
+                  line = raw.strip()
+                  if line.startswith("["):
+                      in_pkg = (line == "[package]")
+                      continue
+                  if in_pkg:
+                      m = re.match(r'^version\s*=\s*"([^"]+)"', line)
+                      if m:
+                          cargo_ver = m.group(1)
+                          break
+          if cargo_ver != tag_ver:
+              sys.exit(f"tag v{tag_ver} does not match rust/Cargo.toml version {cargo_ver}")
+
+          manifests = [
+              "npm/simple-memory/package.json",
+              "npm/platforms/darwin-arm64/package.json",
+              "npm/platforms/darwin-x64/package.json",
+              "npm/platforms/linux-x64/package.json",
+              "npm/platforms/linux-arm64/package.json",
+          ]
+          for path in manifests:
+              with open(path, encoding="utf-8") as f:
+                  ver = json.load(f).get("version")
+              if ver != tag_ver:
+                  sys.exit(f"tag v{tag_ver} does not match {path} version {ver}")
+          print(f"verified release version {tag_ver}")
+          PY
+
+  build:
+    needs: validate
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: darwin-arm64
+            os: macos-latest
+            rust_target: aarch64-apple-darwin
+          - target: darwin-x64
+            os: macos-latest
+            rust_target: x86_64-apple-darwin
+          - target: linux-x64
+            os: ubuntu-22.04
+            rust_target: x86_64-unknown-linux-gnu
+          - target: linux-arm64
+            os: ubuntu-22.04
+            rust_target: aarch64-unknown-linux-gnu
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust toolchain and target
+        working-directory: rust
+        run: |
+          rustup toolchain install
+          rustup target add "${{ matrix.rust_target }}"
+      - name: Install aarch64 cross-compiler
+        if: matrix.target == 'linux-arm64'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+      # Reproducible release builds remap host build paths out of the compiled binary.
+      - name: Build release binary
+        working-directory: rust
+        env:
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+        run: |
+          export RUSTFLAGS="--remap-path-prefix=$HOME=/build --remap-path-prefix=$PWD=/src"
+          export CFLAGS="-ffile-prefix-map=$HOME=/build -ffile-prefix-map=$PWD=/src"
+          cargo build --release --locked --target "${{ matrix.rust_target }}"
+      - name: Validate binary and package archive
+        run: |
+          bin="rust/target/${{ matrix.rust_target }}/release/sm"
+          chmod 0755 "$bin"
+          bash scripts/stage_npm.sh \
+            --out "$RUNNER_TEMP/stage-check" \
+            --bin "${{ matrix.target }}=$bin" \
+            --pack \
+            --verify-pack
+          mkdir -p dist/bin
+          cp "$bin" "dist/bin/sm-${{ matrix.target }}"
+          chmod 0755 "dist/bin/sm-${{ matrix.target }}"
+          COPYFILE_DISABLE=1 tar -czf "dist/sm-${{ matrix.target }}.tar.gz" \
+            -C "rust/target/${{ matrix.rust_target }}/release" sm
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.target }}
+          path: dist/
+          retention-days: 7
+
+  publish:
+    needs: build
+    timeout-minutes: 20
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: dist
+      - name: Generate SHA256SUMS
+        working-directory: dist
+        run: |
+          sha256sum \
+            sm-darwin-arm64.tar.gz \
+            sm-darwin-x64.tar.gz \
+            sm-linux-x64.tar.gz \
+            sm-linux-arm64.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          gh release create "$tag" \
+            dist/sm-darwin-arm64.tar.gz \
+            dist/sm-darwin-x64.tar.gz \
+            dist/sm-linux-x64.tar.gz \
+            dist/sm-linux-arm64.tar.gz \
+            dist/SHA256SUMS \
+            --title "$tag" \
+            --generate-notes
+      - name: Stage, verify, and publish npm packages
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          args=(
+            --out npm/.stage
+            --bin "darwin-arm64=dist/bin/sm-darwin-arm64"
+            --bin "darwin-x64=dist/bin/sm-darwin-x64"
+            --bin "linux-x64=dist/bin/sm-linux-x64"
+            --bin "linux-arm64=dist/bin/sm-linux-arm64"
+            --pack
+            --verify-pack
+            --publish
+          )
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ inputs.dry_run }}" == "true" ]]; then
+            args+=(--dry-run)
+          fi
+          bash scripts/stage_npm.sh "${args[@]}"

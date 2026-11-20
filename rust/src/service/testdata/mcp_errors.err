@@ -1,0 +1,11 @@
+sm mcp: serving MCP 2026-07-28 and 2025-11-25 on stdio
+sm mcp: memory_query: argument 'limit' must be at least 1, got 0
+sm mcp: memory_query: unknown argument 'bogus'; expected one of query, bias, kind, tag, limit, all_repos, repo, in
+sm mcp: memory_related: Item not found: m_missing
+sm mcp: memory_query: unknown argument 'format'; expected one of query, bias, kind, tag, limit, all_repos, repo, in
+sm mcp: parse error: Expecting property name enclosed in double quotes: line 1 column 2 (char 1)
+sm mcp: parse error: 'utf-8' codec can't decode byte 0xff in position 0: invalid start byte
+sm mcp: memory_put: missing required argument 'text'
+sm mcp: memory_query: argument 'limit' must be integer, got "2"
+sm mcp: memory_supersede: missing required argument 'new_id'
+sm mcp: memory_related: Item not found: m_missing

@@ -1,0 +1,43 @@
+{
+  "name": "simple-memory",
+  "version": "0.5.0",
+  "description": "Local single-file SQLite + FTS5 memory store and MCP server for coding agents",
+  "license": "MIT",
+  "keywords": [
+    "memory",
+    "agents",
+    "sqlite",
+    "fts5",
+    "mcp"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/tuanhung303/simple-memory.git"
+  },
+  "homepage": "https://github.com/tuanhung303/simple-memory#readme",
+  "bugs": {
+    "url": "https://github.com/tuanhung303/simple-memory/issues"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "preferUnplugged": true,
+  "bin": {
+    "sm": "bin/sm.js",
+    "simple-memory": "bin/sm.js"
+  },
+  "files": [
+    "bin/",
+    "lib/",
+    "scripts/",
+    "LICENSE",
+    "README.md"
+  ],
+  "scripts": {
+    "postinstall": "node scripts/postinstall.js"
+  },
+  "optionalDependencies": {
+    "simple-memory-darwin-arm64": "0.5.0",
+    "simple-memory-darwin-x64": "0.5.0"
+  }
+}

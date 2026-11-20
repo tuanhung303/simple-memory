@@ -1,0 +1,25 @@
+{
+  "name": "simple-memory-darwin-x64",
+  "version": "0.5.0",
+  "description": "Prebuilt simple-memory (sm) binary for macOS x64",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/tuanhung303/simple-memory.git"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "os": [
+    "darwin"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "preferUnplugged": true,
+  "files": [
+    "bin/sm",
+    "LICENSE",
+    "README.md"
+  ]
+}
