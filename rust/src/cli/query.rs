@@ -240,9 +240,17 @@ fn footer_lines(lk: &Lookup, ns: &Namespace, limit: &LimitText) -> Vec<String> {
         lines.push(format!("missing: {}", parts.join("; ")));
     }
     let mut more = Vec::new();
+    let full = lk.pool_cap.is_some_and(|c| c != 0);
+    if lk.beyond_limit == 0 && full {
+        // --limit took the whole pool: a wider limit shows no more, so the hint narrows the query
+        more.push(format!(
+            "matches may exist beyond the full pool of {} -> narrow the query: {}",
+            lk.pool_cap.unwrap_or(0),
+            query_cmd(&lk.query, &with(&scope, &filters))
+        ));
+    }
     if lk.beyond_limit != 0 {
         let wider = limit.plus(lk.beyond_limit.min(10));
-        let full = lk.pool_cap.is_some_and(|c| c != 0);
         let count = if full {
             format!("{}+", lk.beyond_limit)
         } else {

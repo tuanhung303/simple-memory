@@ -4,6 +4,7 @@ use std::collections::{BTreeSet, HashSet};
 use indexmap::IndexMap;
 use rusqlite::Connection;
 use rusqlite::types::Value as Sql;
+use unicode_normalization::UnicodeNormalization;
 
 use crate::core::fold::{fold, has_accents};
 use crate::core::item::{Item, parse_as_of_epoch};
@@ -460,7 +461,10 @@ fn gather(
     f: &Filters,
     o: &SearchOpts,
 ) -> Result<Gathered, SmError> {
-    let (positive_query, excluded) = parse_query_exclusions(query);
+    // \w stops at a combining mark, so an NFD query splits its accented words: the raw FTS terms
+    // and the accent and phrase tiers need the stored (NFC) form
+    let query: String = query.nfc().collect();
+    let (positive_query, excluded) = parse_query_exclusions(&query);
     let q_clean = crate::py::str::strip(&positive_query);
     if q_clean.is_empty() {
         return Ok((Vec::new(), Vec::new(), None, positive_query));

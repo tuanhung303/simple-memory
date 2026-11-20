@@ -984,6 +984,10 @@ fn initialize(params: &PyValue) -> Result<PyValue, Fail> {
     ]))
 }
 
+fn encode_reply(v: &PyValue) -> Result<Vec<u8>, SmError> {
+    py::path::encode_text(&dumps(v, &Opts::unicode())?)
+}
+
 /// The answer to one input line, or None for a blank line or a notification.
 pub fn answer_line(server: &Server, raw: &[u8], out: &mut Out) -> Result<Option<Vec<u8>>, SmError> {
     if raw.iter().all(|b| b.is_ascii_whitespace() || *b == 0x0b) {
@@ -998,12 +1002,32 @@ pub fn answer_line(server: &Server, raw: &[u8], out: &mut Out) -> Result<Option<
             out.eprint(&format!("sm mcp: parse error: {}", e.msg))?;
             Some(error(PyValue::None, PARSE_ERROR, "Parse error", None))
         }
-        Ok(msg) => server.handle(&msg, out)?,
+        Ok(msg) => match get(&msg, "id").map(encode_reply) {
+            // an id that cannot be written back is refused before the request runs
+            Some(Err(e)) => {
+                out.eprint(&format!("sm mcp: reply error: {}", e.msg))?;
+                Some(error(
+                    PyValue::None,
+                    INVALID_REQUEST,
+                    "Invalid Request",
+                    None,
+                ))
+            }
+            _ => server.handle(&msg, out)?,
+        },
     };
     let Some(resp) = response else {
         return Ok(None);
     };
-    let mut bytes = py::path::encode_text(&dumps(&resp, &Opts::unicode())?)?;
+    let mut bytes = match encode_reply(&resp) {
+        Ok(b) => b,
+        Err(e) => {
+            // a lone surrogate in an echoed method, tool name or version: answer, never stop
+            out.eprint(&format!("sm mcp: reply error: {}", e.msg))?;
+            let rid = get(&resp, "id").cloned().unwrap_or(PyValue::None);
+            encode_reply(&error(rid, INVALID_REQUEST, "Invalid Request", None))?
+        }
+    };
     bytes.push(b'\n');
     Ok(Some(bytes))
 }

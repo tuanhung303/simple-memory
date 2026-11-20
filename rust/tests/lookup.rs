@@ -997,6 +997,86 @@ fn query_more_counts_ranked_candidates_and_marks_a_full_pool() {
 }
 
 #[test]
+fn query_more_says_a_full_pool_also_when_limit_takes_the_whole_pool() {
+    // 60 items hold "nebula"; with --bias recency the pool keeps the best 50, so --limit 50 and
+    // --limit 100 both show all 50 and beyond_limit is 0 although 10 more items match
+    let c = Cli::new();
+    for i in 0..60 {
+        c.put(&format!("Nebula note {i}"), &["--tag", "derived"]);
+    }
+    for i in 0..5 {
+        c.put(&format!("Pulsar note {i}"), &["--tag", "derived"]);
+    }
+    let want = [
+        "more: matches may exist beyond the full pool of 50 -> narrow the query: sm query \"nebula\" --repo a --bias recency",
+    ];
+    for limit in ["50", "100"] {
+        let o = c.ok(&[
+            "query", "nebula", "--repo", "a", "--bias", "recency", "--limit", limit,
+        ]);
+        assert_eq!(o.more(), want, "--limit {limit}");
+        let o = c.ok(&[
+            "query", "nebula", "--repo", "a", "--bias", "recency", "--limit", limit, "--format",
+            "brief",
+        ]);
+        assert_eq!(o.more(), want, "brief --limit {limit}");
+    }
+    // JSON keeps its fields: beyond_limit 0 and pool_full true
+    let more = c
+        .ok(&[
+            "query", "nebula", "--repo", "a", "--bias", "recency", "--limit", "100", "--format",
+            "json",
+        ])
+        .json()["more"]
+        .clone();
+    assert_eq!(
+        more,
+        json!({"beyond_limit": 0, "pool_full": true, "other_repos": {}, "other_repos_pool_full": true})
+    );
+    // 5 matches fill no pool: --limit 10 shows all of them and prints no more line
+    let o = c.ok(&["query", "pulsar", "--repo", "a", "--limit", "10"]);
+    assert_eq!(o.more(), Vec::<&str>::new());
+}
+
+#[test]
+fn query_in_nfd_ranks_like_the_same_words_in_nfc() {
+    // The accented item is stored first, its unaccented twin last; "đường cao tốc" in NFD
+    // (macOS file names, some input methods) must keep the accent and phrase tiers of the NFC query.
+    use unicode_normalization::UnicodeNormalization;
+    let c = Cli::new();
+    for i in 0..5 {
+        c.put(&format!("báo cáo tuần {i}"), &["--tag", "derived"]);
+    }
+    c.put("đường cao tốc Hà Nội báo cáo dự án", &["--tag", "derived"]);
+    c.put("duong cao toc ha noi bao cao", &["--tag", "derived"]);
+    let nfc = "đường cao tốc";
+    let nfd: String = nfc.nfd().collect();
+    assert_ne!(nfd, nfc);
+    let top = |q: &str| {
+        let r = c
+            .ok(&[
+                "query", q, "--repo", "a", "--limit", "2", "--format", "json",
+            ])
+            .json();
+        let hit = &r["results"][0];
+        (
+            hit["snippet"]
+                .as_str()
+                .unwrap()
+                .chars()
+                .take(13)
+                .collect::<String>(),
+            hit["why"]["phrase"].clone(),
+            hit["why"]["score"].clone(),
+        )
+    };
+    let (title, phrase, score) = top(nfc);
+    assert_eq!((title.as_str(), phrase), ("đường cao tốc", json!(true)));
+    // the NFD query scores byte for byte like the NFC one: the accent tier (not in the JSON) is in the score
+    assert_eq!(top(&nfd), ("đường cao tốc".to_string(), json!(true), score));
+}
+
+#[test]
 fn query_other_repos_count_only_the_best_matches_across_all_repos() {
     // Repo b holds 60 weak matches (the word once in a long body); repo c and the scoped repo a
     // hold strong ones. The pool across all repos keeps the best 50: a 1, c 2, b 47.

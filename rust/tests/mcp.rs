@@ -1934,3 +1934,85 @@ fn memory_amend_and_memory_retire_round_trip_and_validate_guards() {
             && r["flags"]["via"] == "mcp"
     }));
 }
+
+/// A request line holding the escape \udcff (a lone low surrogate, which UTF-8 cannot write) gets
+/// one error reply, the next request is answered and the server exits 0 at end of input.
+fn a_lone_surrogate_in_a_request_gets_an_error_reply(line: &'static [u8], reply_id: Value) {
+    let fx = Fx::new();
+    let repo = fx.repo_dir();
+    let (out, err) = fx.converse(vec![ping(1).into(), Line::Raw(line), ping(3).into()], &repo);
+    assert_eq!(
+        out,
+        vec![
+            json!({"jsonrpc": "2.0", "id": 1, "result": {}}),
+            json!({"jsonrpc": "2.0", "id": reply_id, "error": {"code": -32600, "message": "Invalid Request"}}),
+            json!({"jsonrpc": "2.0", "id": 3, "result": {}}),
+        ]
+    );
+    assert!(
+        err.contains("sm mcp: reply error: 'utf-8' codec can't encode character '\\udcff'"),
+        "{err}"
+    );
+}
+
+#[test]
+fn a_lone_surrogate_in_the_id_gets_an_error_reply_with_a_null_id() {
+    a_lone_surrogate_in_a_request_gets_an_error_reply(
+        b"{\"jsonrpc\":\"2.0\",\"id\":\"x\\udcff\",\"method\":\"ping\"}\n",
+        Value::Null,
+    );
+}
+
+#[test]
+fn a_lone_surrogate_in_the_method_gets_an_error_reply_with_the_id() {
+    a_lone_surrogate_in_a_request_gets_an_error_reply(
+        b"{\"jsonrpc\":\"2.0\",\"id\":\"m1\",\"method\":\"x\\udcff\"}\n",
+        json!("m1"),
+    );
+}
+
+#[test]
+fn a_lone_surrogate_in_the_tool_name_gets_an_error_reply_with_the_id() {
+    a_lone_surrogate_in_a_request_gets_an_error_reply(
+        b"{\"jsonrpc\":\"2.0\",\"id\":\"t1\",\"method\":\"tools/call\",\"params\":{\"name\":\"x\\udcff\"}}\n",
+        json!("t1"),
+    );
+}
+
+#[test]
+fn a_lone_surrogate_in_the_meta_version_gets_an_error_reply_with_the_id() {
+    a_lone_surrogate_in_a_request_gets_an_error_reply(
+        b"{\"jsonrpc\":\"2.0\",\"id\":\"v1\",\"method\":\"tools/list\",\"params\":{\"_meta\":{\"io.modelcontextprotocol/protocolVersion\":\"\\udcff\",\"io.modelcontextprotocol/clientCapabilities\":{}}}}\n",
+        json!("v1"),
+    );
+}
+
+#[test]
+fn a_put_whose_id_cannot_be_written_back_is_refused_before_it_runs() {
+    let fx = Fx::new();
+    let repo = fx.repo_dir();
+    let put = b"{\"jsonrpc\":\"2.0\",\"id\":\"p\\udcff\",\"method\":\"tools/call\",\"params\":{\"name\":\"memory_put\",\"arguments\":{\"text\":\"surrogate id write test\",\"kind\":\"fact\",\"tag\":\"derived\",\"evidence\":\"e\"}}}\n";
+    let (out, err) = fx.converse(
+        vec![
+            ping(1).into(),
+            Line::Raw(put),
+            call(3, "memory_query", json!({"query": "surrogate id write"})).into(),
+            ping(4).into(),
+        ],
+        &repo,
+    );
+    assert_eq!(
+        out[1],
+        json!({"jsonrpc": "2.0", "id": null, "error": {"code": -32600, "message": "Invalid Request"}})
+    );
+    // the query answers with no hit: the put never ran
+    assert_eq!(payload(&out[2])["results"], json!([]));
+    assert_eq!(
+        (out.len(), &out[3]),
+        (4, &json!({"jsonrpc": "2.0", "id": 4, "result": {}}))
+    );
+    assert!(
+        err.contains("sm mcp: reply error: 'utf-8' codec can't encode character '\\udcff'"),
+        "{err}"
+    );
+}
