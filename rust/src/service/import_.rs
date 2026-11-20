@@ -118,20 +118,34 @@ fn later_as_of(a: &str, b: &str) -> std::cmp::Ordering {
     }
 }
 
+/// What the choice between two files of one source reads: the path and the stated as_of.
+#[derive(Clone, Debug)]
+pub struct CopyKey {
+    pub path: PyPath,
+    stated_as_of: Option<String>,
+}
+
+impl CopyKey {
+    pub fn of(path: PyPath, item: &Item) -> CopyKey {
+        let stated_as_of = stated_as_of(item).map(str::to_string);
+        CopyKey { path, stated_as_of }
+    }
+}
+
 /// File `a` is the source's file in place of file `b`: the newest stated as_of (a stated one
 /// over none), then the newest mtime, then the first path in sorted order. A file whose mtime
 /// cannot be read (it went away after the parse) is the older one: the import's own read of
 /// that file reports it, and the scan of the other files goes on.
-fn keeps_over(a: &SourceFile, b: &SourceFile) -> bool {
+fn keeps_over(a: &CopyKey, b: &CopyKey) -> bool {
     use std::cmp::Ordering::{Equal, Greater};
-    let by_as_of = match (stated_as_of(&a.1), stated_as_of(&b.1)) {
+    let by_as_of = match (&a.stated_as_of, &b.stated_as_of) {
         (Some(x), Some(y)) => later_as_of(x, y),
         (x, y) => x.is_some().cmp(&y.is_some()),
     };
     if by_as_of != Equal {
         return by_as_of == Greater;
     }
-    let time = |f: &SourceFile| mtime(&f.0).ok();
+    let time = |f: &CopyKey| mtime(&f.path).ok();
     let by_mtime = match (time(a), time(b)) {
         (Some(x), Some(y)) => x.total_cmp(&y),
         (x, y) => x.is_some().cmp(&y.is_some()),
@@ -139,36 +153,61 @@ fn keeps_over(a: &SourceFile, b: &SourceFile) -> bool {
     if by_mtime != Equal {
         return by_mtime == Greater;
     }
-    a.0.as_str().split('/').lt(b.0.as_str().split('/'))
+    a.path.as_str().split('/').lt(b.path.as_str().split('/'))
 }
 
-/// The files of one scan with their repos aliased, one file per source (repo and source): the
-/// file `keeps_over` every other file of its source. The others are copies of that source and
-/// are left out, so the choice rests on the files alone and every scan makes the same one. The
-/// import and doctor both take their files through here.
+/// One file per source (repo and source), fed one file at a time: the file that `keeps_over`
+/// every other file of its source, with a value the caller keeps for it. Sources stay in the
+/// order of their first file. A caller that needs only a small value per file (doctor) holds
+/// that value and not the parsed file.
+pub struct OnePerSource<T>(IndexMap<(String, String), (CopyKey, T)>);
+
+impl<T> Default for OnePerSource<T> {
+    fn default() -> Self {
+        OnePerSource(IndexMap::new())
+    }
+}
+
+impl<T> OnePerSource<T> {
+    /// Offer a file of the source; `value` runs only when the file takes the source's place.
+    pub fn offer(&mut self, repo: String, source: String, key: CopyKey, value: impl FnOnce() -> T) {
+        use indexmap::map::Entry;
+        match self.0.entry((repo, source)) {
+            Entry::Occupied(mut held) => {
+                if keeps_over(&key, &held.get().0) {
+                    held.insert((key, value()));
+                }
+            }
+            Entry::Vacant(slot) => {
+                slot.insert((key, value()));
+            }
+        }
+    }
+
+    /// The kept files: (repo, source), the file's key and its value.
+    pub fn into_kept(self) -> impl Iterator<Item = ((String, String), CopyKey, T)> {
+        self.0
+            .into_iter()
+            .map(|(source, (key, value))| (source, key, value))
+    }
+}
+
+/// The files of one scan with their repos aliased, one file per source: see `OnePerSource`.
+/// The others are copies of that source and are left out, so the choice rests on the files
+/// alone and every scan makes the same one. The import and doctor both choose through
+/// `OnePerSource`.
 pub fn one_file_per_source(files: Vec<SourceFile>, repo_aliases: &Aliases) -> Vec<SourceFile> {
-    let mut kept: Vec<Option<SourceFile>> = Vec::with_capacity(files.len());
-    let mut slot: HashMap<(String, String), usize> = HashMap::new();
+    let mut pick = OnePerSource::default();
     for (path, mut item) in files {
         if let Some(r) = repo_aliases.get(&item.repo) {
             item.repo = r.clone();
         }
-        let file = (path, item);
-        let key = (file.1.repo.clone(), file.1.source.clone());
-        match slot.get(&key) {
-            Some(&i) => {
-                let held = kept[i].as_ref().expect("a kept file");
-                if keeps_over(&file, held) {
-                    kept[i] = Some(file);
-                }
-            }
-            None => {
-                slot.insert(key, kept.len());
-                kept.push(Some(file));
-            }
-        }
+        let key = CopyKey::of(path, &item);
+        pick.offer(item.repo.clone(), item.source.clone(), key, || item);
     }
-    kept.into_iter().flatten().collect()
+    pick.into_kept()
+        .map(|(_, key, item)| (key.path, item))
+        .collect()
 }
 
 /// Counts per `str(attr or "")`, most first, then by key.

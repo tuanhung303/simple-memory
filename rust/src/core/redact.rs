@@ -119,6 +119,8 @@ impl Guarded {
 enum Matcher {
     Plain(Regex),
     Guarded(Guarded),
+    /// The bearer pattern, which yields to a key_value pair at its token (`bearer_find`).
+    Bearer(Guarded),
     KeyValue,
     QuerySignature(Regex),
 }
@@ -129,6 +131,7 @@ impl Matcher {
         let find: Box<dyn Fn(usize) -> Option<(usize, usize)>> = match self {
             Matcher::Plain(re) => Box::new(|pos| re.find_at(t, pos).map(|m| (m.start(), m.end()))),
             Matcher::Guarded(g) => Box::new(|pos| g.find(t, pos)),
+            Matcher::Bearer(g) => Box::new(|pos| bearer_find(g, t, pos)),
             Matcher::KeyValue => Box::new(|pos| key_value_find(t, pos)),
             Matcher::QuerySignature(re) => return query_signature_spans(re, t),
         };
@@ -181,7 +184,15 @@ static SECRET_PATTERNS: LazyLock<Vec<(&'static str, Matcher)>> = LazyLock::new(|
                 None,
             )),
         ),
-        ("bearer", word(&format!("Bearer[{s_inner}]+[A-Za-z0-9._~+/=-]{{8,}}"))),
+        (
+            "bearer",
+            Matcher::Bearer(Guarded::new(
+                w,
+                &format!("Bearer[{s_inner}]+[A-Za-z0-9._~+/=-]{{8,}}"),
+                is_word,
+                None,
+            )),
+        ),
         // `scheme://user:password@`, the user may be empty. A `/` in the password is taken only
         // where the text cannot be `host:port/path`: the user holds no `.`, the password holds no
         // `:`, and its text before the first `/` is not empty and not all digits. No guard before
@@ -394,13 +405,47 @@ fn kv_bare(t: &str, i: usize) -> Option<usize> {
     Some(end)
 }
 
-/// The value part after the key run that ends at `e`: the end of the match. Each choice here is
-/// forced: a quote after the key is taken (else no `:` or `=` follows), and `\s*` is greedy
-/// (else a space stands where `:` or `=` must be).
+/// Where the `:` or `=` after the key run that ends at `e` must stand. Each choice here is forced:
+/// a quote after the key is taken (else no `:` or `=` follows), and `\s*` is greedy (else a space
+/// stands where `:` or `=` must be).
+fn kv_sep(t: &str, e: usize) -> usize {
+    let q = e + usize::from(matches!(t.as_bytes().get(e), Some(b'"' | b'\'')));
+    skip_space(t, q)
+}
+
+/// Where the value after the separator at `v` starts when the pair matches: past white space and
+/// one opening quote or backtick (a branch that skips less refuses what it did not skip).
+fn kv_value_start(t: &str, v: usize) -> usize {
+    let w = skip_space(t, v + 1);
+    w + usize::from(matches!(t.as_bytes().get(w), Some(b'"' | b'\'' | b'`')))
+}
+
+/// Does a key word start at `x` whose own pair matches (by `kv_after_sep`, so this reads a fixed
+/// amount ahead) with its value at or after `end`? Then a match that ends at `end` and takes that
+/// key word as its value would leave the second value in clear (`TOKEN=` newline
+/// `password: value`); without it the scan goes on to the second key, whose match covers all the
+/// first one did past its separator.
+fn pair_after(t: &str, x: usize, end: usize) -> bool {
+    let k = run(t, x, key_char).0;
+    let seg = &t[x..k];
+    let v = kv_sep(t, k);
+    ends_with_any(seg, &KEY_TAILS)
+        && matches!(t.as_bytes().get(v), Some(b':' | b'='))
+        && kv_value_start(t, v) >= end
+        && kv_after_sep(t, v, ends_with_any(seg, &ACCESS_KEY_TAILS)).is_some()
+}
+
+/// The value part after the key run that ends at `e`: the end of the match. A value that is a
+/// second key word with its own value after it is no value: that pair matches on its own.
 fn kv_after_key(t: &str, e: usize, access_key: bool) -> Option<usize> {
+    let v = kv_sep(t, e);
+    let end = kv_after_sep(t, v, access_key)?;
+    (!pair_after(t, kv_value_start(t, v), end)).then_some(end)
+}
+
+/// The value part after the separator at `v`: the end of the match.
+fn kv_after_sep(t: &str, v: usize, access_key: bool) -> Option<usize> {
     let b = t.as_bytes();
-    let q = e + usize::from(matches!(b.get(e), Some(b'"' | b'\'')));
-    let v = skip_space(t, q);
     match b.get(v) {
         Some(b':') => {
             let w = skip_space(t, v + 1);
@@ -454,6 +499,22 @@ fn key_value_find(t: &str, pos: usize) -> Option<(usize, usize)> {
         i = e;
     }
     None
+}
+
+/// The first bearer match from `pos` whose token is not a key word with its own pair after it
+/// (`Bearer password: value`): key_value takes that pair, and the marker covers all the bearer
+/// match did past `Bearer`. A refused match goes on at its token, where no `Bearer` starts.
+fn bearer_find(g: &Guarded, t: &str, mut pos: usize) -> Option<(usize, usize)> {
+    loop {
+        let (s, e) = g.find(t, pos)?;
+        let x = t[..e]
+            .trim_end_matches(|c: char| c.is_ascii_alphanumeric() || "._~+/=-".contains(c))
+            .len();
+        if !pair_after(t, x, e) {
+            return Some((s, e));
+        }
+        pos = x;
+    }
 }
 
 /// `[?&]Signature=value` in a URL that also carries `AWSAccessKeyId=` or `GoogleAccessId=` (S3 and
@@ -1192,6 +1253,143 @@ mod tests {
             assert!(!out.contains(secret), "{refs} -> {out}");
             assert_eq!(out, want, "{refs}");
         }
+    }
+
+    /// A key word or `Bearer` whose value would be a second key word that has its own value after
+    /// it, each with the text the second pair must give (`{v}` is the secret).
+    const PAIR_AFTER_AN_EMPTY_VALUE: [(&str, &str); 11] = [
+        ("TOKEN=\npassword: {v}", "TOKEN=\n[REDACTED:key_value]"),
+        ("api_key= password: {v}", "api_key= [REDACTED:key_value]"),
+        (
+            "SECRET_KEY=\nDB_PASSWORD: {v}",
+            "SECRET_KEY=\n[REDACTED:key_value]",
+        ),
+        ("TOKEN=\npassword = {v}", "TOKEN=\n[REDACTED:key_value]"),
+        ("TOKEN=\n\npassword: {v}", "TOKEN=\n\n[REDACTED:key_value]"),
+        ("Bearer password: {v}", "Bearer [REDACTED:key_value]"),
+        // three in a row: each defers to the next, and the last pair holds the secret
+        (
+            "API_KEY=\nSECRET=\nPASSWORD: {v}",
+            "API_KEY=\nSECRET=\n[REDACTED:key_value]",
+        ),
+        // the quoted colon form and the bare colon form
+        ("TOKEN: \"password: {v}\"", "TOKEN: [REDACTED:key_value]\""),
+        ("TOKEN: Db2_password = {v}", "TOKEN: [REDACTED:key_value]"),
+        // an access key name's bare 40-char value, which only `kv_aws_secret` takes
+        (
+            "TOKEN=\nsecret_access_key: wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+            "TOKEN=\n[REDACTED:key_value]",
+        ),
+        // the second value starts right where the first match ends, after its optional quote
+        ("TOKEN=\npassword:\"{v}\"", "TOKEN=\n[REDACTED:key_value]"),
+    ];
+
+    #[test]
+    fn a_key_whose_value_is_a_second_key_with_its_own_value_redacts_the_second_pair() {
+        let v = "Hunter2-example-Zz9";
+        let mut wrong = Vec::new();
+        for (shape, want) in PAIR_AFTER_AN_EMPTY_VALUE {
+            let raw = shape.replace("{v}", v);
+            let got = counted(&raw);
+            if got != (want.to_string(), counts(&[("key_value", 1)])) {
+                wrong.push(format!("{raw:?} -> {got:?}"));
+            }
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+        // a value that holds the second pair whole, or a second key with no value of its own,
+        // keeps one marker over all of it, as before
+        for (raw, want, kind) in [
+            (
+                "TOKEN=password=secret12",
+                "[REDACTED:key_value]",
+                "key_value",
+            ),
+            ("TOKEN=\npassword:", "[REDACTED:key_value]", "key_value"),
+            (
+                "TOKEN=\npassword: short",
+                "[REDACTED:key_value] short",
+                "key_value",
+            ),
+            (
+                "Bearer password=Hunter2-example-Zz9",
+                "[REDACTED:bearer]",
+                "bearer",
+            ),
+            ("Bearer password", "[REDACTED:bearer]", "bearer"),
+            (
+                "Bearer password: short",
+                "[REDACTED:bearer]: short",
+                "bearer",
+            ),
+            // a second word that is no key word is the first key's value, whatever follows it
+            (
+                "api_key= user_name: Alice-example-01",
+                "[REDACTED:key_value] Alice-example-01",
+                "key_value",
+            ),
+        ] {
+            assert_eq!(
+                counted(raw),
+                (want.to_string(), counts(&[(kind, 1)])),
+                "{raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_chain_of_keys_with_empty_values_takes_linear_time() {
+        // 256 KB of key words, each with an empty `=` value before the next one: each defers to
+        // the next, and the last but one takes the last as its value; a scan to the end of the
+        // chain from each key would read about 4 GB
+        let started = std::time::Instant::now();
+        for (unit, tail) in [
+            ("api_key= ", "[REDACTED:key_value] "),
+            ("PASSWORD=\n", "[REDACTED:key_value]\n"),
+            ("a_key=", "a_key=a_key="),
+        ] {
+            let n = (1 << 18) / unit.len();
+            let got = redact_text(&unit.repeat(n), None, None);
+            let end = &got[got.len().saturating_sub(60)..];
+            assert!(
+                got == format!("{}{tail}", unit.repeat(n - 2)),
+                "{unit:?} ends {end:?}"
+            );
+        }
+        let took = started.elapsed();
+        assert!(took < std::time::Duration::from_secs(2), "took {took:?}");
+    }
+
+    #[test]
+    fn redact_for_store_drops_the_ref_of_a_second_pair_after_an_empty_value() {
+        let v = "Hunter2-example-Zz9";
+        let mut cases: Vec<(String, String)> = PAIR_AFTER_AN_EMPTY_VALUE[..6]
+            .iter()
+            .map(|(shape, _)| {
+                let first = shape.split([' ', '\n']).next().unwrap_or_default();
+                (
+                    format!("TKT-1 {}", shape.replace("{v}", v)),
+                    format!("TKT-1 {first}"),
+                )
+            })
+            .collect();
+        // a comma and a vertical tab part the refs; read single-spaced they are one pair, and
+        // the bearer match of the refs as written still drops `Bearer`
+        cases.push((
+            format!("TKT-1 api_key=,,Bearer db_password:\x0b{v}"),
+            "TKT-1 api_key=".to_string(),
+        ));
+        let mut wrong = Vec::new();
+        for (refs, want) in cases {
+            let item = Item {
+                refs: refs.clone(),
+                ..Item::bare("m_r", "a", "fact", "T", "plain body", "assumed")
+            };
+            let got = redact_for_store(&item, None).refs;
+            if got != want {
+                wrong.push(format!("{refs:?} -> {got:?}, want {want:?}"));
+            }
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
     }
 
     #[test]
