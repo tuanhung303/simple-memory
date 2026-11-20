@@ -38,6 +38,17 @@ Prebuilt native Rust binaries ship through npm optional dependencies for macOS (
 
 Install globally with `npm install -g simple-memory` (not `npx`) before running `sm hooks print`, so hook and MCP configs point to a stable path. Make sure `node` is on the `PATH` seen by your hook and MCP hosts, or install the standalone native binary via `./scripts/install.sh` for minimal-`PATH` GUI hosts.
 
+### Upgrading
+
+Check for a newer release or upgrade with `sm update`:
+
+```sh
+sm update --check   # check npm for a newer version and refresh the local cache
+sm update           # run npm install -g simple-memory@latest for npm installs, or print the source-upgrade command
+```
+
+Interactive npm CLI runs also read `$SIMPLE_MEMORY_HOME/update-check.json` (refreshed in the background at most once every 24 hours) and print a one-line notice to stderr when a newer release exists. The reminder stays silent on non-TTY streams, CI, `mcp`, `hook`/`hooks`, `update`, `--format json`, `--version`/`-v`, `--help`/`-h`, or when `SM_NO_UPDATE_CHECK=1` is set.
+
 ### Build from source (Linux or custom Rust build)
 
 Requires [Rust (`rustup`)](https://rustup.rs/). `rust/rust-toolchain.toml` pins Rust `1.99.1`. Clone your repository copy and run:
@@ -92,7 +103,13 @@ sm query "connection pool ADR-004"
 next: sm show m_01M7R350TK1Z1DKWVWT4NSF8MQ m_01M7R350W6QV508RDWBHA9S45W; sm related m_01M7R350TK1Z1DKWVWT4NSF8MQ
 ```
 
-Open full body and provenance with `sm show`, update metadata or text append-only with `sm amend`, retire obsolete items with `sm retire`, or replace outdated facts with `--supersedes` (`sm supersede OLD NEW`):
+`sm query` (alias `sm search`) also accepts unquoted multi-word terms, `-term` or `-"exact phrase"` exclusions (quote the query or use `--` when starting with `-` or excluding multi-word phrases in a shell), and relative `--since` / `--until` bounds (`30m`, `24h`, `7d`, `2w`):
+
+```sh
+sm search connection pool -staging --since 7d
+```
+
+Open full body and provenance with `sm show` (or `sm show --format json`), update metadata or text append-only with `sm amend`, retire obsolete items with `sm retire`, or replace outdated facts with `--supersedes` (`sm supersede OLD NEW`):
 
 ```sh
 sm show m_01M7R350TK1Z1DKWVWT4NSF8MQ
@@ -140,19 +157,22 @@ Example output of `sm hooks print claude-code`:
 
 1. Skips slash commands, machine-wrapped notifications, and prompts under 3 words.
 2. Uses `claude -p` (Haiku, with hooks, tools, and MCP servers off) to turn the prompt into keywords or `NONE`. Set `[prompt_hook] model = "none"` for offline IDF local-keyword search with zero model calls.
-3. Falls back to local-keyword search on missing `claude`, error, or timeout (with a 10-minute cooldown after two consecutive failures), skipping built-in English stopwords plus `[prompt_hook] extra_stopwords`.
-4. Injects at most 4 short lines carrying repo, kind, evidence tag, date, compact refs, and title, and tracks shown IDs per session (per compaction epoch in Claude Code, per `conversationId` in `agy`). When the prompt or rewritten query names a configured `[prompt_hook.projects]` code mapped in `[scopes]`, those scope matchers union additively with the current repo AND apply automatic `scope:<path>` bias (`+0.3` via `BIAS_BOOST`) on both the Haiku and local paths so cross-repo project notes surface without dropping local matches (opt out of automatic scope bias with `[query] default_bias = ["relevance"]`). On scopes with at least 20 active items, the Haiku path drops low-information hits whose matched-term IDF sum falls below `[prompt_hook] min_idf` (default `3.0`; `0.0` disables via `run_query`; exact ref hits bypass; dropped IDs log under `floor_dropped`). Disable per invocation with `SM_PROMPT_HOOK=0`.
+3. Falls back to local-keyword search on missing `claude`, error, or timeout (with a 10-minute cooldown after two consecutive failures that clears automatically when `claude_bin`, `model`, or `timeout` changes), skipping built-in English stopwords plus `[prompt_hook] extra_stopwords`.
+4. Injects at most 4 short lines carrying repo, kind, evidence tag, date, compact refs, and title (including `--in <scopes>` in the follow-up hint when project scopes match), and tracks shown IDs per session (per compaction epoch in Claude Code, per `conversationId` in `agy`). When the prompt or rewritten query names a configured `[prompt_hook.projects]` code mapped in `[scopes]`, those scope matchers union additively with the current repo and apply automatic `scope:<path>` bias (`+0.3` via `BIAS_BOOST`) on both the Haiku and local paths so cross-repo project notes surface without dropping local matches (opt out of automatic scope bias with `[query] default_bias = ["relevance"]`). On scopes with at least 20 active items, the Haiku path drops low-information hits whose matched-term IDF sum falls below `[prompt_hook] min_idf` (default `3.0`; `0.0` disables via `run_query`; exact ref hits bypass; dropped IDs log under `floor_dropped`). The local fallback applies `[prompt_hook] local_min_idf` (default `8.0`; `0.0` disables) as its local IDF floor. Disable per invocation with `SM_PROMPT_HOOK=0`.
 
 ### MCP server (`sm mcp`)
 
-Speaks JSON-RPC 2.0 over stdio (`MCP 2026-07-28` stateless metadata and `2024-11-05` through `2025-11-25` `initialize` handshakes) and serves five tools:
+Speaks JSON-RPC 2.0 over stdio (`MCP 2026-07-28` stateless metadata and `2024-11-05` through `2025-11-25` `initialize` handshakes) and serves eight tools:
 
 | Tool | Arguments | Purpose |
 |---|---|---|
-| `memory_query` | `query`; optional `bias`, `kind`, `tag`, `in`, `limit`, `all_repos`, `repo` | Ranked search (`sm query --format json`); `bias` accepts `scope:<path>` |
+| `memory_query` | `query`; optional `bias`, `kind`, `tag`, `source`, `since`, `until`, `recent`, `include_history`, `in`, `limit`, `all_repos`, `repo` | Ranked search (`sm query --format json`); `bias` accepts `scope:<path>` |
+| `memory_list` | optional `limit`, `offset`, `kind`, `tag`, `source`, `since`, `until`, `status`, `include_history`, `all_repos`, `repo`, `in` | Browse items newest-first without a query |
 | `memory_show` | `ids` (non-empty array) | Full body, refs, and provenance per ID |
 | `memory_related` | `id`; optional `limit` | Supersede chain, shared refs, same session |
 | `memory_put` | `text`, `tag`; optional `kind`, `evidence`, `refs`, `supersedes`, `repo` | Store item, redact secrets, warn on overlaps |
+| `memory_amend` | `id`; optional `text`, `title`, `kind`, `tag`, `evidence`, `repo`, `add_refs`, `remove_refs`, `refs`, `add_tags`, `remove_tags`, `tags`, `as_of` | Append-only update (creates a new item and supersedes `id`) |
+| `memory_retire` | `id`; optional `reason` | Soft-retire an active item with no replacement |
 | `memory_supersede` | `old_id`, `new_id` | Retire `old_id` in favor of `new_id` |
 
 ## Ontology and retrieval gate
@@ -167,7 +187,7 @@ Both prompt-hook recall (`sm hook prompt`) and explicit lookup (`sm query` / `sm
 ![Ontology and retrieval gate](assets/ontology.svg)
 
 - **Hard scope filter (`--in`)**: `sm query "auth timeout" --in acme/globex` searches across all repos and keeps only items matching `acme/globex` or its descendants.
-- **Soft scope bias (`--bias scope:<path>`)**: `sm query "auth timeout" --bias scope:acme/globex` (or MCP `memory_query` `bias`, or `[query] default_bias`) keeps the normal repo result set, widens the FTS candidate pool to `100`, and adds `+0.3` (`BIAS_BOOST`) per matched scope without overriding exact `ref_hits`, `phrase`, or `accent` matches (reported as `why=...,bias:scope:acme/globex`). Stack parent and child paths (`--bias scope:acme,scope:acme/globex`) for hierarchical specificity.
+- **Soft scope bias (`--bias scope:<path>`)**: `sm query "auth timeout" --bias scope:acme/globex` (or MCP `memory_query` `bias`, or `[query] default_bias`) keeps the normal repo result set, widens the FTS candidate pool to `100`, and adds `+0.3` (`BIAS_BOOST`) per matched scope without overriding exact `ref_hits`, `phrase`, or `accent` matches (reported as `why=...,bias:scope:acme/globex`). When `--bias` contains only `scope:<path>` tokens, they merge additively on top of `[query] default_bias` so durable kind, tag, and recency boosts stay active; pass `relevance` or another explicit kind/tag token (such as `--bias relevance,scope:acme/globex`) to replace the defaults. Stack parent and child paths (`--bias scope:acme,scope:acme/globex`) for hierarchical specificity.
 - **Automatic hook scope bias**: When `sm hook prompt` matches a `[prompt_hook.projects]` code to `[scopes]`, matched paths union additively into SQL and apply automatic `scope:<path>` bias on both the Haiku and local paths. Set `[query] default_bias = ["relevance"]` to opt out of automatic scope bias (along with recency and kind/tag bias) while keeping additive SQL scope inclusion.
 
 ## Multi-repo scopes and maintenance
@@ -181,7 +201,7 @@ Group related repos or project codes locally in `~/.simple-memory/config.toml` u
 "acme/globex/portal" = ["repo:globex-portal"]
 ```
 
-Filter hard across scopes with `sm query "auth timeout" --in acme/globex`, soft-boost a scope without filtering via `sm query "auth timeout" --bias scope:acme/globex`, and inspect store counts, recall open rates, catch-up runs, and scope totals with `sm stats` (`--days N`, `--format json`).
+Filter hard across scopes with `sm query "auth timeout" --in acme/globex`, soft-boost a scope without filtering via `sm query "auth timeout" --bias scope:acme/globex`, and inspect active, superseded, and retired store counts, recall open rates, catch-up runs, and scope totals with `sm stats` (`--days N`, `--format json`).
 
 Check store health anytime:
 
@@ -193,10 +213,10 @@ sm backup               # verified SQLite backup copy in ~/.simple-memory/backup
 
 ## Extending simple-memory
 
-Modules follow a downward architecture (`cli` -> `service` -> `store` / `sources` / `config` -> `core`, plus shared `py`, `clock`, `error`), with two explicit helper edges (`rust/src/config.rs` -> `service::capture` and `rust/src/config.rs` -> `sources`; `stands_as_word` lives in `rust/src/core/terms.rs`):
+Modules follow a downward architecture (`cli` -> `service` -> `store` / `sources` / `config` -> `core`, plus shared `py`, `clock`, `error`), with three explicit helper edges (`rust/src/config.rs` -> `service::capture`, `rust/src/config.rs` -> `service::query::LOCAL_TAU`, and `rust/src/config.rs` -> `sources`; `stands_as_word` lives in `rust/src/core/terms.rs`):
 
 - **Custom stopwords and ranking defaults**: Set `[prompt_hook] extra_stopwords` for domain/language filler skipped by the local fallback, and `[query] default_bias` to override default ranking without recompiling.
-- **New import source**: Add a parser under `rust/src/sources/` returning `core::item::Item` records, register its subcommand in `rust/src/cli/args.rs` and `rust/src/service/import_.rs`, and wire it into `service/catchup.rs` + `service/doctor.rs` (`--imports`).
+- **New import source**: Add a parser under `rust/src/sources/` returning `core::item::Item` records, register its subcommand in `rust/src/cli/args.rs` and `rust/src/service/import_.rs`, and wire it into `rust/src/service/catchup.rs` + `rust/src/service/doctor.rs` (`--imports`).
 - **New MCP tool or schema field**: Add tool schemas and handlers in `rust/src/service/mcp.rs` over shared `service/*` calls; place numbered `.sql` migrations under `rust/migrations/` and register them in `rust/src/store/connect.rs`.
 - **Additional redaction patterns**: Extend `rust/src/core/redact.rs` with linear-time regex patterns and unit tests.
 
@@ -208,8 +228,8 @@ Modules follow a downward architecture (`cli` -> `service` -> `store` / `sources
 | `sm init` | Create home dir, `memory.db`, and commented `config.toml` |
 | `sm config` | Print effective configuration (defaults plus `config.toml`) as TOML |
 | `sm put TEXT --tag TAG [...]` | Store item (`--kind`, `--evidence`, `--refs`, `--tags`, `--supersedes`, `--repo`, `--as-of`) |
-| `sm query TEXT [...]` | Ranked search (`--limit`, `--recent`, `--bias` including `scope:<path>`, `--kind`, `--tag`, `--source`, `--since`, `--until`, `--in`, `--all`, `--include-history`, `--format`) |
-| `sm show ID [ID ...]` | Print full text and provenance; exits 1 if any ID is missing |
+| `sm query TEXT [...]` (alias `sm search`) | Ranked search with unquoted terms, `-term`/`-"phrase"` exclusions, relative `--since`/`--until` (`30m`, `24h`, `7d`, `2w`), additive `--bias scope:<path>`, `--limit`, `--recent`, `--kind`, `--tag`, `--source`, `--in` (mutually exclusive with `--repo`), `--all`, `--include-history`, `--format` |
+| `sm show ID [ID ...] [--format text\|json]` | Print full text and provenance (`text` or `json` array); exits 1 if any ID is missing |
 | `sm related ID [...]` | Show supersede chain, shared-ref items, and same-session items |
 | `sm supersede OLD NEW` | Mark `OLD` superseded by `NEW` |
 | `sm retire ID [--reason TEXT]` | Soft-retire an active item with no replacement (default reason: `manual`) |
@@ -221,11 +241,12 @@ Modules follow a downward architecture (`cli` -> `service` -> `store` / `sources
 | `sm upkeep [--dry-run] [--report]` | Retire older/claimed session handoffs; `--report` flags near-duplicates and stale items |
 | `sm backup [--keep N]` | Checked SQLite backup in `backups/` |
 | `sm doctor [--rebuild-fts] [--backfill-refs] [--imports]` | Verify SQLite integrity, rebuild FTS5, backfill refs, or audit unimported files |
-| `sm stats [--days N] [--format text\|json]` | Store counts, recall open rate, catch-up runs, backups, and `[scopes]` rollup |
+| `sm stats [--days N] [--format text\|json]` | Store counts (active, superseded, retired), recall open rate, catch-up runs, backups, and `[scopes]` rollup |
 | `sm hook prompt [--agy]` | Harness hook reading prompt JSON on stdin |
 | `sm hooks print claude-code\|agy\|mcp` | Print harness configuration JSON to stdout |
 | `sm mcp` | Run JSON-RPC 2.0 MCP server on stdio |
-| `sm --version` | Print installed binary version |
+| `sm update [--check]` | Check npm for a newer release and upgrade npm installs (or print the source-upgrade command) |
+| `sm --version`, `sm -v` | Print installed binary version |
 
 </details>
 
@@ -236,8 +257,8 @@ Modules follow a downward architecture (`cli` -> `service` -> `store` / `sources
 
 - `[repos] roots`: Parent directories whose direct children map workspace/transcript folders to repo keys (`[repo_aliases]` maps aliases such as worktrees).
 - `[keyword_aliases]`: Query term expansions (e.g. `"k8s" = "kubernetes"`).
-- `[query] default_bias`: Default is `["recency", "fact", "decision", "learning", "executed", "verified", "decided", "client-stated"]`. Accepts the same tokens as `--bias`, including `scope:<path>` (for example `"scope:acme/globex"`). Set `["relevance"]` to disable recency, kind/tag, and automatic prompt-hook scope bias.
-- `[prompt_hook]`: `enabled`, `model` (`"haiku"` or `"none"`), `timeout`, `limit`, `claude_bin`, `extra_stopwords`, `min_idf` (default `3.0`; `0.0` disables), and `[prompt_hook.projects]` project codes.
+- `[query] default_bias`: Default is `["recency", "fact", "decision", "learning", "executed", "verified", "decided", "client-stated"]`. Accepts the same tokens as `--bias`, including `scope:<path>` (for example `"scope:acme/globex"`). Explicit `--bias` with only `scope:<path>` tokens merges on top of `default_bias`; set `["relevance"]` to disable recency, kind/tag, and automatic prompt-hook scope bias.
+- `[prompt_hook]`: `enabled`, `model` (`"haiku"` or `"none"`), `timeout`, `limit`, `claude_bin`, `extra_stopwords`, `min_idf` (default `3.0`; `0.0` disables), `local_min_idf` (default `8.0`; `0.0` disables), and `[prompt_hook.projects]` project codes.
 - `[catch_up]`: `enabled`, `interval_minutes` (default `10`).
 - `[upkeep]`: `tasklog_roots` and `handoff_dirs`.
 - `[capture]`: `enabled`, `root` (`~/.claude/projects`), `idle_minutes`, `since_days`, `min_prompts`, `max_per_run`, `model`, `timeout`, `dialogue_chars`.
@@ -251,6 +272,7 @@ Environment variables:
 - `SM_PROMPT_HOOK=0`: Disable prompt-hook recall and background catch-up for one process tree (such as subagent runs).
 - `SM_BINARY_PATH`: Explicit path to a `sm` binary for the npm wrapper; exits with an error if the path does not exist instead of falling back.
 - `SM_SKIP_DOWNLOAD=1`: Skip the npm `postinstall` GitHub Release binary fallback download.
+- `SM_NO_UPDATE_CHECK=1`: Disable the npm wrapper's 24-hour interactive update reminder.
 
 </details>
 

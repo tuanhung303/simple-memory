@@ -1,10 +1,12 @@
-//! The `show` command and its text output.
+//! The `show` command and its text and JSON output.
 
 use crate::core::item::Item;
 use crate::core::tags::retired_label;
 use crate::error::SmError;
+use crate::py;
 use crate::py::argparse::Namespace;
 use crate::py::io::Out;
+use crate::service::mcp::item_json;
 use crate::service::show::run_show_many;
 use crate::service::usage::log_usage;
 
@@ -36,11 +38,16 @@ pub fn print_item(it: &Item, out: &mut Out) -> Result<(), SmError> {
 
 pub fn run(ns: &Namespace, out: &mut Out) -> Result<i32, SmError> {
     let (found, missing) = run_show_many(&ns.get_str_list("ids"), None)?;
-    for (n, it) in found.iter().enumerate() {
-        if n > 0 {
-            out.print("")?;
+    if ns.get_str("format") == "json" {
+        let arr = serde_json::Value::Array(found.iter().map(item_json).collect());
+        out.print(&py::json::dumps_value(&arr, &py::json::Opts::unicode()))?;
+    } else {
+        for (n, it) in found.iter().enumerate() {
+            if n > 0 {
+                out.print("")?;
+            }
+            print_item(it, out)?;
         }
-        print_item(it, out)?;
     }
     for id in &missing {
         out.eprint(&format!("not found: {id}"))?;

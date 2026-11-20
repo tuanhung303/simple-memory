@@ -334,12 +334,50 @@ fn local_naive_epoch(naive: NaiveDateTime) -> f64 {
         .timestamp() as f64
 }
 
-/// Parse a `--since` (`end_of_day = false`) or `--until` (`end_of_day = true`) ISO 8601 bound.
-/// Returns `(epoch_secs, exclusive)`: date-only `--until` advances to next local midnight with
-/// `exclusive = true` (`< ?`), except `9999-12-31` which uses `23:59:59` local with `exclusive = false`.
-pub fn parse_date_bound(value: &str, end_of_day: bool) -> Result<(f64, bool), SmError> {
-    let norm = validate_as_of(Some(value), false, false)?;
+const MAX_RELATIVE_COUNT: u64 = 36_500;
+
+/// Parse `<N><unit>` relative shorthand (`m`/`h`/`d`/`w`, case-insensitive, `N` in `1..=36500`).
+/// Returns `Ok(Some(epoch))` when matched, `Ok(None)` when `stripped` is not a relative form,
+/// or `Err` for `<digits><m|h|d|w>` with `N` outside `1..=36500`.
+fn parse_relative_bound(raw: &str, stripped: &str, now_epoch: f64) -> Result<Option<f64>, SmError> {
+    let bytes = stripped.as_bytes();
+    if bytes.len() < 2 {
+        return Ok(None);
+    }
+    let unit_secs = match bytes[bytes.len() - 1].to_ascii_lowercase() {
+        b'm' => 60.0,
+        b'h' => 3600.0,
+        b'd' => 86400.0,
+        b'w' => 604800.0,
+        _ => return Ok(None),
+    };
+    let digits = &stripped[..stripped.len() - 1];
+    if !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return Ok(None);
+    }
+    let Some(n) = digits
+        .parse::<u64>()
+        .ok()
+        .filter(|&n| (1..=MAX_RELATIVE_COUNT).contains(&n))
+    else {
+        return Err(SmError::value(format!(
+            "Invalid relative date {}; expected <N><m|h|d|w> with N in 1..={MAX_RELATIVE_COUNT}",
+            repr(raw)
+        )));
+    };
+    Ok(Some(now_epoch - (n as f64) * unit_secs))
+}
+
+fn parse_date_bound_at(
+    value: &str,
+    end_of_day: bool,
+    now_epoch: f64,
+) -> Result<(f64, bool), SmError> {
     let s0 = strip(value);
+    if let Some(ep) = parse_relative_bound(value, s0, now_epoch)? {
+        return Ok((ep, false));
+    }
+    let norm = validate_as_of(Some(value), false, false)?;
     let replaced = AS_OF_WORD_RE.replace(s0, "");
     let stripped = strip(&replaced);
     if end_of_day && DATE_ONLY_RE.is_match(stripped) {
@@ -354,21 +392,34 @@ pub fn parse_date_bound(value: &str, end_of_day: bool) -> Result<(f64, bool), Sm
     Ok((dt.timestamp() as f64, false))
 }
 
+/// Parse a `--since` (`end_of_day = false`) or `--until` (`end_of_day = true`) ISO 8601 or
+/// relative (`<N><m|h|d|w>`) bound. Returns `(epoch_secs, exclusive)`: date-only `--until`
+/// advances to next local midnight with `exclusive = true` (`< ?`), except `9999-12-31` which
+/// uses `23:59:59` local with `exclusive = false`.
+pub fn parse_date_bound(value: &str, end_of_day: bool) -> Result<(f64, bool), SmError> {
+    parse_date_bound_at(value, end_of_day, clock::now_epoch())
+}
+
 /// Validate optional `--since` and `--until` bounds, returning `(since_epoch, until_epoch, until_exclusive)`.
 pub fn validate_date_range(
     since: Option<&str>,
     until: Option<&str>,
 ) -> Result<(Option<f64>, Option<f64>, bool), SmError> {
-    let since_ep = match since.filter(|s| !s.is_empty()) {
-        Some(v) => Some(parse_date_bound(v, false)?.0),
-        None => None,
-    };
-    let (until_ep, until_excl) = match until.filter(|s| !s.is_empty()) {
-        Some(v) => {
-            let (ep, excl) = parse_date_bound(v, true)?;
-            (Some(ep), excl)
+    let since_val = since.filter(|s| !s.is_empty());
+    let until_val = until.filter(|s| !s.is_empty());
+    let (since_ep, until_ep, until_excl) = match (since_val, until_val) {
+        (None, None) => return Ok((None, None, false)),
+        (Some(s), None) => (Some(parse_date_bound(s, false)?.0), None, false),
+        (None, Some(u)) => {
+            let (ep, excl) = parse_date_bound(u, true)?;
+            (None, Some(ep), excl)
         }
-        None => (None, false),
+        (Some(s), Some(u)) => {
+            let now = clock::now_epoch();
+            let s_ep = parse_date_bound_at(s, false, now)?.0;
+            let (u_ep, excl) = parse_date_bound_at(u, true, now)?;
+            (Some(s_ep), Some(u_ep), excl)
+        }
     };
     if let (Some(s), Some(u)) = (since_ep, until_ep)
         && ((until_excl && s >= u) || (!until_excl && s > u))
@@ -952,6 +1003,50 @@ mod tests {
         );
         // Whitespace-only bound is rejected as invalid timestamp.
         assert!(validate_date_range(Some("   "), None).is_err());
+
+        // Relative shorthand (<N><m|h|d|w>, case-insensitive, N in 1..=36500).
+        let now = 1_800_000_000.0;
+        assert_eq!(
+            parse_date_bound_at("1m", false, now).unwrap(),
+            (now - 60.0, false)
+        );
+        assert_eq!(
+            parse_date_bound_at("24H", true, now).unwrap(),
+            (now - 86_400.0, false)
+        );
+        assert_eq!(
+            parse_date_bound_at(" 7d ", false, now).unwrap(),
+            (now - 7.0 * 86_400.0, false)
+        );
+        assert_eq!(
+            parse_date_bound_at("2W", true, now).unwrap(),
+            (now - 2.0 * 604_800.0, false)
+        );
+        assert_eq!(
+            parse_date_bound_at("36500d", false, now).unwrap(),
+            (now - 36_500.0 * 86_400.0, false)
+        );
+        for bad in ["0d", "00m", "36501d", "99999999999999999999999d"] {
+            let err = parse_date_bound_at(bad, false, now).unwrap_err();
+            assert_eq!(
+                err.python_text(),
+                format!(
+                    "ValueError: Invalid relative date '{bad}'; expected <N><m|h|d|w> with N in 1..=36500"
+                ),
+                "{bad}"
+            );
+        }
+        for bad in ["-7d", "7x", "1.5d", "d", "7d extra"] {
+            assert!(parse_date_bound_at(bad, false, now).is_err(), "{bad}");
+        }
+        // validate_date_range shares one clock::now_epoch() across both bounds.
+        let (s, u, excl) = validate_date_range(Some("24h"), Some("1d")).unwrap();
+        assert_eq!((s, u, excl), (s, s, false));
+        let err = validate_date_range(Some("1d"), Some("7d")).unwrap_err();
+        assert_eq!(
+            err.python_text(),
+            "ValueError: --since cannot be after --until"
+        );
     }
 
     #[test]

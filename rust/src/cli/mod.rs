@@ -18,6 +18,7 @@ pub mod show;
 pub mod stats;
 pub mod supersede;
 pub mod transfer;
+pub mod update;
 pub mod upkeep;
 
 use std::ffi::OsString;
@@ -72,7 +73,7 @@ fn report_error(e: &SmError, out: &mut Out) -> i32 {
 fn dispatch(ns: &Namespace, out: &mut Out) -> Result<i32, SmError> {
     match ns.get_str("command") {
         "put" => put::run(ns, out),
-        "query" => query::run(ns, out),
+        "query" | "search" => query::run(ns, out),
         "show" => show::run(ns, out),
         "related" => related::run(ns, out),
         "supersede" => supersede::run(ns, out),
@@ -89,6 +90,7 @@ fn dispatch(ns: &Namespace, out: &mut Out) -> Result<i32, SmError> {
         "mcp" => mcp::run(ns, out),
         "init" | "config" | "hooks" => setup::run(ns, out),
         "doctor" => doctor::run(ns, out),
+        "update" => update::run(ns, out),
         _ => Ok(0),
     }
 }

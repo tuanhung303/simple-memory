@@ -63,6 +63,7 @@ pub fn defaults() -> PyValue {
                 ("claude_bin", s("")),
                 ("extra_stopwords", PyValue::List(vec![])),
                 ("min_idf", float(3.0)),
+                ("local_min_idf", float(crate::service::query::LOCAL_TAU)),
                 ("projects", empty()),
             ]),
         ),
@@ -155,6 +156,10 @@ pub const NOTES: &[(&str, &str)] = &[
     (
         "prompt_hook.min_idf",
         "Minimum matched-term IDF sum for Haiku hook recall when scope has >= 20 items (0.0 disables; exact ref hits bypass).",
+    ),
+    (
+        "prompt_hook.local_min_idf",
+        "Minimum matched-term IDF sum for local prompt-hook fallback recall (0.0 disables).",
     ),
     (
         "prompt_hook.projects",
@@ -705,7 +710,7 @@ mod tests {
         let text = config_toml(&defaults(), false).unwrap();
         assert!(text.starts_with("[repos]\nroots = []\n\n[repo_aliases]\n\n[keyword_aliases]\n\n[prompt_hook]\nenabled = true\n"));
         assert!(text.contains(
-            "timeout = 8.0\nlimit = 4\nclaude_bin = \"\"\nextra_stopwords = []\nmin_idf = 3.0\n\n[prompt_hook.projects]\n\n[catch_up]"
+            "timeout = 8.0\nlimit = 4\nclaude_bin = \"\"\nextra_stopwords = []\nmin_idf = 3.0\nlocal_min_idf = 8.0\n\n[prompt_hook.projects]\n\n[catch_up]"
         ));
         assert!(text.ends_with("[backup]\ninterval_hours = 24\nkeep = 7\n"));
         assert_eq!(
@@ -785,7 +790,7 @@ mod tests {
         assert_eq!(
             get(&cfg, "prompt_hook").unwrap().py_repr(),
             "{'enabled': True, 'model': 'haiku', 'timeout': 8.0, 'limit': 4, 'claude_bin': '', \
-             'extra_stopwords': [], 'min_idf': 3.0, 'projects': {'ACME': 'Acme, a repository', 'ops': 'the ops repo'}}"
+             'extra_stopwords': [], 'min_idf': 3.0, 'local_min_idf': 8.0, 'projects': {'ACME': 'Acme, a repository', 'ops': 'the ops repo'}}"
         );
         assert_eq!(
             get(&cfg, "upkeep").unwrap().py_repr(),

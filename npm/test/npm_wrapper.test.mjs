@@ -16,6 +16,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const REPO_ROOT = path.resolve(__dirname, "..", "..");
 const BIN_SM = path.join(REPO_ROOT, "npm", "simple-memory", "bin", "sm.js");
+const CHECK_UPDATE_SCRIPT = path.join(REPO_ROOT, "npm", "simple-memory", "scripts", "check-update.js");
 const STAGE_SCRIPT = path.join(REPO_ROOT, "scripts", "stage_npm.sh");
 
 const {
@@ -26,11 +27,25 @@ const {
 } = require("../simple-memory/lib/platform.js");
 
 const {
+  DEFAULT_TTL_MS,
+  parseSemver,
+  isNewerVersion,
+  shouldCheckUpdate,
+  cachePathForEnv,
+  readUpdateCache,
+  isCacheStale,
+  formatUpdateNotice,
+  maybeNotifyAndRefresh,
+} = require("../simple-memory/lib/update.js");
+
+const {
   parseSha256Sums,
   readStreamWithLimit,
   extractBinaryFromTarGz,
   runPostinstall,
 } = require("../simple-memory/scripts/postinstall.js");
+
+const { fetchAndWriteUpdateCache } = require("../simple-memory/scripts/check-update.js");
 
 function withTempDir(fn) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "sm-npm-test-"));
@@ -139,7 +154,7 @@ function makeMachOHeader(cpuType, cpuSubtype, dylibPath = null, suffix = Buffer.
   return Buffer.concat([hdr, lc, suffix]);
 }
 
-function makeFixtureRepo(dir, cargoVersion = "0.5.0") {
+function makeFixtureRepo(dir, cargoVersion = "0.6.0") {
   fs.mkdirSync(path.join(dir, "rust"), { recursive: true });
   fs.writeFileSync(
     path.join(dir, "rust", "Cargo.toml"),
@@ -153,6 +168,74 @@ function makeFixtureRepo(dir, cargoVersion = "0.5.0") {
   fs.cpSync(path.join(REPO_ROOT, "npm", "platforms"), path.join(dir, "npm", "platforms"), {
     recursive: true,
   });
+}
+
+function spawnAsync(cmd, args, options = {}) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(cmd, args, {
+      ...options,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    const outChunks = [];
+    const errChunks = [];
+    child.stdout.on("data", (c) => outChunks.push(c));
+    child.stderr.on("data", (c) => errChunks.push(c));
+    child.on("error", reject);
+    child.on("close", (status, signal) => {
+      resolve({
+        status,
+        signal,
+        stdout: Buffer.concat(outChunks).toString("utf8"),
+        stderr: Buffer.concat(errChunks).toString("utf8"),
+      });
+    });
+  });
+}
+
+async function runWithStderrPty(cmdArgs, env) {
+  const pyCode = `
+import errno, json, os, pty, select, subprocess, sys, termios
+cmd = json.loads(sys.argv[1])
+master_fd, slave_fd = pty.openpty()
+attrs = termios.tcgetattr(slave_fd)
+attrs[1] &= ~termios.ONLCR
+termios.tcsetattr(slave_fd, termios.TCSANOW, attrs)
+proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=slave_fd)
+os.close(slave_fd)
+out_fd = proc.stdout.fileno()
+out_chunks = []
+err_chunks = []
+open_fds = [out_fd, master_fd]
+while open_fds:
+    r, _, _ = select.select(open_fds, [], [], 0.2)
+    if not r and proc.poll() is not None:
+        break
+    for fd in r:
+        try:
+            data = os.read(fd, 4096)
+        except OSError as e:
+            if e.errno == errno.EIO:
+                data = b""
+            else:
+                raise
+        if not data:
+            open_fds.remove(fd)
+        elif fd == out_fd:
+            out_chunks.append(data)
+        else:
+            err_chunks.append(data)
+rc = proc.wait()
+proc.stdout.close()
+os.close(master_fd)
+sys.stdout.write(json.dumps({
+    "status": rc,
+    "stdout": b"".join(out_chunks).decode("utf-8", "replace"),
+    "stderr": b"".join(err_chunks).decode("utf-8", "replace"),
+}))
+`;
+  const run = await spawnAsync("python3", ["-c", pyCode, JSON.stringify(cmdArgs)], { env });
+  assert.equal(run.status, 0, `pty runner failed:\nstderr: ${run.stderr}\nstdout: ${run.stdout}`);
+  return JSON.parse(run.stdout);
 }
 
 async function pollUntil(predicate, timeoutMs = 5000, intervalMs = 20) {
@@ -600,6 +683,502 @@ setInterval(() => {}, 10000);
       assert.match(eacces.stderr, /failed to execute/);
     });
   });
+
+  it("passes SM_INSTALL_METHOD=npm to child and handles TTY vs non-TTY update notices and detached refresh", async () => {
+    const reqs = [];
+    const srv = await startServer((req, res) => {
+      reqs.push(req.url);
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ name: "simple-memory", version: "0.7.1" }));
+    });
+    try {
+      await withTempDirAsync(async (dir) => {
+        const stub = path.join(dir, "sm");
+        fs.writeFileSync(
+          stub,
+          `#!${process.execPath}
+process.stdout.write(JSON.stringify({
+  installMethod: process.env.SM_INSTALL_METHOD || "",
+  argv: process.argv.slice(2),
+}) + "\\n");
+`,
+          { mode: 0o755 }
+        );
+        fs.chmodSync(stub, 0o755);
+
+        const smHome = path.join(dir, "sm-home");
+        fs.mkdirSync(smHome, { recursive: true });
+        const cachePath = path.join(smHome, "update-check.json");
+
+        // Non-TTY run passes SM_INSTALL_METHOD=npm, emits zero stderr, and triggers zero HTTP calls.
+        fs.writeFileSync(cachePath, JSON.stringify({ checked_at: Date.now(), latest: "0.7.0" }));
+        const nonTtyEnv = { ...process.env, SM_BINARY_PATH: stub, SIMPLE_MEMORY_HOME: smHome, SM_UPDATE_CHECK_URL: srv.baseUrl };
+        delete nonTtyEnv.CI;
+        delete nonTtyEnv.SM_NO_UPDATE_CHECK;
+        const nonTtyRun = spawnSync(process.execPath, [BIN_SM, "list"], {
+          env: nonTtyEnv,
+          encoding: "utf8",
+        });
+        assert.equal(nonTtyRun.status, 0);
+        assert.equal(nonTtyRun.stderr, "");
+        assert.deepEqual(JSON.parse(nonTtyRun.stdout), { installMethod: "npm", argv: ["list"] });
+        assert.equal(reqs.length, 0);
+
+        // TTY run with fresh cache newer than 0.6.0 prints exact 1-line stderr notice and keeps stdout clean.
+        const ttyRun = await runWithStderrPty([process.execPath, BIN_SM, "list"], nonTtyEnv);
+        assert.equal(ttyRun.status, 0);
+        assert.deepEqual(JSON.parse(ttyRun.stdout), { installMethod: "npm", argv: ["list"] });
+        assert.equal(
+          ttyRun.stderr,
+          "Update available: 0.6.0 -> 0.7.0. Run: sm update (or npm install -g simple-memory@latest; disable: SM_NO_UPDATE_CHECK=1)\n"
+        );
+        assert.equal(reqs.length, 0);
+
+        // TTY suppression guards: SM_NO_UPDATE_CHECK=1, CI=1, mcp, hook, hooks, update, --format json, --version.
+        const suppressedCases = [
+          { args: ["list"], extraEnv: { SM_NO_UPDATE_CHECK: "1" } },
+          { args: ["list"], extraEnv: { CI: "1" } },
+          { args: ["mcp"], extraEnv: {} },
+          { args: ["hook", "prompt"], extraEnv: {} },
+          { args: ["hooks", "print", "mcp"], extraEnv: {} },
+          { args: ["update", "--check"], extraEnv: {} },
+          { args: ["query", "abc", "--format", "json"], extraEnv: {} },
+          { args: ["query", "abc", "--format=json"], extraEnv: {} },
+          { args: ["--version"], extraEnv: {} },
+          { args: ["-v"], extraEnv: {} },
+        ];
+        const suppressedRuns = await Promise.all(
+          suppressedCases.map((c) =>
+            runWithStderrPty([process.execPath, BIN_SM, ...c.args], {
+              ...nonTtyEnv,
+              ...c.extraEnv,
+            }).then((r) => ({ c, r }))
+          )
+        );
+        for (const { c, r } of suppressedRuns) {
+          assert.equal(r.status, 0);
+          assert.deepEqual(JSON.parse(r.stdout), { installMethod: "npm", argv: c.args });
+          assert.equal(r.stderr, "", `expected empty stderr for ${JSON.stringify(c)}`);
+        }
+
+        // Signal exit on TTY must not print update notice even with a newer cache.
+        const sigStub = path.join(dir, "sm-sig");
+        fs.writeFileSync(sigStub, "#!/bin/sh\nkill -PIPE $$\n", { mode: 0o755 });
+        fs.chmodSync(sigStub, 0o755);
+        const sigRun = await runWithStderrPty([process.execPath, BIN_SM, "list"], {
+          ...nonTtyEnv,
+          SM_BINARY_PATH: sigStub,
+        });
+        assert.equal(sigRun.status, 141);
+        assert.equal(sigRun.stdout, "");
+        assert.equal(sigRun.stderr, "");
+
+        // Missing cache on TTY spawns detached check-update.js; next TTY run prints cached notice with no new HTTP call.
+        fs.rmSync(cachePath);
+        const firstTty = await runWithStderrPty([process.execPath, BIN_SM, "list"], nonTtyEnv);
+        assert.equal(firstTty.status, 0);
+        assert.equal(firstTty.stderr, "");
+        await pollUntil(() => fs.existsSync(cachePath));
+        const written = JSON.parse(fs.readFileSync(cachePath, "utf8"));
+        assert.equal(written.latest, "0.7.1");
+        assert.equal(typeof written.checked_at, "number");
+        assert.equal(reqs.length, 1);
+
+        const secondTty = await runWithStderrPty([process.execPath, BIN_SM, "list"], nonTtyEnv);
+        assert.equal(secondTty.status, 0);
+        assert.equal(
+          secondTty.stderr,
+          "Update available: 0.6.0 -> 0.7.1. Run: sm update (or npm install -g simple-memory@latest; disable: SM_NO_UPDATE_CHECK=1)\n"
+        );
+        assert.equal(reqs.length, 1);
+      });
+    } finally {
+      await srv.close();
+    }
+  });
+});
+
+describe("lib/update.js", () => {
+  it("parseSemver and isNewerVersion compare major.minor.patch numerically and reject prereleases or malformed strings", () => {
+    assert.deepEqual(parseSemver("0.6.0"), { major: 0, minor: 6, patch: 0 });
+    assert.deepEqual(parseSemver("12.34.56"), { major: 12, minor: 34, patch: 56 });
+
+    for (const bad of [
+      "0.7.0-rc.1",
+      "0.7.0-alpha",
+      "0.7.0+build.1",
+      "v0.7.0",
+      "0.7",
+      "0.7.0.1",
+      "01.2.3",
+      " 0.7.0",
+      "",
+      null,
+      undefined,
+      123,
+      "99999999999999999999.0.0",
+    ]) {
+      assert.equal(parseSemver(bad), null, `expected null for ${String(bad)}`);
+      assert.equal(isNewerVersion(bad, "0.6.0"), false);
+      assert.equal(isNewerVersion("0.7.0", bad), false);
+    }
+
+    assert.equal(isNewerVersion("0.6.1", "0.6.0"), true);
+    assert.equal(isNewerVersion("0.7.0", "0.6.9"), true);
+    assert.equal(isNewerVersion("0.10.0", "0.9.9"), true);
+    assert.equal(isNewerVersion("1.0.0", "0.99.99"), true);
+    assert.equal(isNewerVersion("2.0.0", "1.9.9"), true);
+    assert.equal(isNewerVersion("0.6.0", "0.6.0"), false);
+    assert.equal(isNewerVersion("0.5.9", "0.6.0"), false);
+    assert.equal(isNewerVersion("0.6.0", "0.7.0"), false);
+    assert.equal(isNewerVersion("1.0.0", "2.0.0"), false);
+  });
+
+  it("shouldCheckUpdate enforces TTY, SM_NO_UPDATE_CHECK, CI, subcommand, JSON format, and version/help guards", () => {
+    // Normal interactive command.
+    assert.equal(shouldCheckUpdate({ argv: ["query", "auth"], env: {}, isStderrTTY: true }), true);
+    assert.equal(shouldCheckUpdate({ argv: [], env: {}, isStderrTTY: true }), true);
+    assert.equal(shouldCheckUpdate({ argv: ["query", "mcp"], env: {}, isStderrTTY: true }), true);
+    assert.equal(shouldCheckUpdate({ argv: ["query", "foo", "--format", "text"], env: {}, isStderrTTY: true }), true);
+    assert.equal(shouldCheckUpdate({ argv: ["query", "foo", "--format"], env: {}, isStderrTTY: true }), true);
+    assert.equal(shouldCheckUpdate({ argv: ["put", "--", "--help"], env: {}, isStderrTTY: true }), true);
+    assert.equal(shouldCheckUpdate({ argv: ["query", "--", "-v"], env: {}, isStderrTTY: true }), true);
+
+    // Non-TTY.
+    assert.equal(shouldCheckUpdate({ argv: ["list"], env: {}, isStderrTTY: false }), false);
+    assert.equal(shouldCheckUpdate({ argv: ["list"], env: {}, isStderrTTY: undefined }), false);
+
+    // SM_NO_UPDATE_CHECK.
+    assert.equal(
+      shouldCheckUpdate({ argv: ["list"], env: { SM_NO_UPDATE_CHECK: "1" }, isStderrTTY: true }),
+      false
+    );
+    assert.equal(
+      shouldCheckUpdate({ argv: ["list"], env: { SM_NO_UPDATE_CHECK: "0" }, isStderrTTY: true }),
+      true
+    );
+
+    // CI env values.
+    for (const ci of ["1", "true", "TRUE", "yes", "github"]) {
+      assert.equal(
+        shouldCheckUpdate({ argv: ["list"], env: { CI: ci }, isStderrTTY: true }),
+        false,
+        `expected CI=${ci} to suppress`
+      );
+    }
+    for (const ci of ["", "0", "false", "FALSE", "  "]) {
+      assert.equal(
+        shouldCheckUpdate({ argv: ["list"], env: { CI: ci }, isStderrTTY: true }),
+        true,
+        `expected CI=${JSON.stringify(ci)} to allow`
+      );
+    }
+
+    // Non-array argv guard.
+    assert.equal(shouldCheckUpdate({ argv: null, env: {}, isStderrTTY: true }), false);
+
+    // Skipped subcommands.
+    for (const sub of [["mcp"], ["hook", "prompt"], ["hooks", "print", "agy"], ["update"], ["update", "--check"]]) {
+      assert.equal(
+        shouldCheckUpdate({ argv: sub, env: {}, isStderrTTY: true }),
+        false,
+        `expected subcommand ${sub[0]} to suppress`
+      );
+    }
+
+    // Skipped flags.
+    for (const args of [
+      ["--version"],
+      ["-v"],
+      ["-h"],
+      ["--help"],
+      ["query", "--help"],
+      ["query", "-h"],
+      ["query", "foo", "--format", "json"],
+      ["show", "m_1", "--format=json"],
+    ]) {
+      assert.equal(
+        shouldCheckUpdate({ argv: args, env: {}, isStderrTTY: true }),
+        false,
+        `expected args ${JSON.stringify(args)} to suppress`
+      );
+    }
+  });
+
+  it("cachePathForEnv, readUpdateCache, isCacheStale, formatUpdateNotice, and maybeNotifyAndRefresh handle normal, boundary, and corrupt cases", () => {
+    assert.equal(
+      cachePathForEnv({ SIMPLE_MEMORY_HOME: "/tmp/custom-sm" }, "/tmp/ignored-home"),
+      path.join("/tmp/custom-sm", "update-check.json")
+    );
+    assert.equal(
+      cachePathForEnv({ SIMPLE_MEMORY_HOME: "~/tilde-home" }, "/tmp/base-home"),
+      path.join("/tmp/base-home", "tilde-home", "update-check.json")
+    );
+    assert.equal(
+      cachePathForEnv({ SIMPLE_MEMORY_HOME: "~" }, "/tmp/base-home"),
+      path.join("/tmp/base-home", "update-check.json")
+    );
+    assert.equal(
+      cachePathForEnv({ SIMPLE_MEMORY_HOME: "  " }, "/tmp/base-home"),
+      path.join("/tmp/base-home", ".simple-memory", "update-check.json")
+    );
+    assert.equal(
+      cachePathForEnv({}, "/tmp/base-home"),
+      path.join("/tmp/base-home", ".simple-memory", "update-check.json")
+    );
+
+    const t0 = 1_700_000_000_000;
+    assert.equal(DEFAULT_TTL_MS, 86_400_000);
+    assert.equal(isCacheStale(null, t0), true);
+    assert.equal(isCacheStale({ checked_at: t0, latest: "0.6.0" }, t0), false);
+    assert.equal(isCacheStale({ checked_at: t0, latest: "0.6.0" }, t0 + DEFAULT_TTL_MS - 1), false);
+    assert.equal(isCacheStale({ checked_at: t0, latest: "0.6.0" }, t0 + DEFAULT_TTL_MS), true);
+    assert.equal(isCacheStale({ checked_at: t0, latest: "0.6.0" }, t0 + DEFAULT_TTL_MS + 1), true);
+
+    assert.equal(
+      formatUpdateNotice("0.6.0", "0.7.0"),
+      "Update available: 0.6.0 -> 0.7.0. Run: sm update (or npm install -g simple-memory@latest; disable: SM_NO_UPDATE_CHECK=1)\n"
+    );
+
+    withTempDir((dir) => {
+      const missing = path.join(dir, "missing.json");
+      assert.equal(readUpdateCache(missing), null);
+      assert.equal(readUpdateCache(""), null);
+      assert.equal(readUpdateCache(dir), null);
+
+      const badJson = path.join(dir, "bad.json");
+      fs.writeFileSync(badJson, "{not json");
+      assert.equal(readUpdateCache(badJson), null);
+
+      const badShape = path.join(dir, "bad-shape.json");
+      for (const content of [
+        JSON.stringify({ checked_at: "123", latest: "0.7.0" }),
+        JSON.stringify({ checked_at: -1, latest: "0.7.0" }),
+        JSON.stringify({ checked_at: t0, latest: "0.7.0-rc.1" }),
+        JSON.stringify({ checked_at: t0 }),
+        "null",
+      ]) {
+        fs.writeFileSync(badShape, content);
+        assert.equal(readUpdateCache(badShape), null);
+      }
+
+      const valid = path.join(dir, "valid.json");
+      fs.writeFileSync(valid, JSON.stringify({ checked_at: t0, latest: "0.7.0" }));
+      assert.deepEqual(readUpdateCache(valid), { checked_at: t0, latest: "0.7.0" });
+
+      // maybeNotifyAndRefresh: suppressed does nothing.
+      const smHome = path.join(dir, "sm-home");
+      fs.mkdirSync(smHome);
+      const cacheFile = path.join(smHome, "update-check.json");
+      const refreshCalls = [];
+      const stderrSuppressed = createBufferWriter();
+      assert.deepEqual(
+        maybeNotifyAndRefresh({
+          argv: ["list"],
+          env: { SIMPLE_MEMORY_HOME: smHome, SM_NO_UPDATE_CHECK: "1" },
+          currentVersion: "0.6.0",
+          isStderrTTY: true,
+          stderr: stderrSuppressed,
+          spawnRefresh: (p) => refreshCalls.push(p),
+          nowMs: t0,
+        }),
+        { notified: false, refreshed: false, latest: null }
+      );
+      assert.equal(stderrSuppressed.text(), "");
+      assert.deepEqual(refreshCalls, []);
+
+      // Missing cache refreshes without notifying.
+      const stderrMissing = createBufferWriter();
+      assert.deepEqual(
+        maybeNotifyAndRefresh({
+          argv: ["list"],
+          env: { SIMPLE_MEMORY_HOME: smHome },
+          currentVersion: "0.6.0",
+          isStderrTTY: true,
+          stderr: stderrMissing,
+          spawnRefresh: (p) => refreshCalls.push(p),
+          nowMs: t0,
+        }),
+        { notified: false, refreshed: true, latest: null }
+      );
+      assert.equal(stderrMissing.text(), "");
+      assert.deepEqual(refreshCalls, [cacheFile]);
+
+      // Fresh cache with newer version notifies and does not refresh.
+      refreshCalls.length = 0;
+      fs.writeFileSync(cacheFile, JSON.stringify({ checked_at: t0, latest: "0.7.0" }));
+      const stderrFresh = createBufferWriter();
+      assert.deepEqual(
+        maybeNotifyAndRefresh({
+          argv: ["list"],
+          env: { SIMPLE_MEMORY_HOME: smHome },
+          currentVersion: "0.6.0",
+          isStderrTTY: true,
+          stderr: stderrFresh,
+          spawnRefresh: (p) => refreshCalls.push(p),
+          nowMs: t0 + 1000,
+        }),
+        { notified: true, refreshed: false, latest: "0.7.0" }
+      );
+      assert.equal(stderrFresh.text(), formatUpdateNotice("0.6.0", "0.7.0"));
+      assert.deepEqual(refreshCalls, []);
+
+      // Fresh cache with same version stays silent and does not refresh.
+      const stderrSame = createBufferWriter();
+      assert.deepEqual(
+        maybeNotifyAndRefresh({
+          argv: ["list"],
+          env: { SIMPLE_MEMORY_HOME: smHome },
+          currentVersion: "0.7.0",
+          isStderrTTY: true,
+          stderr: stderrSame,
+          spawnRefresh: (p) => refreshCalls.push(p),
+          nowMs: t0 + 1000,
+        }),
+        { notified: false, refreshed: false, latest: "0.7.0" }
+      );
+      assert.equal(stderrSame.text(), "");
+      assert.deepEqual(refreshCalls, []);
+
+      // Stale cache with newer version both notifies and refreshes.
+      const stderrStale = createBufferWriter();
+      assert.deepEqual(
+        maybeNotifyAndRefresh({
+          argv: ["list"],
+          env: { SIMPLE_MEMORY_HOME: smHome },
+          currentVersion: "0.6.0",
+          isStderrTTY: true,
+          stderr: stderrStale,
+          spawnRefresh: (p) => refreshCalls.push(p),
+          nowMs: t0 + DEFAULT_TTL_MS,
+        }),
+        { notified: true, refreshed: true, latest: "0.7.0" }
+      );
+      assert.equal(stderrStale.text(), formatUpdateNotice("0.6.0", "0.7.0"));
+      assert.deepEqual(refreshCalls, [cacheFile]);
+
+      // Throwing stderr and spawnRefresh never propagate errors.
+      assert.deepEqual(
+        maybeNotifyAndRefresh({
+          argv: ["list"],
+          env: { SIMPLE_MEMORY_HOME: smHome },
+          currentVersion: "0.6.0",
+          isStderrTTY: true,
+          stderr: {
+            write() {
+              throw new Error("EPIPE");
+            },
+          },
+          spawnRefresh() {
+            throw new Error("ENOENT");
+          },
+          nowMs: t0 + DEFAULT_TTL_MS,
+        }),
+        { notified: false, refreshed: false, latest: "0.7.0" }
+      );
+    });
+  });
+});
+
+describe("scripts/check-update.js", () => {
+  it("fetches latest version from HTTP mock, writes atomic cache, and exits 0 silently on 500, invalid JSON, prerelease, timeout, or offline", async () => {
+    let mode = "ok";
+    const srv = await startServer((_req, res) => {
+      if (mode === "ok") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ name: "simple-memory", version: "0.8.0" }));
+      } else if (mode === "500") {
+        res.writeHead(500, { "content-type": "application/json" });
+        res.end(JSON.stringify({ version: "9.9.9", error: "server error" }));
+      } else if (mode === "bad-json") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end("{broken");
+      } else if (mode === "prerelease") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ version: "0.9.0-beta.1" }));
+      } else if (mode === "oversized") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ version: "0.9.0", pad: "x".repeat(4096) }));
+      } else if (mode === "hang") {
+        // Leave open until AbortSignal fires.
+      }
+    });
+
+    try {
+      await withTempDirAsync(async (dir) => {
+        const cachePath = path.join(dir, "nested", "update-check.json");
+
+        // CLI invocation writes valid atomic cache with zero stdout/stderr.
+        const okCli = await spawnAsync(process.execPath, [CHECK_UPDATE_SCRIPT, cachePath], {
+          env: { ...process.env, SM_UPDATE_CHECK_URL: srv.baseUrl },
+        });
+        assert.equal(okCli.status, 0);
+        assert.equal(okCli.stdout, "");
+        assert.equal(okCli.stderr, "");
+        const parsed = JSON.parse(fs.readFileSync(cachePath, "utf8"));
+        assert.equal(parsed.latest, "0.8.0");
+        assert.equal(typeof parsed.checked_at, "number");
+        assert.deepEqual(fs.readdirSync(path.dirname(cachePath)), ["update-check.json"]);
+
+        // CLI invocation with no positional cachePath falls back to SIMPLE_MEMORY_HOME.
+        const envSmHome = path.join(dir, "env-home");
+        const envCli = await spawnAsync(process.execPath, [CHECK_UPDATE_SCRIPT], {
+          env: { ...process.env, SIMPLE_MEMORY_HOME: envSmHome, SM_UPDATE_CHECK_URL: srv.baseUrl },
+        });
+        assert.equal(envCli.status, 0);
+        assert.equal(envCli.stdout, "");
+        assert.equal(envCli.stderr, "");
+        const envParsed = JSON.parse(
+          fs.readFileSync(path.join(envSmHome, "update-check.json"), "utf8")
+        );
+        assert.equal(envParsed.latest, "0.8.0");
+
+        // Existing cache must remain intact across 500, bad JSON, prerelease, oversized, timeout, and offline errors.
+        const snapshot = fs.readFileSync(cachePath, "utf8");
+
+        for (const errMode of ["500", "bad-json", "prerelease"]) {
+          mode = errMode;
+          const cliRun = await spawnAsync(process.execPath, [CHECK_UPDATE_SCRIPT, cachePath], {
+            env: { ...process.env, SM_UPDATE_CHECK_URL: srv.baseUrl },
+          });
+          assert.equal(cliRun.status, 0, `mode ${errMode} must exit 0`);
+          assert.equal(cliRun.stdout, "");
+          assert.equal(cliRun.stderr, "");
+          assert.equal(fs.readFileSync(cachePath, "utf8"), snapshot);
+        }
+
+        mode = "oversized";
+        assert.equal(
+          await fetchAndWriteUpdateCache({ cachePath, url: srv.baseUrl, maxBytes: 512 }),
+          false
+        );
+        assert.equal(fs.readFileSync(cachePath, "utf8"), snapshot);
+
+        mode = "hang";
+        assert.equal(
+          await fetchAndWriteUpdateCache({ cachePath, url: srv.baseUrl, timeoutMs: 60 }),
+          false
+        );
+        assert.equal(fs.readFileSync(cachePath, "utf8"), snapshot);
+
+        assert.equal(await fetchAndWriteUpdateCache({ cachePath: "", url: srv.baseUrl }), false);
+
+        // Offline / unreachable port exits 0 silently.
+        const deadSrv = await startServer((_req, res) => res.end());
+        const deadUrl = deadSrv.baseUrl;
+        await deadSrv.close();
+        const offlineCli = await spawnAsync(process.execPath, [CHECK_UPDATE_SCRIPT, cachePath], {
+          env: { ...process.env, SM_UPDATE_CHECK_URL: deadUrl },
+        });
+        assert.equal(offlineCli.status, 0);
+        assert.equal(offlineCli.stdout, "");
+        assert.equal(offlineCli.stderr, "");
+        assert.equal(fs.readFileSync(cachePath, "utf8"), snapshot);
+      });
+    } finally {
+      await srv.close();
+    }
+  });
 });
 
 describe("scripts/postinstall.js", () => {
@@ -1038,7 +1617,7 @@ describe("scripts/stage_npm.sh", () => {
     withTempDir((dir) => {
       const repo = path.join(dir, "repo");
       const out = path.join(dir, "stage");
-      makeFixtureRepo(repo, "0.5.0");
+      makeFixtureRepo(repo, "0.6.0");
 
       const linuxBin = path.join(dir, "sm-linux-x64");
       const darwinBin = path.join(dir, "sm-darwin-arm64");
@@ -1071,8 +1650,8 @@ describe("scripts/stage_npm.sh", () => {
         fs.readFileSync(path.join(out, "packages", "simple-memory", "package.json"), "utf8")
       );
       assert.deepEqual(stagedMainPkg.optionalDependencies, {
-        "simple-memory-darwin-arm64": "0.5.0",
-        "simple-memory-linux-x64": "0.5.0",
+        "simple-memory-darwin-arm64": "0.6.0",
+        "simple-memory-linux-x64": "0.6.0",
       });
       assert.equal(
         fs.statSync(path.join(out, "packages", "simple-memory-linux-x64", "bin", "sm")).mode & 0o777,
@@ -1082,6 +1661,14 @@ describe("scripts/stage_npm.sh", () => {
         fs.statSync(path.join(out, "packages", "simple-memory", "bin", "sm.js")).mode & 0o777,
         0o755
       );
+      assert.equal(
+        fs.existsSync(path.join(out, "packages", "simple-memory", "lib", "update.js")),
+        true
+      );
+      assert.equal(
+        fs.existsSync(path.join(out, "packages", "simple-memory", "scripts", "check-update.js")),
+        true
+      );
     });
   });
 
@@ -1089,7 +1676,7 @@ describe("scripts/stage_npm.sh", () => {
     withTempDir((dir) => {
       const repo = path.join(dir, "repo");
       const out = path.join(dir, "stage");
-      makeFixtureRepo(repo, "0.5.0");
+      makeFixtureRepo(repo, "0.6.0");
 
       const linuxBin = path.join(dir, "sm-linux-x64");
       fs.writeFileSync(linuxBin, makeElfHeader(62));
@@ -1153,7 +1740,7 @@ describe("scripts/stage_npm.sh", () => {
 
       // Version mismatch: main package.json differs from Cargo.toml while platform matches.
       const mainMismatchRepo = path.join(dir, "main-mismatch-repo");
-      makeFixtureRepo(mainMismatchRepo, "0.5.0");
+      makeFixtureRepo(mainMismatchRepo, "0.6.0");
       const mainPkgPath = path.join(mainMismatchRepo, "npm", "simple-memory", "package.json");
       const mainPkgData = JSON.parse(fs.readFileSync(mainPkgPath, "utf8"));
       mainPkgData.version = "0.9.9";
@@ -1168,7 +1755,7 @@ describe("scripts/stage_npm.sh", () => {
 
       // Version mismatch: platform package.json differs from Cargo.toml while main matches.
       const platMismatchRepo = path.join(dir, "plat-mismatch-repo");
-      makeFixtureRepo(platMismatchRepo, "0.5.0");
+      makeFixtureRepo(platMismatchRepo, "0.6.0");
       const platPkgPath = path.join(
         platMismatchRepo,
         "npm",
@@ -1197,7 +1784,7 @@ describe("scripts/stage_npm.sh", () => {
           entries: [
             {
               name: "package/package.json",
-              data: Buffer.from(JSON.stringify({ name: "simple-memory", version: "0.5.0" })),
+              data: Buffer.from(JSON.stringify({ name: "simple-memory", version: "0.6.0" })),
               mode: 0o644,
             },
             { name: "package/.env", data: Buffer.from("NPM_TOKEN=example\n"), mode: 0o644 },
@@ -1209,7 +1796,7 @@ describe("scripts/stage_npm.sh", () => {
           entries: [
             {
               name: "package/package.json",
-              data: Buffer.from(JSON.stringify({ name: "simple-memory", version: "0.5.0" })),
+              data: Buffer.from(JSON.stringify({ name: "simple-memory", version: "0.6.0" })),
               mode: 0o644,
             },
             { name: "package/vendor/sm", data: Buffer.from("bin"), mode: 0o755 },
@@ -1221,14 +1808,20 @@ describe("scripts/stage_npm.sh", () => {
           entries: [
             {
               name: "package/package.json",
-              data: Buffer.from(JSON.stringify({ name: "simple-memory", version: "0.5.0" })),
+              data: Buffer.from(JSON.stringify({ name: "simple-memory", version: "0.6.0" })),
               mode: 0o644,
             },
             { name: "package/bin/sm.js", data: Buffer.from("#!/usr/bin/env node\n"), mode: 0o644 },
             { name: "package/lib/platform.js", data: Buffer.from("// lib\n"), mode: 0o644 },
+            { name: "package/lib/update.js", data: Buffer.from("// update\n"), mode: 0o644 },
             {
               name: "package/scripts/postinstall.js",
               data: Buffer.from("// postinstall\n"),
+              mode: 0o644,
+            },
+            {
+              name: "package/scripts/check-update.js",
+              data: Buffer.from("// check-update\n"),
               mode: 0o644,
             },
             { name: "package/LICENSE", data: Buffer.from("MIT\n"), mode: 0o644 },
@@ -1242,7 +1835,7 @@ describe("scripts/stage_npm.sh", () => {
             {
               name: "package/package.json",
               data: Buffer.from(
-                JSON.stringify({ name: "simple-memory-linux-x64", version: "0.5.0" })
+                JSON.stringify({ name: "simple-memory-linux-x64", version: "0.6.0" })
               ),
               mode: 0o644,
             },
@@ -1258,7 +1851,7 @@ describe("scripts/stage_npm.sh", () => {
             {
               name: "package/package.json",
               data: Buffer.from(
-                JSON.stringify({ name: "simple-memory-linux-x64", version: "0.5.0" })
+                JSON.stringify({ name: "simple-memory-linux-x64", version: "0.6.0" })
               ),
               mode: 0o644,
             },
@@ -1273,7 +1866,7 @@ describe("scripts/stage_npm.sh", () => {
             {
               name: "package/package.json",
               data: Buffer.from(
-                JSON.stringify({ name: "simple-memory-linux-x64", version: "0.5.0" })
+                JSON.stringify({ name: "simple-memory-linux-x64", version: "0.6.0" })
               ),
               mode: 0o644,
             },
@@ -1289,7 +1882,7 @@ describe("scripts/stage_npm.sh", () => {
             {
               name: "package/package.json",
               data: Buffer.from(
-                JSON.stringify({ name: "simple-memory-linux-x64", version: "0.5.0" })
+                JSON.stringify({ name: "simple-memory-linux-x64", version: "0.6.0" })
               ),
               mode: 0o644,
             },
@@ -1311,10 +1904,32 @@ describe("scripts/stage_npm.sh", () => {
               data: Buffer.from(
                 JSON.stringify({
                   name: "simple-memory",
-                  version: "0.5.0",
-                  optionalDependencies: { "simple-memory-linux-x64": "0.5.0" },
+                  version: "0.6.0",
+                  optionalDependencies: { "simple-memory-linux-x64": "0.6.0" },
                 })
               ),
+              mode: 0o644,
+            },
+            { name: "package/bin/sm.js", data: Buffer.from("#!/usr/bin/env node\n"), mode: 0o755 },
+            { name: "package/lib/platform.js", data: Buffer.from("// lib\n"), mode: 0o644 },
+            { name: "package/lib/update.js", data: Buffer.from("// update\n"), mode: 0o644 },
+            { name: "package/scripts/postinstall.js", data: Buffer.from("// pi\n"), mode: 0o644 },
+            {
+              name: "package/scripts/check-update.js",
+              data: Buffer.from("// check-update\n"),
+              mode: 0o644,
+            },
+            { name: "package/LICENSE", data: Buffer.from("MIT\n"), mode: 0o644 },
+            { name: "package/README.md", data: Buffer.from("# hi\n"), mode: 0o644 },
+          ],
+          pattern: /optionalDependency simple-memory-linux-x64 has no matching tarball/,
+        },
+        {
+          label: "missing package/lib/update.js and package/scripts/check-update.js in main tarball",
+          entries: [
+            {
+              name: "package/package.json",
+              data: Buffer.from(JSON.stringify({ name: "simple-memory", version: "0.6.0" })),
               mode: 0o644,
             },
             { name: "package/bin/sm.js", data: Buffer.from("#!/usr/bin/env node\n"), mode: 0o755 },
@@ -1323,7 +1938,7 @@ describe("scripts/stage_npm.sh", () => {
             { name: "package/LICENSE", data: Buffer.from("MIT\n"), mode: 0o644 },
             { name: "package/README.md", data: Buffer.from("# hi\n"), mode: 0o644 },
           ],
-          pattern: /optionalDependency simple-memory-linux-x64 has no matching tarball/,
+          pattern: /unexpected file set.*package\/lib\/update\.js.*package\/scripts\/check-update\.js/,
         },
       ];
 
@@ -1332,7 +1947,7 @@ describe("scripts/stage_npm.sh", () => {
         const out = path.join(dir, `stage-${i}`);
         const tarballs = path.join(out, "tarballs");
         fs.mkdirSync(tarballs, { recursive: true });
-        fs.writeFileSync(path.join(tarballs, "pkg-0.5.0.tgz"), buildTarGz(c.entries));
+        fs.writeFileSync(path.join(tarballs, "pkg-0.6.0.tgz"), buildTarGz(c.entries));
 
         const res = spawnSync("bash", [STAGE_SCRIPT, "--out", out, "--verify-pack"], {
           encoding: "utf8",
@@ -1346,32 +1961,38 @@ describe("scripts/stage_npm.sh", () => {
       const orphanTarballs = path.join(orphanOut, "tarballs");
       fs.mkdirSync(orphanTarballs, { recursive: true });
       fs.writeFileSync(
-        path.join(orphanTarballs, "simple-memory-0.5.0.tgz"),
+        path.join(orphanTarballs, "simple-memory-0.6.0.tgz"),
         buildTarGz([
           {
             name: "package/package.json",
             data: Buffer.from(
               JSON.stringify({
                 name: "simple-memory",
-                version: "0.5.0",
-                optionalDependencies: { "simple-memory-linux-x64": "0.5.0" },
+                version: "0.6.0",
+                optionalDependencies: { "simple-memory-linux-x64": "0.6.0" },
               })
             ),
             mode: 0o644,
           },
           { name: "package/bin/sm.js", data: Buffer.from("#!/usr/bin/env node\n"), mode: 0o755 },
           { name: "package/lib/platform.js", data: Buffer.from("// lib\n"), mode: 0o644 },
+          { name: "package/lib/update.js", data: Buffer.from("// update\n"), mode: 0o644 },
           { name: "package/scripts/postinstall.js", data: Buffer.from("// pi\n"), mode: 0o644 },
+          {
+            name: "package/scripts/check-update.js",
+            data: Buffer.from("// check-update\n"),
+            mode: 0o644,
+          },
           { name: "package/LICENSE", data: Buffer.from("MIT\n"), mode: 0o644 },
           { name: "package/README.md", data: Buffer.from("# hi\n"), mode: 0o644 },
         ])
       );
       fs.writeFileSync(
-        path.join(orphanTarballs, "simple-memory-linux-x64-0.5.0.tgz"),
+        path.join(orphanTarballs, "simple-memory-linux-x64-0.6.0.tgz"),
         buildTarGz([
           {
             name: "package/package.json",
-            data: Buffer.from(JSON.stringify({ name: "simple-memory-linux-x64", version: "0.5.0" })),
+            data: Buffer.from(JSON.stringify({ name: "simple-memory-linux-x64", version: "0.6.0" })),
             mode: 0o644,
           },
           { name: "package/bin/sm", data: makeElfHeader(62), mode: 0o755 },
@@ -1404,7 +2025,7 @@ describe("scripts/stage_npm.sh", () => {
     withTempDir((dir) => {
       const repo = path.join(dir, "repo");
       const out = path.join(dir, "stage");
-      makeFixtureRepo(repo, "0.5.0");
+      makeFixtureRepo(repo, "0.6.0");
 
       const linuxBin = path.join(dir, "sm-linux-x64");
       fs.writeFileSync(linuxBin, makeElfHeader(62));
@@ -1483,10 +2104,10 @@ if (args[0] === "whoami") {
       assert.equal(dryCalls[0].args[0], "whoami");
       assert.equal(dryCalls[1].args[0], "publish");
       assert.ok(dryCalls[1].args.includes("--dry-run"));
-      assert.match(dryCalls[1].args.at(-1), /simple-memory-linux-x64-0\.5\.0\.tgz$/);
+      assert.match(dryCalls[1].args.at(-1), /simple-memory-linux-x64-0\.6\.0\.tgz$/);
       assert.equal(dryCalls[2].args[0], "publish");
       assert.ok(dryCalls[2].args.includes("--dry-run"));
-      assert.match(dryCalls[2].args.at(-1), /simple-memory-0\.5\.0\.tgz$/);
+      assert.match(dryCalls[2].args.at(-1), /simple-memory-0\.6\.0\.tgz$/);
       assert.equal(dryCalls[0].ucMode, 0o600);
       assert.equal(
         dryCalls[0].ucContent,
@@ -1515,9 +2136,9 @@ if (args[0] === "whoami") {
       assert.ok(liveCalls[1].args.includes("--dry-run"));
       assert.ok(liveCalls[2].args.includes("--dry-run"));
       assert.equal(liveCalls[3].args.includes("--dry-run"), false);
-      assert.match(liveCalls[3].args.at(-1), /simple-memory-linux-x64-0\.5\.0\.tgz$/);
+      assert.match(liveCalls[3].args.at(-1), /simple-memory-linux-x64-0\.6\.0\.tgz$/);
       assert.equal(liveCalls[4].args.includes("--dry-run"), false);
-      assert.match(liveCalls[4].args.at(-1), /simple-memory-0\.5\.0\.tgz$/);
+      assert.match(liveCalls[4].args.at(-1), /simple-memory-0\.6\.0\.tgz$/);
       assert.equal(fs.existsSync(liveCalls[0].ucPath), false);
 
       // Whitespace in token is refused.

@@ -199,6 +199,9 @@ fn tool_names() -> Vec<&'static str> {
         "memory_related",
         "memory_put",
         "memory_supersede",
+        "memory_list",
+        "memory_amend",
+        "memory_retire",
     ]
 }
 
@@ -622,7 +625,7 @@ fn query_arguments_fail_as_the_repeated_cli_flags_fail() {
         (
             &["--bias", "executed", "--bias", "newest"],
             json!({"bias": "executed,newest"}),
-            "Invalid bias 'newest'; expected one of recency, relevance, executed, verified, decided, client-stated, derived, assumed, prior, planned, fact, decision, learning, episode, task, handoff",
+            "Invalid bias 'newest'; expected one of recency, relevance, executed, verified, decided, client-stated, derived, assumed, prior, planned, fact, decision, learning, episode, task, handoff, or scope:<path>",
         ),
     ];
     for (flags, arguments, message) in cases {
@@ -891,12 +894,12 @@ fn a_failing_tool_answers_is_error() {
         (
             "memory_query",
             json!({"query": "x", "bias": "loudest"}),
-            "error: Invalid bias 'loudest'; expected one of recency, relevance, executed, verified, decided, client-stated, derived, assumed, prior, planned, fact, decision, learning, episode, task, handoff",
+            "error: Invalid bias 'loudest'; expected one of recency, relevance, executed, verified, decided, client-stated, derived, assumed, prior, planned, fact, decision, learning, episode, task, handoff, or scope:<path>",
         ),
         (
             "memory_query",
-            json!({"query": "x", "since": "1d"}),
-            "error: unknown argument 'since'; expected one of query, bias, kind, tag, limit, all_repos, repo, in",
+            json!({"query": "x", "bogus": "1d"}),
+            "error: unknown argument 'bogus'; expected one of query, bias, kind, tag, source, since, until, recent, include_history, limit, all_repos, repo, in",
         ),
         (
             "memory_show",
@@ -1263,4 +1266,542 @@ fn an_oserror_in_a_tool_answers_is_error_and_the_server_keeps_running() {
         err.contains("sm mcp: memory_query: [Errno 20] Not a directory"),
         "{err}"
     );
+}
+
+#[test]
+fn memory_query_supports_since_until_source_recent_and_include_history() {
+    let fx = Fx::new();
+    let repo = fx.repo_dir();
+    let put_cli = |args: &[&str]| -> String {
+        let o = fx.cli(args, &repo);
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        String::from_utf8(o.stdout).unwrap().trim().to_string()
+    };
+    let id_old = put_cli(&[
+        "put",
+        "--tag",
+        "decided",
+        "--source",
+        "task:T-1",
+        "--as-of",
+        "2026-03-01T10:00:00Z",
+        "Cobalt cache old setting",
+    ]);
+    let id_mid = put_cli(&[
+        "put",
+        "--tag",
+        "assumed",
+        "--source",
+        "agent:bot",
+        "--as-of",
+        "2026-04-15T10:00:00Z",
+        "Cobalt cache mid setting",
+    ]);
+    let id_new = put_cli(&[
+        "put",
+        "--tag",
+        "assumed",
+        "--source",
+        "task:T-2",
+        "--as-of",
+        "2026-05-20T10:00:00Z",
+        "Cobalt cache new setting",
+    ]);
+    let id_sup = put_cli(&[
+        "put",
+        "--tag",
+        "decided",
+        "--as-of",
+        "2026-02-01T10:00:00Z",
+        "Cobalt cache superseded setting",
+    ]);
+    assert!(
+        fx.cli(&["supersede", &id_sup, &id_new], &repo)
+            .status
+            .success()
+    );
+
+    let (out, _) = fx.conv(
+        vec![
+            init(),
+            call(
+                1,
+                "memory_query",
+                json!({"query": "cobalt cache", "source": "task:"}),
+            ),
+            call(
+                2,
+                "memory_query",
+                json!({"query": "cobalt cache", "since": "2026-04-01", "until": "2026-04-30"}),
+            ),
+            call(
+                3,
+                "memory_query",
+                json!({"query": "cobalt cache", "recent": true}),
+            ),
+            call(
+                4,
+                "memory_query",
+                json!({"query": "cobalt cache", "include_history": true, "limit": 10}),
+            ),
+            call(
+                5,
+                "memory_query",
+                json!({"query": "cobalt cache", "recent": true, "bias": "decided"}),
+            ),
+            call(
+                6,
+                "memory_query",
+                json!({"query": "cobalt cache", "in": "acme", "repo": "alpha"}),
+            ),
+            call(
+                7,
+                "memory_query",
+                json!({"query": "cobalt cache", "since": "2026-05-01", "until": "2026-04-01"}),
+            ),
+        ],
+        &repo,
+    );
+
+    let hit_ids = |v: &Value| -> Vec<String> {
+        v["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["id"].as_str().unwrap().to_string())
+            .collect()
+    };
+
+    // 1. source filter matches CLI JSON exactly.
+    let q_src = payload(&out[1]);
+    assert_eq!(
+        q_src,
+        fx.cli_json(
+            &[
+                "query",
+                "cobalt cache",
+                "--source",
+                "task:",
+                "--format",
+                "json"
+            ],
+            &repo
+        )
+    );
+    let mut src_ids = hit_ids(&q_src);
+    src_ids.sort();
+    let mut want_src = vec![id_old.clone(), id_new.clone()];
+    want_src.sort();
+    assert_eq!(src_ids, want_src);
+
+    // 2. since/until date range keeps only April item.
+    assert_eq!(hit_ids(&payload(&out[2])), vec![id_mid.clone()]);
+
+    // 3. recent sorts newest first (ignoring decided bias of id_old).
+    assert_eq!(
+        hit_ids(&payload(&out[3])),
+        vec![id_new.clone(), id_mid.clone(), id_old.clone()]
+    );
+
+    // 4. include_history includes the superseded item.
+    let hist_ids = hit_ids(&payload(&out[4]));
+    assert!(hist_ids.contains(&id_sup), "{hist_ids:?}");
+    assert_eq!(hist_ids.len(), 4);
+
+    // 5-7. Guard errors return isError: true.
+    assert_eq!(out[5]["result"]["isError"], true);
+    assert_eq!(
+        out[5]["result"]["content"][0]["text"],
+        "error: argument 'recent' is not allowed with argument 'bias'"
+    );
+    assert_eq!(out[6]["result"]["isError"], true);
+    assert_eq!(
+        out[6]["result"]["content"][0]["text"],
+        "error: argument 'repo' is not allowed with argument 'in'"
+    );
+    assert_eq!(out[7]["result"]["isError"], true);
+    assert_eq!(
+        out[7]["result"]["content"][0]["text"],
+        "error: --since cannot be after --until"
+    );
+
+    // Usage log records new filter flags when provided.
+    let rows = usage_rows(&fx);
+    assert_eq!(rows[0]["flags"]["source"], "task:");
+    assert_eq!(rows[1]["flags"]["since"], "2026-04-01");
+    assert_eq!(rows[1]["flags"]["until"], "2026-04-30");
+    assert_eq!(rows[2]["flags"]["recent"], true);
+    assert_eq!(rows[3]["flags"]["include_history"], true);
+}
+
+#[test]
+fn memory_list_matches_cli_validates_guards_and_logs_usage() {
+    let fx = Fx::new();
+    let repo = fx.repo_dir();
+    std::fs::create_dir_all(fx.home()).unwrap();
+    std::fs::write(
+        fx.home().join("config.toml"),
+        "[scopes]\nacme = [\"repo:beta\"]\n",
+    )
+    .unwrap();
+    let put_cli = |args: &[&str]| -> String {
+        let o = fx.cli(args, &repo);
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        String::from_utf8(o.stdout).unwrap().trim().to_string()
+    };
+    let a1 = put_cli(&[
+        "put",
+        "--kind",
+        "decision",
+        "--tag",
+        "decided",
+        "--source",
+        "task:T-1",
+        "--as-of",
+        "2026-06-01T10:00:00Z",
+        "Alpha decision one",
+    ]);
+    let a2 = put_cli(&[
+        "put",
+        "--kind",
+        "fact",
+        "--tag",
+        "assumed",
+        "--as-of",
+        "2026-06-02T10:00:00Z",
+        "Alpha fact two",
+    ]);
+    let a_ret = put_cli(&[
+        "put",
+        "--tag",
+        "assumed",
+        "--as-of",
+        "2026-06-03T10:00:00Z",
+        "Alpha retired three",
+    ]);
+    assert!(
+        fx.cli(&["retire", &a_ret, "--reason", "obsolete"], &repo)
+            .status
+            .success()
+    );
+    let b1 = put_cli(&[
+        "put",
+        "--repo",
+        "beta",
+        "--tag",
+        "decided",
+        "--as-of",
+        "2026-06-04T10:00:00Z",
+        "Beta note four",
+    ]);
+
+    let (out, _) = fx.conv(
+        vec![
+            init(),
+            call(1, "memory_list", json!({})),
+            call(2, "memory_list", json!({"limit": 1, "offset": 1})),
+            call(3, "memory_list", json!({"status": "retired"})),
+            call(4, "memory_list", json!({"include_history": true})),
+            call(5, "memory_list", json!({"in": "acme"})),
+            call(6, "memory_list", json!({"all_repos": true})),
+            call(
+                7,
+                "memory_list",
+                json!({"repo": "alpha", "all_repos": true}),
+            ),
+            call(
+                8,
+                "memory_list",
+                json!({"status": "active", "include_history": true}),
+            ),
+            call(9, "memory_list", json!({"offset": -1})),
+            call(10, "memory_list", json!({"status": "bogus"})),
+        ],
+        &repo,
+    );
+
+    let list_ids = |v: &Value| -> Vec<String> {
+        v["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["id"].as_str().unwrap().to_string())
+            .collect()
+    };
+
+    assert_eq!(
+        payload(&out[1]),
+        fx.cli_json(&["list", "--format", "json"], &repo)
+    );
+    assert_eq!(list_ids(&payload(&out[1])), vec![a2.clone(), a1.clone()]);
+    assert_eq!(list_ids(&payload(&out[2])), vec![a1.clone()]);
+    assert_eq!(list_ids(&payload(&out[3])), vec![a_ret.clone()]);
+    assert_eq!(
+        list_ids(&payload(&out[4])),
+        vec![a_ret.clone(), a2.clone(), a1.clone()]
+    );
+    assert_eq!(list_ids(&payload(&out[5])), vec![b1.clone()]);
+    assert_eq!(
+        list_ids(&payload(&out[6])),
+        vec![b1.clone(), a2.clone(), a1.clone()]
+    );
+
+    assert_eq!(out[7]["result"]["isError"], true);
+    assert_eq!(
+        out[7]["result"]["content"][0]["text"],
+        "error: only one of 'repo', 'all_repos', or 'in' may be set"
+    );
+    assert_eq!(out[8]["result"]["isError"], true);
+    assert_eq!(
+        out[8]["result"]["content"][0]["text"],
+        "error: argument 'include_history' is not allowed with argument 'status'"
+    );
+    assert_eq!(out[9]["result"]["isError"], true);
+    assert_eq!(
+        out[9]["result"]["content"][0]["text"],
+        "error: argument 'offset' must be at least 0, got -1"
+    );
+    assert_eq!(out[10]["result"]["isError"], true);
+    assert_eq!(
+        out[10]["result"]["content"][0]["text"],
+        "error: argument 'status' must be one of active, superseded, retired, all, got 'bogus'"
+    );
+
+    let rows = usage_rows(&fx);
+    assert_eq!(rows[0]["cmd"], "list");
+    assert_eq!(rows[0]["repo"], "alpha");
+    assert_eq!(rows[0]["flags"]["via"], "mcp");
+    assert_eq!(rows[0]["flags"]["status"], "active");
+}
+
+#[test]
+fn memory_amend_and_memory_retire_round_trip_and_validate_guards() {
+    let fx = Fx::new();
+    let repo = fx.repo_dir();
+    let (out, _) = fx.conv(
+        vec![
+            init(),
+            call(
+                1,
+                "memory_put",
+                json!({
+                    "text": "Queue timeout is 30 seconds",
+                    "tag": "assumed",
+                    "refs": "T-10 T-20"
+                }),
+            ),
+        ],
+        &repo,
+    );
+    let orig_id = payload(&out[1])["id"].as_str().unwrap().to_string();
+
+    let (out, _) = fx.conv(
+        vec![
+            init(),
+            call(
+                1,
+                "memory_amend",
+                json!({
+                    "id": orig_id,
+                    "text": "Queue timeout is 45 seconds",
+                    "title": "Queue timeout updated",
+                    "kind": "decision",
+                    "tag": "verified",
+                    "evidence": "bench run 12",
+                    "refs": "T-20 T-30",
+                    "tags": "ops, timeout",
+                    "as_of": "2026-07-01T12:00:00Z"
+                }),
+            ),
+            // Amending the now-superseded original must fail.
+            call(2, "memory_amend", json!({"id": orig_id, "title": "Nope"})),
+            // Empty amend must fail.
+            call(3, "memory_amend", json!({"id": "m_any"})),
+            // Conflicting refs + add_refs must fail.
+            call(
+                4,
+                "memory_amend",
+                json!({"id": orig_id, "refs": "T-1", "add_refs": "T-2"}),
+            ),
+            // Conflicting tags + add_tags must fail.
+            call(
+                5,
+                "memory_amend",
+                json!({"id": orig_id, "tags": "a", "add_tags": "b"}),
+            ),
+        ],
+        &repo,
+    );
+
+    let amended = payload(&out[1]);
+    let new_id = amended["id"].as_str().unwrap().to_string();
+    assert_eq!(amended["old_id"], orig_id);
+    assert_eq!(amended["body_changed"], true);
+    assert_ne!(new_id, orig_id);
+    assert_eq!(out[2]["result"]["isError"], true);
+    assert!(
+        out[2]["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Cannot amend superseded item")
+    );
+    assert_eq!(out[3]["result"]["isError"], true);
+    assert_eq!(
+        out[3]["result"]["content"][0]["text"],
+        "error: sm amend requires at least one field to change"
+    );
+    assert_eq!(out[4]["result"]["isError"], true);
+    assert_eq!(
+        out[4]["result"]["content"][0]["text"],
+        "error: argument 'refs' is not allowed with 'add_refs' or 'remove_refs'"
+    );
+    assert_eq!(out[5]["result"]["isError"], true);
+    assert_eq!(
+        out[5]["result"]["content"][0]["text"],
+        "error: argument 'tags' is not allowed with 'add_tags' or 'remove_tags'"
+    );
+
+    // Inspect both old and amended item, then retire the amended item.
+    let (out, _) = fx.conv(
+        vec![
+            init(),
+            call(1, "memory_show", json!({"ids": [orig_id, new_id]})),
+            call(
+                2,
+                "memory_amend",
+                json!({"id": new_id, "add_refs": "T-40", "add_tags": "prod"}),
+            ),
+        ],
+        &repo,
+    );
+    let shown = payload(&out[1])["items"].as_array().unwrap().clone();
+    assert_eq!(shown[0]["status"], "superseded");
+    assert_eq!(shown[0]["superseded_by"], new_id);
+    assert_eq!(shown[1]["status"], "active");
+    assert_eq!(shown[1]["title"], "Queue timeout updated");
+    assert_eq!(shown[1]["body"], "Queue timeout is 45 seconds");
+    assert_eq!(shown[1]["kind"], "decision");
+    assert_eq!(shown[1]["tag"], "verified");
+    assert_eq!(shown[1]["evidence"], "bench run 12");
+    assert_eq!(shown[1]["refs"], json!(["T-20", "T-30"]));
+    assert_eq!(shown[1]["tags"], "ops, timeout");
+    // 2026-07-01T12:00:00Z = 1_782_907_200 epoch seconds (independent of host TZ).
+    assert_eq!(
+        simple_memory::core::item::parse_as_of_epoch(shown[1]["as_of"].as_str()).unwrap(),
+        1_782_907_200.0
+    );
+    assert_eq!(
+        shown[1]["as_of"],
+        fx.cli_json(&["show", &new_id, "--format", "json"], &repo)[0]["as_of"]
+    );
+
+    let third_id = payload(&out[2])["id"].as_str().unwrap().to_string();
+    assert_eq!(payload(&out[2])["body_changed"], false);
+
+    // Replace tags on third_id (`ops, timeout, prod` -> `prod`) so old tags are removed.
+    let (out, _) = fx.conv(
+        vec![
+            init(),
+            call(1, "memory_show", json!({"ids": [third_id]})),
+            call(2, "memory_amend", json!({"id": third_id, "tags": "prod"})),
+        ],
+        &repo,
+    );
+    let third = &payload(&out[1])["items"][0];
+    assert_eq!(third["refs"], json!(["T-20", "T-30", "T-40"]));
+    assert_eq!(third["tags"], "ops, timeout, prod");
+    let fourth_id = payload(&out[2])["id"].as_str().unwrap().to_string();
+
+    let (out, _) = fx.conv(
+        vec![
+            init(),
+            call(1, "memory_show", json!({"ids": [fourth_id]})),
+            call(
+                2,
+                "memory_retire",
+                json!({"id": fourth_id, "reason": "stale policy"}),
+            ),
+            // Retiring an already-retired item fails.
+            call(3, "memory_retire", json!({"id": fourth_id})),
+            // Retiring a missing item fails.
+            call(4, "memory_retire", json!({"id": "m_missing"})),
+            // Default query hides the retired item; list retired shows it.
+            call(5, "memory_query", json!({"query": "queue timeout"})),
+            call(6, "memory_list", json!({"status": "retired"})),
+        ],
+        &repo,
+    );
+    let fourth = &payload(&out[1])["items"][0];
+    assert_eq!(fourth["tags"], "prod");
+
+    // Case-only replacement of refs and tags replaces rather than duplicating old + new case.
+    let (case_out, _) = fx.conv(
+        vec![
+            init(),
+            call(
+                1,
+                "memory_put",
+                json!({"text": "case replace target", "tag": "decided", "refs": "T-10 T-20"}),
+            ),
+        ],
+        &repo,
+    );
+    let case_id = payload(&case_out[1])["id"].as_str().unwrap().to_string();
+    let (case_out2, _) = fx.conv(
+        vec![
+            init(),
+            call(
+                1,
+                "memory_amend",
+                json!({"id": case_id, "add_tags": "Ops, Timeout"}),
+            ),
+        ],
+        &repo,
+    );
+    let case_id2 = payload(&case_out2[1])["id"].as_str().unwrap().to_string();
+    let (case_out3, _) = fx.conv(
+        vec![
+            init(),
+            call(
+                1,
+                "memory_amend",
+                json!({"id": case_id2, "refs": "t-10", "tags": "ops"}),
+            ),
+        ],
+        &repo,
+    );
+    let case_id3 = payload(&case_out3[1])["id"].as_str().unwrap().to_string();
+    let (case_show, _) = fx.conv(
+        vec![init(), call(1, "memory_show", json!({"ids": [case_id3]}))],
+        &repo,
+    );
+    assert_eq!(payload(&case_show[1])["items"][0]["refs"], json!(["t-10"]));
+    assert_eq!(payload(&case_show[1])["items"][0]["tags"], "ops");
+    assert_eq!(
+        payload(&out[2]),
+        json!({"id": fourth_id, "retired": "stale policy"})
+    );
+    assert_eq!(out[3]["result"]["isError"], true);
+    assert_eq!(out[4]["result"]["isError"], true);
+    assert_eq!(
+        out[4]["result"]["content"][0]["text"],
+        "error: Item not found: m_missing"
+    );
+    assert_eq!(payload(&out[5])["results"], json!([]));
+    let retired_list = payload(&out[6])["items"].as_array().unwrap().clone();
+    assert_eq!(retired_list.len(), 1);
+    assert_eq!(retired_list[0]["id"], fourth_id);
+    assert_eq!(retired_list[0]["retired"], "stale policy");
+
+    // Verify amend and retire rows were logged to usage.log.
+    let rows = usage_rows(&fx);
+    assert!(rows.iter().any(|r| {
+        r["cmd"] == "amend" && r["ids"] == json!([orig_id, new_id]) && r["flags"]["via"] == "mcp"
+    }));
+    assert!(rows.iter().any(|r| {
+        r["cmd"] == "retire"
+            && r["ids"] == json!([fourth_id])
+            && r["flags"]["reason"] == "stale policy"
+            && r["flags"]["via"] == "mcp"
+    }));
 }

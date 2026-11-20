@@ -314,6 +314,7 @@ fn invalid_min_idf_values_fail_before_claude_and_keep_local_fallback_working() {
         error: "simulated".into(),
         cause: "error".into(),
         notified: Vec::new(),
+        ..Default::default()
     }
     .write(&bo_path)
     .unwrap();

@@ -52,6 +52,17 @@ pub fn compact_refs(refs: &str, max_chars: usize) -> String {
     format!("{}{tail}", shown.join(" "))
 }
 
+/// Status annotation for a superseded or retired item, shared by `query` and `list`.
+pub(crate) fn status_marker(it: &crate::core::item::Item) -> Option<String> {
+    match it.superseded_by.as_deref() {
+        Some(by) if it.status == "superseded" && !by.is_empty() => {
+            Some(format!("superseded_by={by}"))
+        }
+        _ if it.status == "superseded" => Some(format!("retired: {}", retired_label(&it.tags))),
+        _ => None,
+    }
+}
+
 /// Refs minus the one equal to the source after its `prefix:`.
 pub fn refs_without_source(it: &crate::core::item::Item) -> String {
     let source_value = it.source.split_once(':').map_or("", |(_, v)| v);
@@ -310,14 +321,8 @@ pub fn format_query_text(lk: &Lookup, footer: &[String]) -> String {
         if !refs.is_empty() {
             parts.push(format!("refs={}", compact_refs(&refs, HEADER_REFS_CHARS)));
         }
-        match it.superseded_by.as_deref() {
-            Some(by) if it.status == "superseded" && !by.is_empty() => {
-                parts.push(format!("superseded_by={by}"))
-            }
-            _ if it.status == "superseded" => {
-                parts.push(format!("retired: {}", retired_label(&it.tags)))
-            }
-            _ => {}
+        if let Some(m) = status_marker(it) {
+            parts.push(m);
         }
         headers.push(parts.join(" "));
         texts.push(item_text(it));
@@ -389,10 +394,12 @@ pub fn format_query_brief(lk: &Lookup, footer: &[String]) -> String {
                 ))
             );
         }
+        let marker = status_marker(it).map_or_else(String::new, |m| format!(" [{m}]"));
         lines.push(format!(
-            "[{}] #{} {} {} {} ~{} tok: {title}",
+            "[{}] #{} {} {} {} {} ~{} tok{marker}: {title}",
             it.id,
             i + 1,
+            it.repo,
             it.kind,
             it.tag,
             py::str::slice(&it.as_of, None, Some(10)),
@@ -432,6 +439,26 @@ fn s(v: &str) -> PyValue {
     PyValue::Str(v.to_string())
 }
 
+fn join_query_tokens(parts: &[String]) -> String {
+    if parts.len() <= 1 {
+        return parts.first().cloned().unwrap_or_default();
+    }
+    parts
+        .iter()
+        .map(|tok| {
+            if let Some(rest) = tok.strip_prefix('-')
+                && rest.chars().any(char::is_whitespace)
+                && !rest.contains('"')
+            {
+                format!("-\"{rest}\"")
+            } else {
+                tok.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 pub fn run(ns: &Namespace, out: &mut Out) -> Result<i32, SmError> {
     let limit_text = LimitText::of(ns.get("limit"));
     let bias = bias_of(ns);
@@ -453,7 +480,8 @@ pub fn run(ns: &Namespace, out: &mut Out) -> Result<i32, SmError> {
         home: None,
         cwd: None,
     };
-    let lookup = match run_lookup(ns.get_str("query"), &a) {
+    let query = join_query_tokens(&ns.get_str_list("query"));
+    let lookup = match run_lookup(&query, &a) {
         Err(e) if e.class == crate::config::UNKNOWN_SCOPE => {
             out.eprint(&e.msg)?;
             return Ok(2);
@@ -619,11 +647,22 @@ mod tests {
     fn brief_line_cuts_the_title() {
         let mut h = hit("m_1", "b");
         h.item.title = format!("{} {}", "t".repeat(170), "end");
-        let line = format_query_brief(&lookup(vec![h]), &["next: x".into()]);
+        let mut sup = hit("m_2", "b");
+        sup.item.title = "Old note".into();
+        sup.item.status = "superseded".into();
+        sup.item.superseded_by = Some("m_9".into());
+        let mut ret = hit("m_3", "b");
+        ret.item.title = "Retired note".into();
+        ret.item.status = "superseded".into();
+        ret.item.tags = "retired:manual".into();
+        let line = format_query_brief(&lookup(vec![h, sup, ret]), &["next: x".into()]);
         assert_eq!(
             line,
             format!(
-                "[m_1] #1 fact decided 2026-01-01 ~44 tok: {}...\nnext: x",
+                "[m_1] #1 r fact decided 2026-01-01 ~44 tok: {}...\n\
+                 [m_2] #2 r fact decided 2026-01-01 ~3 tok [superseded_by=m_9]: Old note\n\
+                 [m_3] #3 r fact decided 2026-01-01 ~4 tok [retired: manual]: Retired note\n\
+                 next: x",
                 "t".repeat(157)
             )
         );

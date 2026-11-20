@@ -23,8 +23,9 @@ fn kv<K: std::fmt::Display>(m: impl IntoIterator<Item = (K, i64)>) -> String {
 
 fn print_stats(st: &Stats, out: &mut Out) -> Result<(), SmError> {
     let store = &st.store;
-    let status = kv(store.status.iter().map(|(k, v)| (k, *v)));
-    let total: i64 = store.status.values().sum();
+    let breakdown = store.status_breakdown();
+    let status = kv(breakdown.iter().map(|(k, v)| (k, *v)));
+    let total: i64 = breakdown.values().sum();
     let line = format!("store: items={total} {status}");
     out.print(line.trim_end_matches(crate::py::str::isspace))?;
     let active = store.active;

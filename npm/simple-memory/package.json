@@ -1,6 +1,6 @@
 {
   "name": "simple-memory",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "Local single-file SQLite + FTS5 memory store and MCP server for coding agents",
   "license": "MIT",
   "keywords": [
@@ -37,7 +37,7 @@
     "postinstall": "node scripts/postinstall.js"
   },
   "optionalDependencies": {
-    "simple-memory-darwin-arm64": "0.5.0",
-    "simple-memory-darwin-x64": "0.5.0"
+    "simple-memory-darwin-arm64": "0.6.0",
+    "simple-memory-darwin-x64": "0.6.0"
   }
 }

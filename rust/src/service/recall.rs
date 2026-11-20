@@ -781,6 +781,8 @@ pub struct Recall {
     pub notice: String,
     /// The local query's cause (off, backoff, timeout, error); "" for the model's.
     pub fallback: String,
+    /// Matched `[scopes]` paths used by this recall (rendered as `--in` in the follow-up hint).
+    pub scopes: Vec<String>,
 }
 
 /// A temp file beside it, then a rename.
@@ -869,6 +871,22 @@ pub fn strs_of(value: &PyValue) -> Vec<String> {
     }
 }
 
+fn opt_str_of(value: &PyValue) -> Option<String> {
+    if let PyValue::Str(s) = value {
+        Some(s.clone())
+    } else {
+        None
+    }
+}
+
+fn opt_finite_float_of(value: &PyValue) -> Option<f64> {
+    match value {
+        PyValue::Int(s) => s.parse::<f64>().ok().filter(|x| x.is_finite()),
+        PyValue::Float(x) if x.is_finite() => Some(*x),
+        _ => None,
+    }
+}
+
 /// hook/backoff.json. A missing, null or wrong-typed key reads as its default.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Backoff {
@@ -877,6 +895,9 @@ pub struct Backoff {
     pub error: String,
     pub cause: String,
     pub notified: Vec<String>,
+    pub rewrite_cmd: Option<String>,
+    pub rewrite_model: Option<String>,
+    pub rewrite_timeout: Option<f64>,
 }
 
 fn s(v: &str) -> PyValue {
@@ -897,20 +918,30 @@ impl Backoff {
             error: str_of(g("error")),
             cause: str_of(g("cause")),
             notified: strs_of(g("notified")),
+            rewrite_cmd: opt_str_of(g("rewrite_cmd")),
+            rewrite_model: opt_str_of(g("rewrite_model")),
+            rewrite_timeout: opt_finite_float_of(g("rewrite_timeout")),
         })
     }
 
     pub fn write(&self, path: &PyPath) -> Result<(), SmError> {
-        write_json(
-            path,
-            &PyValue::Dict(vec![
-                (s("failures"), PyValue::Int(self.failures.to_string())),
-                (s("until"), PyValue::Float(self.until)),
-                (s("error"), s(&self.error)),
-                (s("cause"), s(&self.cause)),
-                (s("notified"), strs_value(&self.notified)),
-            ]),
-        )
+        let mut pairs = vec![
+            (s("failures"), PyValue::Int(self.failures.to_string())),
+            (s("until"), PyValue::Float(self.until)),
+            (s("error"), s(&self.error)),
+            (s("cause"), s(&self.cause)),
+            (s("notified"), strs_value(&self.notified)),
+        ];
+        if let Some(cmd) = &self.rewrite_cmd {
+            pairs.push((s("rewrite_cmd"), s(cmd)));
+        }
+        if let Some(model) = &self.rewrite_model {
+            pairs.push((s("rewrite_model"), s(model)));
+        }
+        if let Some(timeout) = self.rewrite_timeout.filter(|x| x.is_finite()) {
+            pairs.push((s("rewrite_timeout"), PyValue::Float(timeout)));
+        }
+        write_json(path, &PyValue::Dict(pairs))
     }
 }
 
@@ -1082,23 +1113,77 @@ fn backoff_path(home: &PyPath) -> PyPath {
     home.join("hook").join("backoff.json")
 }
 
-fn backoff_active(home: &PyPath) -> Result<bool, SmError> {
-    Ok(Backoff::read(&backoff_path(home))?.until > clock::now_epoch())
+fn clear_backoff(path: &PyPath) -> Result<(), SmError> {
+    match std::fs::remove_file(path.to_os()) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            Err(SmError::from_io(&e, Some(&path.to_os())))
+        }
+        _ => Ok(()),
+    }
 }
 
-/// Two failures in a row skip the model for 10 minutes; the count stays.
-fn record_rewrite(home: &PyPath, error: Option<&str>, cause: &str) -> Result<(), SmError> {
+fn backoff_matches_config(
+    state: &Backoff,
+    claude_bin: &str,
+    model: &str,
+    timeout: Option<f64>,
+) -> bool {
+    if let Some(prev) = state.rewrite_cmd.as_deref()
+        && prev != claude_bin
+    {
+        return false;
+    }
+    if let Some(prev) = state.rewrite_model.as_deref()
+        && prev != model
+    {
+        return false;
+    }
+    if let (Some(prev), Some(curr)) = (state.rewrite_timeout, timeout)
+        && prev != curr
+    {
+        return false;
+    }
+    true
+}
+
+fn backoff_active(
+    home: &PyPath,
+    claude_bin: &str,
+    model: &str,
+    timeout: Option<f64>,
+) -> Result<bool, SmError> {
+    let path = backoff_path(home);
+    let state = Backoff::read(&path)?;
+    if state.until <= clock::now_epoch() {
+        return Ok(false);
+    }
+    if !backoff_matches_config(&state, claude_bin, model, timeout) {
+        clear_backoff(&path)?;
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+/// Two failures in a row skip the model for 10 minutes; the count stays unless rewrite config changed.
+fn record_rewrite(
+    home: &PyPath,
+    error: Option<&str>,
+    cause: &str,
+    claude_bin: &str,
+    model: &str,
+    timeout: Option<f64>,
+) -> Result<(), SmError> {
     let path = backoff_path(home);
     let Some(error) = error else {
-        return match std::fs::remove_file(path.to_os()) {
-            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
-                Err(SmError::from_io(&e, Some(&path.to_os())))
-            }
-            _ => Ok(()),
-        };
+        return clear_backoff(&path);
     };
     let state = Backoff::read(&path)?;
-    let failures = state.failures.saturating_add(1);
+    let same_cfg = backoff_matches_config(&state, claude_bin, model, timeout);
+    let failures = if same_cfg {
+        state.failures.saturating_add(1)
+    } else {
+        1
+    };
     let cause = if failures > 1 && state.cause != "timeout" {
         "error"
     } else {
@@ -1115,6 +1200,9 @@ fn record_rewrite(home: &PyPath, error: Option<&str>, cause: &str) -> Result<(),
         error: error.to_string(),
         cause: cause.to_string(),
         notified: Vec::new(),
+        rewrite_cmd: Some(claude_bin.to_string()),
+        rewrite_model: Some(model.to_string()),
+        rewrite_timeout: timeout,
     }
     .write(&path)
 }
@@ -1515,6 +1603,7 @@ pub fn run_prompt_hook(
     );
 
     // `db_ms` is the store query, repo lookup included; `git_ms` the git call in that lookup.
+    #[allow(clippy::too_many_arguments)]
     let finish = |row: &mut Row,
                   notices: &[String],
                   path: &str,
@@ -1523,7 +1612,8 @@ pub fn run_prompt_hook(
                   query: &str,
                   items: Vec<Item>,
                   dropped: Vec<String>,
-                  fallback: &str|
+                  fallback: &str,
+                  scopes: Vec<String>|
      -> Result<Option<Recall>, SmError> {
         let fin_started = Instant::now();
         if let Some(sess) = &session {
@@ -1574,6 +1664,7 @@ pub fn run_prompt_hook(
                 items,
                 notice,
                 fallback: fallback.into(),
+                scopes,
             }));
         }
         Ok(None)
@@ -1663,6 +1754,7 @@ pub fn run_prompt_hook(
                     Vec::new(),
                     Vec::new(),
                     cause,
+                    Vec::new(),
                 )
             }
             Ok((query, fetched)) => {
@@ -1685,6 +1777,7 @@ pub fn run_prompt_hook(
                     head(&kept, limit),
                     dropped,
                     cause,
+                    matched_scopes,
                 )
             }
         }
@@ -1693,7 +1786,11 @@ pub fn run_prompt_hook(
     if model == "none" {
         return local(&mut row, &notices, "off", 0);
     }
-    if backoff_active(&home_path)? {
+    let claude_bin = or(get_or_none(hook_cfg, "claude_bin"), &s("")).py_str();
+    let cfg_timeout_opt = py_float(or(get_or_none(hook_cfg, "timeout"), &PyValue::Float(8.0)))
+        .ok()
+        .filter(|x| x.is_finite());
+    if backoff_active(&home_path, &claude_bin, &model, cfg_timeout_opt)? {
         notices.push(take_backoff_notice(&home_path, &session_id)?);
         return local(&mut row, &notices, "backoff", 0);
     }
@@ -1713,7 +1810,6 @@ pub fn run_prompt_hook(
     } else {
         cfg_timeout
     };
-    let claude_bin = or(get_or_none(hook_cfg, "claude_bin"), &s("")).py_str();
     let rewrite_started = Instant::now();
     let result = rewrite_query(
         &prompt,
@@ -1741,13 +1837,20 @@ pub fn run_prompt_hook(
             };
             row.insert("error".into(), s(&error));
             let cause = if timed_out { "timeout" } else { "error" };
-            record_rewrite(&home_path, Some(&error), cause)?;
+            record_rewrite(
+                &home_path,
+                Some(&error),
+                cause,
+                &claude_bin,
+                &model,
+                cfg_timeout_opt,
+            )?;
             notices.push(take_backoff_notice(&home_path, &session_id)?);
             return local(&mut row, &notices, cause, rewrite_ms);
         }
         Err(e) => return Err(e),
     };
-    record_rewrite(&home_path, None, "")?;
+    record_rewrite(&home_path, None, "", &claude_bin, &model, cfg_timeout_opt)?;
     if query.is_empty() {
         return finish(
             &mut row,
@@ -1759,6 +1862,7 @@ pub fn run_prompt_hook(
             Vec::new(),
             Vec::new(),
             "",
+            Vec::new(),
         );
     }
     let matched_scopes = matching_scope_paths(&cfg, &prompt, &query, &projects);
@@ -1808,6 +1912,7 @@ pub fn run_prompt_hook(
                 Vec::new(),
                 Vec::new(),
                 "",
+                Vec::new(),
             );
         }
         Err(e) => return Err(e),
@@ -1834,6 +1939,7 @@ pub fn run_prompt_hook(
         head(&kept, limit),
         dropped,
         "",
+        matched_scopes,
     )
 }
 

@@ -903,8 +903,10 @@ pub struct AmendPatch<'a> {
     pub body: Option<&'a str>,
     pub add_refs: Option<&'a str>,
     pub remove_refs: Option<&'a str>,
+    pub replace_refs: Option<&'a str>,
     pub add_tags: Option<&'a str>,
     pub remove_tags: Option<&'a str>,
+    pub replace_tags: Option<&'a str>,
     pub as_of: Option<&'a str>,
 }
 
@@ -918,8 +920,10 @@ impl AmendPatch<'_> {
             && self.body.is_none()
             && self.add_refs.is_none()
             && self.remove_refs.is_none()
+            && self.replace_refs.is_none()
             && self.add_tags.is_none()
             && self.remove_tags.is_none()
+            && self.replace_tags.is_none()
             && self.as_of.is_none()
     }
 }
@@ -1041,26 +1045,37 @@ pub fn amend_item(
         if new_evidence != old.evidence {
             extracted_refs.extend(extract_refs(Some(&new_evidence)));
         }
-        let add_ref_tokens = split_refs(patch.add_refs.map(RefsArg::Str).as_ref());
-        let remove_ref_folded: HashSet<String> =
-            split_refs(patch.remove_refs.map(RefsArg::Str).as_ref())
-                .into_iter()
-                .map(|t| fold(Some(&t)))
-                .collect();
         let mut merged_refs: Vec<String> = Vec::new();
         let mut seen_refs: HashSet<String> = HashSet::new();
-        for tok in old_ref_tokens
-            .iter()
-            .cloned()
-            .chain(extracted_refs)
-            .chain(add_ref_tokens)
-        {
-            if seen_refs.insert(tok.clone()) {
-                merged_refs.push(tok);
+        if let Some(rep) = patch.replace_refs {
+            for tok in split_refs(Some(&RefsArg::Str(rep)))
+                .into_iter()
+                .chain(extracted_refs)
+            {
+                if seen_refs.insert(tok.clone()) {
+                    merged_refs.push(tok);
+                }
             }
-        }
-        if !remove_ref_folded.is_empty() {
-            merged_refs.retain(|t| !remove_ref_folded.contains(&fold(Some(t))));
+        } else {
+            let add_ref_tokens = split_refs(patch.add_refs.map(RefsArg::Str).as_ref());
+            let remove_ref_folded: HashSet<String> =
+                split_refs(patch.remove_refs.map(RefsArg::Str).as_ref())
+                    .into_iter()
+                    .map(|t| fold(Some(&t)))
+                    .collect();
+            for tok in old_ref_tokens
+                .iter()
+                .cloned()
+                .chain(extracted_refs)
+                .chain(add_ref_tokens)
+            {
+                if seen_refs.insert(tok.clone()) {
+                    merged_refs.push(tok);
+                }
+            }
+            if !remove_ref_folded.is_empty() {
+                merged_refs.retain(|t| !remove_ref_folded.contains(&fold(Some(t))));
+            }
         }
         let new_refs = if merged_refs == old_ref_tokens {
             old.refs.clone()
@@ -1077,37 +1092,49 @@ pub fn amend_item(
         let had_stale_retired = old_tag_tokens
             .iter()
             .any(|t| t.starts_with(RETIRED_TAG_PREFIX));
-        let add_tag_tokens: Vec<&str> = patch
-            .add_tags
-            .unwrap_or("")
-            .split(',')
-            .map(strip)
-            .filter(|t| !t.is_empty() && !t.starts_with(RETIRED_TAG_PREFIX))
-            .collect();
-        let remove_tag_folded: HashSet<String> = patch
-            .remove_tags
-            .unwrap_or("")
-            .split(',')
-            .map(strip)
-            .filter(|t| !t.is_empty())
-            .map(|t| fold(Some(t)))
-            .collect();
         let mut merged_tags: Vec<&str> = Vec::new();
-        for &t in &old_tag_tokens {
-            if t.starts_with(RETIRED_TAG_PREFIX) {
-                continue;
+        if let Some(rep) = patch.replace_tags {
+            for t in rep
+                .split(',')
+                .map(strip)
+                .filter(|t| !t.is_empty() && !t.starts_with(RETIRED_TAG_PREFIX))
+            {
+                if !merged_tags.contains(&t) {
+                    merged_tags.push(t);
+                }
             }
-            if !merged_tags.contains(&t) {
-                merged_tags.push(t);
+        } else {
+            let add_tag_tokens: Vec<&str> = patch
+                .add_tags
+                .unwrap_or("")
+                .split(',')
+                .map(strip)
+                .filter(|t| !t.is_empty() && !t.starts_with(RETIRED_TAG_PREFIX))
+                .collect();
+            let remove_tag_folded: HashSet<String> = patch
+                .remove_tags
+                .unwrap_or("")
+                .split(',')
+                .map(strip)
+                .filter(|t| !t.is_empty())
+                .map(|t| fold(Some(t)))
+                .collect();
+            for &t in &old_tag_tokens {
+                if t.starts_with(RETIRED_TAG_PREFIX) {
+                    continue;
+                }
+                if !merged_tags.contains(&t) {
+                    merged_tags.push(t);
+                }
             }
-        }
-        for &t in &add_tag_tokens {
-            if !merged_tags.contains(&t) {
-                merged_tags.push(t);
+            for &t in &add_tag_tokens {
+                if !merged_tags.contains(&t) {
+                    merged_tags.push(t);
+                }
             }
-        }
-        if !remove_tag_folded.is_empty() {
-            merged_tags.retain(|t| !remove_tag_folded.contains(&fold(Some(t))));
+            if !remove_tag_folded.is_empty() {
+                merged_tags.retain(|t| !remove_tag_folded.contains(&fold(Some(t))));
+            }
         }
         let new_tags = if !had_stale_retired && merged_tags == old_tag_tokens {
             old.tags.clone()

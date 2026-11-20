@@ -133,7 +133,7 @@ mod tests {
         let h = d.path().to_str().unwrap();
         assert_eq!(
             err("Missing tag text", &put(h, "", |_| {})),
-            "ValueError: Evidence tag is required"
+            "ValueError: Evidence tag is required; expected one of executed, verified, decided, client-stated, derived, assumed, prior, planned"
         );
         assert_eq!(
             err("Verified without evidence", &put(h, "verified", |_| {})),

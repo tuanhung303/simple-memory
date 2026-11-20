@@ -1,0 +1,1369 @@
+//! Integration and boundary tests for v0.6.0 search, ranking, date bounds, and hook features:
+//! 1. Query exclusions (`-term`, `-"phrase"`, pure `-R6` literal preservation, uppercase `OR`/`AND` stripping)
+//! 2. Active-first history ranking (`--include-history`)
+//! 3. Snake_case & alias-aware `why=` / `missing:` + circular self-hint suppression
+//! 4. Additive `--bias scope:<path>`
+//! 5. Relative `--since` / `--until` shorthands (`m`/`h`/`d`/`w`, bounds `1..=36500`)
+//! 6. `[prompt_hook] local_min_idf` config knob (default `8.0`, `0.0` disables, invalid fails loud)
+//! 7. Hook `--in <scopes>` follow-up hint (Haiku + local paths)
+//! 8. Config-aware backoff auto-invalidation (`rewrite_cmd`, `rewrite_model`, `rewrite_timeout` + legacy compat)
+//! 9. Clearer tag/bias error messages
+
+mod common;
+
+use std::io::Write;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+
+use common::{git, open, scratch, sm, write};
+use serde_json::{Value, json};
+use simple_memory::clock;
+use simple_memory::config::{config_toml, defaults, load_config};
+use simple_memory::core::item::{Item, epoch_to_as_of};
+use simple_memory::py::path::PyPath;
+use simple_memory::py::value::PyValue;
+use simple_memory::service::capture::Completed;
+use simple_memory::service::query::local_min_idf_from_cfg;
+use simple_memory::service::recall::{Backoff, local_query, run_prompt_hook};
+use simple_memory::store::items::put_item;
+
+const TS: &str = "2026-10-25T10:00:00+00:00";
+
+const SCOPES_TOML: &str = "[scopes]\n\
+\"acme/GLX\" = [\"repo:globex-web\", \"GLX\"]\n\
+\"acme/other\" = [\"repo:acme-other\"]\n\
+initech = [\"INI\"]\n";
+
+fn init_git_repo(parent: &Path, name: &str) -> PathBuf {
+    let dir = parent.join(name);
+    std::fs::create_dir_all(&dir).unwrap();
+    git(&["init", "-q", dir.to_str().unwrap()]);
+    dir
+}
+
+#[allow(clippy::too_many_arguments)]
+fn seed_item(
+    home: &Path,
+    id: &str,
+    repo: &str,
+    kind: &str,
+    title: &str,
+    body: &str,
+    tag: &str,
+    refs: &str,
+    tags: &str,
+    as_of: &str,
+) {
+    let conn = open(home);
+    let mut it = Item::bare(id, repo, kind, title, body, tag);
+    it.refs = refs.to_string();
+    it.tags = tags.to_string();
+    it.evidence = "made-up check".to_string();
+    it.as_of = as_of.to_string();
+    put_item(&conn, &it.post_init(), None).unwrap();
+}
+
+fn seed_superseded(
+    home: &Path,
+    id: &str,
+    title: &str,
+    body: &str,
+    refs: &str,
+    superseded_by: Option<&str>,
+    as_of: &str,
+) {
+    let conn = open(home);
+    let mut it = Item::bare(id, "anvil", "fact", title, body, "executed");
+    it.refs = refs.to_string();
+    it.evidence = "made-up check".to_string();
+    it.as_of = as_of.to_string();
+    it.status = "superseded".to_string();
+    it.superseded_by = superseded_by.map(String::from);
+    put_item(&conn, &it.post_init(), None).unwrap();
+}
+
+fn fake_claude(dir: &Path, name: &str, reply: &str) -> String {
+    let path = dir.join(name);
+    write(
+        &path,
+        &format!("#!/bin/sh\ncat >/dev/null\nprintf '%s\\n' '{reply}'\n"),
+    );
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path.to_str().unwrap().to_string()
+}
+
+fn hook_prompt(home: &Path, stdin: &str) -> (i32, String, String) {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_sm"));
+    cmd.args(["hook", "prompt"])
+        .env("HOME", home.parent().unwrap_or(home))
+        .env("SIMPLE_MEMORY_HOME", home)
+        .env_remove("SM_PROMPT_HOOK")
+        .env_remove("SM_PARITY_NOW")
+        .env_remove("SM_PARITY_SEED")
+        .env_remove("SM_PARITY_TRACE")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn().expect("spawn sm hook");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(stdin.as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().expect("wait sm hook");
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8(out.stdout).expect("utf-8 stdout"),
+        String::from_utf8(out.stderr).expect("utf-8 stderr"),
+    )
+}
+
+fn hook_log_rows(home: &Path) -> Vec<Value> {
+    std::fs::read_to_string(home.join("hook.log"))
+        .unwrap_or_default()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect()
+}
+
+fn s(v: &str) -> PyValue {
+    PyValue::Str(v.to_string())
+}
+
+// ---------------------------------------------------------------- 1. Query exclusions & operators
+
+#[test]
+fn query_exclusions_filter_terms_phrases_other_repos_and_preserve_literal_leading_dash() {
+    let (_d, home) = scratch();
+    seed_item(
+        &home,
+        "m_prod",
+        "anvil",
+        "fact",
+        "postgres tuning",
+        "postgres production settings",
+        "decided",
+        "",
+        "",
+        TS,
+    );
+    seed_item(
+        &home,
+        "m_stg",
+        "anvil",
+        "fact",
+        "postgres staging",
+        "postgres staging environment",
+        "decided",
+        "",
+        "",
+        TS,
+    );
+    seed_item(
+        &home,
+        "m_pool",
+        "anvil",
+        "fact",
+        "postgres pool",
+        "postgres connection pool limits",
+        "decided",
+        "",
+        "",
+        TS,
+    );
+    seed_item(
+        &home,
+        "m_other_stg",
+        "other",
+        "fact",
+        "postgres staging other",
+        "postgres staging in other repo",
+        "decided",
+        "",
+        "",
+        TS,
+    );
+    seed_item(
+        &home,
+        "m_other_prod",
+        "other",
+        "fact",
+        "postgres prod other",
+        "postgres production in other repo",
+        "decided",
+        "",
+        "",
+        TS,
+    );
+    seed_item(
+        &home,
+        "m_r6",
+        "anvil",
+        "fact",
+        "Flag -R6 note",
+        "Flag -R6 detail body",
+        "decided",
+        "R6",
+        "",
+        TS,
+    );
+
+    // Single term exclusion + phrase exclusion: only m_prod survives in repo anvil,
+    // and other_repos excludes m_other_stg while keeping m_other_prod.
+    let (code, out, err) = sm(
+        &home,
+        &[
+            "query",
+            "postgres -staging -\"connection pool\"",
+            "--repo",
+            "anvil",
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(code, 0, "{err}");
+    let v: Value = serde_json::from_str(&out).unwrap();
+    let ids: Vec<&str> = v["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, vec!["m_prod"]);
+    // Excluded terms must never pollute why.terms_missing or footer missing.
+    assert_eq!(v["results"][0]["why"]["terms_matched"], json!(["postgres"]));
+    assert_eq!(v["results"][0]["why"]["terms_missing"], json!([]));
+    assert_eq!(v["missing"], json!([]));
+    assert_eq!(v["more"]["other_repos"], json!({"other": 1}));
+
+    // Leading exclusion before positive term works identically (`-staging postgres`).
+    let (code, out_lead, err) = sm(
+        &home,
+        &[
+            "query",
+            "--repo",
+            "anvil",
+            "--format",
+            "json",
+            "--",
+            "-staging postgres",
+        ],
+    );
+    assert_eq!(code, 0, "{err}");
+    let v_lead: Value = serde_json::from_str(&out_lead).unwrap();
+    let lead_ids: Vec<&str> = v_lead["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(lead_ids, vec!["m_prod", "m_pool"]);
+
+    // Quoted `"-staging" postgres` treats staging as positive (not excluded).
+    let (code, out_quoted, err) = sm(
+        &home,
+        &[
+            "query",
+            "\"-staging\" postgres",
+            "--repo",
+            "anvil",
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(code, 0, "{err}");
+    let v_q: Value = serde_json::from_str(&out_quoted).unwrap();
+    let q_ids: Vec<&str> = v_q["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["id"].as_str().unwrap())
+        .collect();
+    assert!(q_ids.contains(&"m_stg"), "{q_ids:?}");
+
+    // Pure leading-dash query (`sm query -- -R6`) stays literal (zero positive tokens -> no exclusion).
+    let (code, out_r6, err) = sm(
+        &home,
+        &["query", "--repo", "anvil", "--format", "json", "--", "-R6"],
+    );
+    assert_eq!(code, 0, "{err}");
+    let v_r6: Value = serde_json::from_str(&out_r6).unwrap();
+    assert_eq!(v_r6["results"][0]["id"], json!("m_r6"));
+
+    // Standalone uppercase OR / AND stripped as boolean noise; does not distort phrase/why.
+    let (code, out_op, err) = sm(
+        &home,
+        &[
+            "query",
+            "postgres OR production AND settings",
+            "--repo",
+            "anvil",
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(code, 0, "{err}");
+    let v_op: Value = serde_json::from_str(&out_op).unwrap();
+    assert_eq!(v_op["results"][0]["id"], json!("m_prod"));
+    assert_eq!(v_op["results"][0]["why"]["phrase"], json!(true));
+    assert_eq!(
+        v_op["results"][0]["why"]["terms_matched"],
+        json!(["postgres", "production", "settings"])
+    );
+
+    // Excluding every matching item suppresses circular `missing: postgres=N -> sm query "postgres"`.
+    let (code, out_all_excl, err) = sm(
+        &home,
+        &[
+            "query",
+            "postgres -production -staging -pool",
+            "--repo",
+            "anvil",
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(code, 0, "{err}");
+    let v_ae: Value = serde_json::from_str(&out_all_excl).unwrap();
+    assert_eq!(v_ae["results"], json!([]));
+    assert_eq!(v_ae["missing"], json!([]));
+}
+
+// ---------------------------------------------------------------- 2. Active-first history ranking
+
+#[test]
+fn include_history_ranks_active_items_ahead_of_superseded_and_retired() {
+    let (_d, home) = scratch();
+    seed_superseded(
+        &home,
+        "m_sup",
+        "R6 deploy workflow",
+        "R6 deploy workflow exact phrase",
+        "R6",
+        Some("m_act"),
+        "2026-11-10T10:00:00+00:00",
+    );
+    seed_superseded(
+        &home,
+        "m_ret",
+        "R6 deploy workflow",
+        "R6 deploy workflow exact phrase",
+        "R6",
+        None,
+        "2026-11-10T10:00:00+00:00",
+    );
+    seed_item(
+        &home,
+        "m_act",
+        "anvil",
+        "fact",
+        "deploy note",
+        "updated deploy guidance without ref",
+        "derived",
+        "",
+        "",
+        "2026-01-01T10:00:00+00:00",
+    );
+
+    let (code, out, err) = sm(
+        &home,
+        &[
+            "query",
+            "R6 deploy workflow",
+            "--repo",
+            "anvil",
+            "--include-history",
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(code, 0, "{err}");
+    let v: Value = serde_json::from_str(&out).unwrap();
+    let results = v["results"].as_array().unwrap();
+    assert_eq!(results.len(), 3);
+    assert_eq!(results[0]["id"], json!("m_act"));
+    assert_eq!(results[0]["status"], json!("active"));
+    assert_eq!(results[1]["status"], json!("superseded"));
+    assert_eq!(results[2]["status"], json!("superseded"));
+
+    // Without --include-history, only the active item is returned.
+    let (code, out_no_hist, err) = sm(
+        &home,
+        &[
+            "query",
+            "R6 deploy workflow",
+            "--repo",
+            "anvil",
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(code, 0, "{err}");
+    let v_nh: Value = serde_json::from_str(&out_no_hist).unwrap();
+    let nh_ids: Vec<&str> = v_nh["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(nh_ids, vec!["m_act"]);
+}
+
+// ---------------------------------------------------------------- 3. Honest why= and missing: (snake_case, aliases, self-hint)
+
+#[test]
+fn snake_case_aliases_and_circular_self_hint_suppression() {
+    let (_d, home) = scratch();
+    write(
+        &home.join("config.toml"),
+        "[keyword_aliases]\nk8s = \"kubernetes\"\n\"queue lag\" = \"queue-worker\"\n",
+    );
+    seed_item(
+        &home,
+        "m_snake",
+        "anvil",
+        "fact",
+        "metric config",
+        "tracks foo_bar_baz values",
+        "decided",
+        "",
+        "",
+        TS,
+    );
+    seed_item(
+        &home,
+        "m_embed",
+        "anvil",
+        "fact",
+        "wrapper token",
+        "contains pre_zorx_post identifier",
+        "decided",
+        "",
+        "",
+        TS,
+    );
+    seed_item(
+        &home,
+        "m_k8s",
+        "anvil",
+        "fact",
+        "kubernetes rollout",
+        "kubernetes deploy steps",
+        "decided",
+        "",
+        "",
+        TS,
+    );
+    seed_item(
+        &home,
+        "m_deploy_only",
+        "anvil",
+        "decision",
+        "R9 deploy note",
+        "deploy note without cluster",
+        "executed",
+        "R9",
+        "",
+        "2026-11-15T10:00:00+00:00",
+    );
+
+    // 1) snake_case query `foo_bar` matches `foo_bar_baz` in why= with no bogus `missing: foo_bar=1`.
+    let (code, out_snake, err) = sm(
+        &home,
+        &["query", "foo_bar", "--repo", "anvil", "--format", "json"],
+    );
+    assert_eq!(code, 0, "{err}");
+    let vs: Value = serde_json::from_str(&out_snake).unwrap();
+    assert_eq!(vs["results"][0]["id"], json!("m_snake"));
+    assert_eq!(vs["results"][0]["why"]["terms_matched"], json!(["foo_bar"]));
+    assert_eq!(vs["results"][0]["why"]["terms_missing"], json!([]));
+    assert_eq!(vs["missing"], json!([]));
+
+    // 2) Single-term query `zorx` matched by FTS5 inside `pre_zorx_post`: never emit circular
+    //    `missing: zorx=1 -> sm query "zorx"` when term equals the entire folded query and n > 0!
+    let (code, out_emb, err) = sm(&home, &["query", "zorx", "--repo", "anvil"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(out_emb.contains("[m_embed]"), "{out_emb}");
+    assert!(!out_emb.contains("missing: zorx="), "{out_emb}");
+
+    // 3) Alias `k8s` -> `kubernetes`: when hit holds `kubernetes`, `why=` counts `k8s` as matched.
+    let (code, out_k8s, err) = sm(
+        &home,
+        &["query", "k8s deploy", "--repo", "anvil", "--format", "json"],
+    );
+    assert_eq!(code, 0, "{err}");
+    let vk: Value = serde_json::from_str(&out_k8s).unwrap();
+    let hit_k8s = vk["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["id"] == "m_k8s")
+        .unwrap();
+    assert_eq!(hit_k8s["why"]["terms_matched"], json!(["k8s", "deploy"]));
+    assert_eq!(hit_k8s["why"]["terms_missing"], json!([]));
+    assert_eq!(vk["missing"], json!([]));
+
+    // 4) Alias-expanded `missing:` count: with `--limit 1`, R9 ranks `m_deploy_only` first, so
+    //    `k8s` is missing from shown hits; its `in_scope` count MUST include `m_k8s` via alias!
+    let (code, out_miss, err) = sm(
+        &home,
+        &[
+            "query", "R9 k8s", "--repo", "anvil", "--limit", "1", "--format", "json",
+        ],
+    );
+    assert_eq!(code, 0, "{err}");
+    let vm: Value = serde_json::from_str(&out_miss).unwrap();
+    assert_eq!(vm["results"][0]["id"], json!("m_deploy_only"));
+    assert_eq!(vm["missing"], json!([{"term": "k8s", "in_scope": 1}]));
+
+    // 5) Zero-hit single-term query STILL emits `missing: nonexistent=0` (no `-> sm query` hint).
+    let (code, out_zero, err) = sm(&home, &["query", "nonexistent", "--repo", "anvil"]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(out_zero, "missing: nonexistent=0\n");
+}
+
+// ---------------------------------------------------------------- 4. Additive --bias scope:<path>
+
+#[test]
+fn scope_only_bias_is_additive_over_default_bias_and_respects_config_relevance() {
+    let (_d, home) = scratch();
+    write(&home.join("config.toml"), SCOPES_TOML);
+    seed_item(
+        &home,
+        "m_glx_dec",
+        "globex-web",
+        "decision",
+        "cobalt rollout plan",
+        "cobalt rollout plan details alpha",
+        "executed",
+        "",
+        "",
+        "2026-11-15T10:00:00+00:00",
+    );
+    seed_item(
+        &home,
+        "m_glx_ep",
+        "globex-web",
+        "episode",
+        "cobalt rollout plan",
+        "cobalt rollout plan details bravo",
+        "assumed",
+        "",
+        "",
+        "2026-01-01T10:00:00+00:00",
+    );
+
+    // Default config + `--bias scope:acme/GLX`: keeps all 8 defaults AND appends scope:acme/GLX,
+    // so decision+executed outranks episode+assumed within the same scope!
+    let (code, out, err) = sm(
+        &home,
+        &[
+            "query",
+            "cobalt rollout",
+            "--all",
+            "--bias",
+            "scope:acme/GLX",
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(code, 0, "{err}");
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(
+        v["bias"],
+        json!([
+            "recency",
+            "fact",
+            "decision",
+            "learning",
+            "executed",
+            "verified",
+            "decided",
+            "client-stated",
+            "scope:acme/GLX"
+        ])
+    );
+    assert_eq!(v["results"][0]["id"], json!("m_glx_dec"));
+    assert_eq!(
+        v["results"][0]["why"]["bias"],
+        json!(["decision", "executed", "scope:acme/GLX"])
+    );
+    assert_eq!(v["results"][1]["id"], json!("m_glx_ep"));
+    assert_eq!(v["results"][1]["why"]["bias"], json!(["scope:acme/GLX"]));
+
+    // Config `[query] default_bias = ["relevance"]` + `--bias scope:acme/GLX` yields `["relevance", "scope:acme/GLX"]`.
+    write(
+        &home.join("config.toml"),
+        &format!("[query]\ndefault_bias = [\"relevance\"]\n{SCOPES_TOML}"),
+    );
+    let (code, out_cfg_rel, err) = sm(
+        &home,
+        &[
+            "query",
+            "cobalt rollout",
+            "--all",
+            "--bias",
+            "scope:acme/GLX",
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(code, 0, "{err}");
+    let vcr: Value = serde_json::from_str(&out_cfg_rel).unwrap();
+    assert_eq!(vcr["bias"], json!(["relevance", "scope:acme/GLX"]));
+    assert_eq!(vcr["results"][0]["why"]["bias"], json!(["scope:acme/GLX"]));
+
+    // Deduplication: if config already includes `scope:acme/GLX`, passing `--bias scope:acme/GLX` doesn't duplicate it.
+    write(
+        &home.join("config.toml"),
+        &format!("[query]\ndefault_bias = [\"recency\", \"scope:acme/GLX\"]\n{SCOPES_TOML}"),
+    );
+    let (code, out_dedup, err) = sm(
+        &home,
+        &[
+            "query",
+            "cobalt rollout",
+            "--all",
+            "--bias",
+            "scope:acme/GLX",
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(code, 0, "{err}");
+    let vd: Value = serde_json::from_str(&out_dedup).unwrap();
+    assert_eq!(vd["bias"], json!(["recency", "scope:acme/GLX"]));
+}
+
+// ---------------------------------------------------------------- 5. Relative --since / --until
+
+#[test]
+fn relative_date_bounds_work_in_query_and_list_and_reject_invalid_forms() {
+    let (_d, home) = scratch();
+    let now = clock::now_epoch();
+    let ts_30m = epoch_to_as_of(now - 30.0 * 60.0).unwrap();
+    let ts_3d = epoch_to_as_of(now - 3.0 * 86_400.0).unwrap();
+    let ts_10d = epoch_to_as_of(now - 10.0 * 86_400.0).unwrap();
+
+    seed_item(
+        &home,
+        "m_30m",
+        "anvil",
+        "fact",
+        "quasar recent",
+        "quasar 30m",
+        "decided",
+        "",
+        "",
+        &ts_30m,
+    );
+    seed_item(
+        &home,
+        "m_3d",
+        "anvil",
+        "fact",
+        "quasar mid",
+        "quasar 3d",
+        "decided",
+        "",
+        "",
+        &ts_3d,
+    );
+    seed_item(
+        &home,
+        "m_10d",
+        "anvil",
+        "fact",
+        "quasar old",
+        "quasar 10d",
+        "decided",
+        "",
+        "",
+        &ts_10d,
+    );
+
+    // `--since 7d --until 1d` keeps only m_3d.
+    let (code, out, err) = sm(
+        &home,
+        &[
+            "query", "quasar", "--repo", "anvil", "--since", "7d", "--until", "1d", "--format",
+            "json",
+        ],
+    );
+    assert_eq!(code, 0, "{err}");
+    let v: Value = serde_json::from_str(&out).unwrap();
+    let ids: Vec<&str> = v["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, vec!["m_3d"]);
+
+    // Case-insensitive `2H` keeps only m_30m in `sm list`.
+    let (code, list_out, err) = sm(
+        &home,
+        &[
+            "list", "--repo", "anvil", "--since", "2H", "--format", "json",
+        ],
+    );
+    assert_eq!(code, 0, "{err}");
+    let lv: Value = serde_json::from_str(&list_out).unwrap();
+    let list_ids: Vec<&str> = lv["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(list_ids, vec!["m_30m"]);
+
+    // `2w` covers all three items.
+    let (code, out_2w, err) = sm(
+        &home,
+        &[
+            "query", "quasar", "--repo", "anvil", "--since", "2w", "--format", "json",
+        ],
+    );
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&out_2w).unwrap()["results"]
+            .as_array()
+            .unwrap()
+            .len(),
+        3
+    );
+
+    // Failure paths: reversed range and out-of-range relative shorthands.
+    let (code, _, err) = sm(
+        &home,
+        &[
+            "query", "quasar", "--repo", "anvil", "--since", "1d", "--until", "7d",
+        ],
+    );
+    assert_eq!(code, 1);
+    assert_eq!(err.trim(), "error: --since cannot be after --until");
+
+    for bad in ["0d", "36501d", "-7d", "7x"] {
+        let (code, _, err) = sm(
+            &home,
+            &["query", "quasar", "--repo", "anvil", "--since", bad],
+        );
+        assert_eq!(code, 1, "{bad}");
+        assert!(err.starts_with("error:"), "{bad}: {err}");
+    }
+}
+
+// ---------------------------------------------------------------- 6. [prompt_hook] local_min_idf
+
+#[test]
+fn local_min_idf_config_defaults_override_zero_disable_and_validation() {
+    let commented = config_toml(&defaults(), true).unwrap();
+    assert!(
+        commented.contains(
+            "# Minimum matched-term IDF sum for local prompt-hook fallback recall (0.0 disables).\n# local_min_idf = 8.0\n"
+        ),
+        "{commented}"
+    );
+
+    let (d, home) = scratch();
+    let repo = init_git_repo(d.path(), "anvil");
+    // 10 items total: one rare term has IDF ln(10/1) = 2.3026 (< 8.0 default, >= 2.0 custom).
+    for i in 0..9 {
+        seed_item(
+            &home,
+            &format!("f_{i:02}"),
+            "anvil",
+            "fact",
+            &format!("ordinary filler {i}"),
+            &format!("neutral body {i}"),
+            "decided",
+            "",
+            "",
+            TS,
+        );
+    }
+    seed_item(
+        &home,
+        "m_rare",
+        "anvil",
+        "fact",
+        "obsidian protocol",
+        "obsidian protocol details",
+        "decided",
+        "",
+        "",
+        TS,
+    );
+
+    // Default local_min_idf = 8.0 drops single rare word (2.30 < 8.0).
+    write(
+        &home.join("config.toml"),
+        "[catch_up]\nenabled = false\n[prompt_hook]\nmodel = \"none\"\n",
+    );
+    let (_, items_def) = local_query(
+        "tell me about obsidian today",
+        4,
+        0,
+        None,
+        "anvil",
+        home.to_str(),
+        None,
+        None,
+    )
+    .unwrap();
+    assert!(items_def.is_empty());
+
+    // Lowering local_min_idf = 2.0 admits m_rare (2.30 >= 2.0), while 2.5 still rejects it.
+    write(
+        &home.join("config.toml"),
+        "[catch_up]\nenabled = false\n[prompt_hook]\nmodel = \"none\"\nlocal_min_idf = 2.0\n",
+    );
+    let (_, items_low) = local_query(
+        "tell me about obsidian today",
+        4,
+        0,
+        None,
+        "anvil",
+        home.to_str(),
+        None,
+        None,
+    )
+    .unwrap();
+    assert_eq!(items_low.len(), 1);
+    assert_eq!(items_low[0].id, "m_rare");
+
+    write(
+        &home.join("config.toml"),
+        "[catch_up]\nenabled = false\n[prompt_hook]\nmodel = \"none\"\nlocal_min_idf = 2.5\n",
+    );
+    let (_, items_hi) = local_query(
+        "tell me about obsidian today",
+        4,
+        0,
+        None,
+        "anvil",
+        home.to_str(),
+        None,
+        None,
+    )
+    .unwrap();
+    assert!(items_hi.is_empty());
+
+    // local_min_idf = 0.0 disables the local IDF floor completely.
+    write(
+        &home.join("config.toml"),
+        "[catch_up]\nenabled = false\n[prompt_hook]\nmodel = \"none\"\nlocal_min_idf = 0.0\n",
+    );
+    let (_, items_zero) = local_query(
+        "tell me about obsidian today",
+        4,
+        0,
+        None,
+        "anvil",
+        home.to_str(),
+        None,
+        None,
+    )
+    .unwrap();
+    assert_eq!(items_zero.len(), 1);
+    assert_eq!(items_zero[0].id, "m_rare");
+
+    // Invalid local_min_idf fails loud in local_min_idf_from_cfg & local_query, logs local_error on
+    // hook local path, and does NOT break a working Haiku path.
+    for bad in ["-0.1", "true", "nan", "inf", "\"bad\"", "[]"] {
+        write(
+            &home.join("config.toml"),
+            &format!(
+                "[catch_up]\nenabled = false\n[prompt_hook]\nmodel = \"none\"\nlocal_min_idf = {bad}\n"
+            ),
+        );
+        let cfg = load_config(home.to_str()).unwrap();
+        let err = local_min_idf_from_cfg(&cfg).unwrap_err();
+        assert_eq!(
+            err.msg, "[prompt_hook] local_min_idf must be a finite number >= 0",
+            "{bad}"
+        );
+    }
+
+    let _ = std::fs::remove_file(home.join("hook.log"));
+    write(
+        &home.join("config.toml"),
+        "[catch_up]\nenabled = false\n[prompt_hook]\nmodel = \"none\"\nlocal_min_idf = -1.0\n",
+    );
+    let p = json!({"prompt": "tell me about obsidian today", "cwd": repo.to_str().unwrap()})
+        .to_string();
+    let (code, stdout, stderr) = hook_prompt(&home, &p);
+    assert_eq!((code, stdout.as_str(), stderr.as_str()), (0, "", ""));
+    let rows = hook_log_rows(&home);
+    assert_eq!(rows.len(), 1);
+    assert!(
+        rows[0]["local_error"]
+            .as_str()
+            .unwrap()
+            .contains("[prompt_hook] local_min_idf must be a finite number >= 0"),
+        "{}",
+        rows[0]
+    );
+}
+
+// ---------------------------------------------------------------- 7. Hook --in <scopes> follow-up hint
+
+#[test]
+fn hook_header_includes_in_scopes_when_matched_and_omits_when_unmatched() {
+    let (d, home) = scratch();
+    let repo = init_git_repo(d.path(), "anvil");
+    let claude = fake_claude(d.path(), "fake-claude.sh", "walrus rollout");
+
+    seed_item(
+        &home,
+        "m_glx",
+        "globex-web",
+        "fact",
+        "walrus rollout plan",
+        "walrus rollout details for GLX",
+        "decided",
+        "",
+        "",
+        TS,
+    );
+    seed_item(
+        &home,
+        "m_local",
+        "anvil",
+        "fact",
+        "walrus rollout local",
+        "walrus rollout local details",
+        "decided",
+        "",
+        "",
+        TS,
+    );
+
+    write(
+        &home.join("config.toml"),
+        &format!(
+            "[catch_up]\nenabled = false\n\
+             [prompt_hook]\nclaude_bin = \"{claude}\"\nmin_idf = 0.0\nlocal_min_idf = 0.0\n\
+             [prompt_hook.projects]\nGLX = \"Globex\"\nINI = \"Initech\"\n\
+             {SCOPES_TOML}"
+        ),
+    );
+
+    // Haiku path with 1 matched scope -> `--in acme/GLX`.
+    let p_one = json!({"prompt": "check GLX walrus rollout now", "cwd": repo.to_str().unwrap()})
+        .to_string();
+    let (code, out_one, err) = hook_prompt(&home, &p_one);
+    assert_eq!((code, err.as_str()), (0, ""));
+    let ctx_one =
+        serde_json::from_str::<Value>(&out_one).unwrap()["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap()
+            .to_string();
+    assert!(
+        ctx_one
+            .lines()
+            .next()
+            .unwrap()
+            .contains("`sm query \"walrus rollout\" --in acme/GLX --limit 10`"),
+        "{ctx_one}"
+    );
+
+    // Haiku path with 2 matched scopes -> `--in acme/GLX,initech`.
+    let p_two =
+        json!({"prompt": "check GLX and INI walrus rollout", "cwd": repo.to_str().unwrap()})
+            .to_string();
+    let (code, out_two, err) = hook_prompt(&home, &p_two);
+    assert_eq!((code, err.as_str()), (0, ""));
+    let ctx_two =
+        serde_json::from_str::<Value>(&out_two).unwrap()["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap()
+            .to_string();
+    assert!(
+        ctx_two
+            .lines()
+            .next()
+            .unwrap()
+            .contains("`sm query \"walrus rollout\" --in acme/GLX,initech --limit 10`"),
+        "{ctx_two}"
+    );
+
+    // Haiku path with NO matched scope -> exact existing hint without `--in`.
+    let p_none =
+        json!({"prompt": "check generic walrus rollout now", "cwd": repo.to_str().unwrap()})
+            .to_string();
+    let (code, out_none, err) = hook_prompt(&home, &p_none);
+    assert_eq!((code, err.as_str()), (0, ""));
+    let ctx_none = serde_json::from_str::<Value>(&out_none).unwrap()["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        ctx_none
+            .lines()
+            .next()
+            .unwrap()
+            .contains("`sm query \"walrus rollout\" --limit 10`"),
+        "{ctx_none}"
+    );
+    assert!(
+        !ctx_none.lines().next().unwrap().contains(" --in "),
+        "{ctx_none}"
+    );
+
+    // Local fallback path (`model = "none"`) with matched scope -> also includes `--in acme/GLX`.
+    write(
+        &home.join("config.toml"),
+        &format!(
+            "[catch_up]\nenabled = false\n\
+             [prompt_hook]\nmodel = \"none\"\nlocal_min_idf = 0.0\n\
+             [prompt_hook.projects]\nGLX = \"Globex\"\n\
+             {SCOPES_TOML}"
+        ),
+    );
+    let (code, out_loc, err) = hook_prompt(&home, &p_one);
+    assert_eq!((code, err.as_str()), (0, ""));
+    let ctx_loc =
+        serde_json::from_str::<Value>(&out_loc).unwrap()["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap()
+            .to_string();
+    assert!(
+        ctx_loc
+            .lines()
+            .next()
+            .unwrap()
+            .contains("--in acme/GLX --limit 10`"),
+        "{ctx_loc}"
+    );
+}
+
+// ---------------------------------------------------------------- 8. Config-aware backoff invalidation
+
+#[test]
+fn backoff_auto_invalidates_when_rewrite_config_changes_and_stays_active_otherwise() {
+    let (d, home) = scratch();
+    let repo = init_git_repo(d.path(), "anvil");
+    seed_item(
+        &home,
+        "m_1",
+        "anvil",
+        "fact",
+        "zebra failover note",
+        "zebra failover body",
+        "decided",
+        "",
+        "",
+        TS,
+    );
+
+    let set_hook_cfg = |cmd: &str, model: &str, timeout: f64| {
+        write(
+            &home.join("config.toml"),
+            &format!(
+                "[catch_up]\nenabled = false\n\
+                 [prompt_hook]\nclaude_bin = \"{cmd}\"\nmodel = \"{model}\"\ntimeout = {timeout}\nmin_idf = 0.0\nlocal_min_idf = 0.0\n"
+            ),
+        );
+    };
+
+    let make_payload = |prompt: &str| {
+        PyValue::Dict(vec![
+            (s("prompt"), s(prompt)),
+            (s("cwd"), s(repo.to_str().unwrap())),
+        ])
+    };
+
+    let fail_runner = |_c: &[String], _i: &str, _t: f64, _e: &[(&str, &str)], _w: Option<&str>| {
+        Ok(Completed {
+            returncode: 1,
+            stdout: String::new(),
+            stderr: "boom".into(),
+        })
+    };
+    let ok_runner = |_c: &[String], _i: &str, _t: f64, _e: &[(&str, &str)], _w: Option<&str>| {
+        Ok(Completed {
+            returncode: 0,
+            stdout: "zebra failover\n".into(),
+            stderr: String::new(),
+        })
+    };
+
+    let bo_path = home.join("hook").join("backoff.json");
+
+    // 2 failures open backoff recording cmd/model/timeout.
+    set_hook_cfg("/bad/claude", "haiku", 8.0);
+    run_prompt_hook(
+        &make_payload("why zebra failover broke"),
+        false,
+        home.to_str(),
+        &fail_runner,
+    )
+    .unwrap();
+    run_prompt_hook(
+        &make_payload("why zebra failover broke"),
+        false,
+        home.to_str(),
+        &fail_runner,
+    )
+    .unwrap();
+    let bo = Backoff::read(&PyPath::new(bo_path.to_str().unwrap())).unwrap();
+    assert_eq!(bo.failures, 2);
+    assert_eq!(bo.rewrite_cmd.as_deref(), Some("/bad/claude"));
+    assert_eq!(bo.rewrite_model.as_deref(), Some("haiku"));
+    assert_eq!(bo.rewrite_timeout, Some(8.0));
+
+    // Unchanged config keeps backoff active (ok_runner is NOT invoked).
+    let calls = std::cell::Cell::new(0usize);
+    let counting_ok = |c: &[String], i: &str, t: f64, e: &[(&str, &str)], w: Option<&str>| {
+        calls.set(calls.get() + 1);
+        ok_runner(c, i, t, e, w)
+    };
+    let same = run_prompt_hook(
+        &make_payload("why zebra failover broke"),
+        false,
+        home.to_str(),
+        &counting_ok,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(same.fallback, "backoff");
+    assert_eq!(calls.get(), 0);
+
+    // Changing each of (claude_bin, model, timeout) invalidates backoff and lets ok_runner succeed!
+    for (new_cmd, new_model, new_timeout) in [
+        ("/good/claude", "haiku", 8.0),
+        ("/bad/claude", "sonnet", 8.0),
+        ("/bad/claude", "haiku", 15.0),
+    ] {
+        // Re-seed active backoff for ("/bad/claude", "haiku", 8.0).
+        Backoff {
+            failures: 2,
+            until: clock::now_epoch() + 600.0,
+            error: "boom".into(),
+            cause: "error".into(),
+            notified: Vec::new(),
+            rewrite_cmd: Some("/bad/claude".into()),
+            rewrite_model: Some("haiku".into()),
+            rewrite_timeout: Some(8.0),
+        }
+        .write(&PyPath::new(bo_path.to_str().unwrap()))
+        .unwrap();
+
+        set_hook_cfg(new_cmd, new_model, new_timeout);
+        calls.set(0);
+        let res = run_prompt_hook(
+            &make_payload("why zebra failover broke"),
+            false,
+            home.to_str(),
+            &counting_ok,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(res.fallback, "", "({new_cmd}, {new_model}, {new_timeout})");
+        assert_eq!(calls.get(), 1, "({new_cmd}, {new_model}, {new_timeout})");
+        assert!(!bo_path.exists(), "({new_cmd}, {new_model}, {new_timeout})");
+    }
+
+    // Changing config after failure #1 resets failure streak back to 1 instead of opening backoff.
+    set_hook_cfg("/bad/claude", "haiku", 8.0);
+    run_prompt_hook(
+        &make_payload("why zebra failover broke"),
+        false,
+        home.to_str(),
+        &fail_runner,
+    )
+    .unwrap();
+    set_hook_cfg("/other/claude", "haiku", 8.0);
+    run_prompt_hook(
+        &make_payload("why zebra failover broke"),
+        false,
+        home.to_str(),
+        &fail_runner,
+    )
+    .unwrap();
+    let bo_reset = Backoff::read(&PyPath::new(bo_path.to_str().unwrap())).unwrap();
+    assert_eq!(bo_reset.failures, 1);
+    assert_eq!(bo_reset.until, 0.0);
+    assert_eq!(bo_reset.rewrite_cmd.as_deref(), Some("/other/claude"));
+}
+
+// ---------------------------------------------------------------- 9. Clearer tag & bias errors
+
+#[test]
+fn clearer_tag_and_bias_errors_list_valid_options() {
+    let (_d, home) = scratch();
+    let (code, _, err) = sm(&home, &["put", "--repo", "anvil", "--tag", "", "some body"]);
+    assert_eq!(code, 1);
+    assert_eq!(
+        err.trim(),
+        "error: Evidence tag is required; expected one of executed, verified, decided, client-stated, derived, assumed, prior, planned"
+    );
+
+    let (code, _, err) = sm(&home, &["query", "kiwi", "--bias", "bogus"]);
+    assert_eq!(code, 2);
+    assert!(
+        err.contains(
+            "Invalid bias 'bogus'; expected one of recency, relevance, executed, verified, decided, client-stated, derived, assumed, prior, planned, fact, decision, learning, episode, task, handoff, or scope:<path>"
+        ),
+        "{err}"
+    );
+}
+
+#[test]
+fn unquoted_dash_exclusions_snake_subtoken_why_and_exact_snake_exclusion() {
+    let (_d, home) = scratch();
+    // 1. Unquoted `-staging` and `-http` (not colliding with `-h` help) work directly in CLI.
+    let (c1, _, e1) = sm(
+        &home,
+        &[
+            "put",
+            "--repo",
+            "anvil",
+            "--tag",
+            "decided",
+            "connection pool production config",
+        ],
+    );
+    assert_eq!(c1, 0, "{e1}");
+    let (c2, _, e2) = sm(
+        &home,
+        &[
+            "put",
+            "--repo",
+            "anvil",
+            "--tag",
+            "decided",
+            "connection pool staging config",
+        ],
+    );
+    assert_eq!(c2, 0, "{e2}");
+    let (c3, _, e3) = sm(
+        &home,
+        &[
+            "put",
+            "--repo",
+            "anvil",
+            "--tag",
+            "decided",
+            "connection pool http fallback",
+        ],
+    );
+    assert_eq!(c3, 0, "{e3}");
+
+    let (code, out, err) = sm(
+        &home,
+        &[
+            "search",
+            "connection",
+            "pool",
+            "-staging",
+            "-http",
+            "--repo",
+            "anvil",
+            "--since",
+            "7d",
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(code, 0, "{err}");
+    let v: Value = serde_json::from_str(&out).unwrap();
+    let results = v["results"].as_array().unwrap();
+    assert_eq!(results.len(), 1, "{out}");
+    assert!(
+        results[0]["title"].as_str().unwrap().contains("production"),
+        "{out}"
+    );
+
+    // Leading `-staging` with no positive query term still fails with required query error;
+    // single-letter `-z` and `--bogus` still fail as unrecognized arguments.
+    let (code, _, _) = sm(&home, &["query", "--repo", "anvil", "-staging"]);
+    assert_eq!(code, 2);
+    let (code, _, err) = sm(&home, &["query", "connection", "-z", "--repo", "anvil"]);
+    assert_eq!(code, 2);
+    assert!(err.contains("unrecognized arguments: -z"), "{err}");
+
+    // 2. Bare query term matching inside a snake_case haystack token reports full terms match and no false missing.
+    let (c4, _, e4) = sm(
+        &home,
+        &[
+            "put",
+            "--repo",
+            "anvil",
+            "--tag",
+            "decided",
+            "alpha wrapper contains pre_zorx_post identifier",
+        ],
+    );
+    assert_eq!(c4, 0, "{e4}");
+    let (code, out, err) = sm(&home, &["query", "alpha zorx", "--repo", "anvil"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains("why=terms:2/2"), "{out}");
+    assert!(!out.contains("missing:"), "{out}");
+
+    // 3. Snake_case exclusion `-rate_limit` excludes exact `rate_limit` / adjacent `rate limit`,
+    //    NOT unrelated `rates ... limited`.
+    let (c5, _, e5) = sm(
+        &home,
+        &[
+            "put",
+            "--repo",
+            "anvil",
+            "--tag",
+            "decided",
+            "quasar rates are high; access is limited for guests",
+        ],
+    );
+    assert_eq!(c5, 0, "{e5}");
+    let (c6, _, e6) = sm(
+        &home,
+        &[
+            "put",
+            "--repo",
+            "anvil",
+            "--tag",
+            "decided",
+            "quasar rate_limit set to 100 rps",
+        ],
+    );
+    assert_eq!(c6, 0, "{e6}");
+    let (c7, _, e7) = sm(
+        &home,
+        &[
+            "put",
+            "--repo",
+            "anvil",
+            "--tag",
+            "decided",
+            "quasar rate limit bucket configuration",
+        ],
+    );
+    assert_eq!(c7, 0, "{e7}");
+    let (code, out, err) = sm(
+        &home,
+        &[
+            "query",
+            "quasar",
+            "-rate_limit",
+            "--repo",
+            "anvil",
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(code, 0, "{err}");
+    let v: Value = serde_json::from_str(&out).unwrap();
+    let titles: Vec<&str> = v["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["title"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        titles,
+        vec!["quasar rates are high; access is limited for guests"]
+    );
+}

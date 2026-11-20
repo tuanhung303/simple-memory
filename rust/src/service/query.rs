@@ -13,7 +13,8 @@ use crate::core::item::{Item, validate_date_range};
 pub use crate::core::rank::parse_bias;
 use crate::core::rank::{
     BIAS_SCOPE_PREFIX, DEFAULT_QUERY_LIMIT, Scored, is_hint_term, is_pure_relevance, match_snippet,
-    parse_bias_list, parse_scope_bias_path, query_terms,
+    parse_bias_list, parse_query_exclusions, parse_scope_bias_path, query_terms,
+    term_alias_targets,
 };
 use crate::core::refs::{RefsArg, split_refs};
 use crate::core::tags::{validate_kind, validate_tag};
@@ -248,6 +249,15 @@ fn prepare(
     };
     let cfg = load_config(a.home)?;
     let bias_list = match explicit_bias {
+        Some(b) if !b.is_empty() && b.iter().all(|t| parse_scope_bias_path(t).is_some()) => {
+            let mut merged = default_bias_from_cfg(&cfg)?;
+            for tok in b {
+                if !merged.contains(&tok) {
+                    merged.push(tok);
+                }
+            }
+            merged
+        }
         Some(b) => b,
         None => default_bias_from_cfg(&cfg)?,
     };
@@ -440,6 +450,32 @@ fn over_floor_at(
         .collect())
 }
 
+/// Parse and validate `[prompt_hook] local_min_idf`: default `LOCAL_TAU` when missing or None;
+/// rejects booleans, non-finite floats, negative numbers, and non-numeric values.
+pub fn local_min_idf_from_cfg(cfg: &PyValue) -> Result<f64, SmError> {
+    const ERR: &str = "[prompt_hook] local_min_idf must be a finite number >= 0";
+    let Some(hook_cfg) = cfg_get(cfg, "prompt_hook") else {
+        return Ok(LOCAL_TAU);
+    };
+    let Some(val) = cfg_get(hook_cfg, "local_min_idf") else {
+        return Ok(LOCAL_TAU);
+    };
+    match val {
+        PyValue::None => Ok(LOCAL_TAU),
+        PyValue::Bool(_) => Err(SmError::value(ERR)),
+        PyValue::Float(x) if x.is_finite() && *x >= 0.0 => Ok(*x),
+        PyValue::Int(s) => match s.parse::<f64>() {
+            Ok(x) if x.is_finite() && x >= 0.0 => Ok(x),
+            _ => Err(SmError::value(ERR)),
+        },
+        PyValue::Str(s) => match py::float::from_str(s) {
+            Ok(x) if x.is_finite() && x >= 0.0 => Ok(x),
+            _ => Err(SmError::value(ERR)),
+        },
+        _ => Err(SmError::value(ERR)),
+    }
+}
+
 /// `run_local_query`: (the local query, its top `limit + extra` items over the idf floor) on one
 /// connection with the hook's deadline and `run_query`'s scope; ("", []) when none clears it.
 #[allow(clippy::too_many_arguments)]
@@ -462,7 +498,7 @@ pub fn run_local_query<S: AsRef<str>>(
         cwd,
         ..Default::default()
     };
-    local_query_at(terms, codes, extra, &a, deadline, LOCAL_TAU)
+    local_query_at(terms, codes, extra, &a, deadline, None)
 }
 
 fn local_query_at<S: AsRef<str>>(
@@ -471,10 +507,14 @@ fn local_query_at<S: AsRef<str>>(
     extra: i64,
     a: &QueryArgs,
     deadline: Option<Instant>,
-    tau: f64,
+    tau_override: Option<f64>,
 ) -> Result<(String, Vec<Item>), SmError> {
     let (limit, home) = (a.limit, a.home);
     let (filters, bias_list, scope_biases, cfg) = prepare(a, deadline)?;
+    let tau = match tau_override {
+        Some(t) => t,
+        None => local_min_idf_from_cfg(&cfg)?,
+    };
     let conn = open(home, deadline)?;
     let mut all: Vec<String> = terms.iter().map(|t| t.as_ref().to_string()).collect();
     all.extend(codes.iter().map(|c| fold(Some(c.as_ref()))));
@@ -498,11 +538,15 @@ fn local_query_at<S: AsRef<str>>(
         &o,
         limit.max(LOCAL_SEARCH_DEPTH) + extra,
     )?;
-    let n_scope = count_scope(&conn, &filters)?;
-    let kept = head(
-        over_floor_at(&conn, found, &units, &df, n_scope, tau)?,
-        limit + extra,
-    );
+    let kept = if tau == 0.0 {
+        head(found, limit + extra)
+    } else {
+        let n_scope = count_scope(&conn, &filters)?;
+        head(
+            over_floor_at(&conn, found, &units, &df, n_scope, tau)?,
+            limit + extra,
+        )
+    };
     Ok(if kept.is_empty() {
         (String::new(), Vec::new())
     } else {
@@ -574,14 +618,30 @@ pub fn run_lookup(query_text: &str, a: &QueryArgs) -> Result<Lookup, SmError> {
     let (scored, pool_cap) = search_scored(&conn, query_text, &f, &o, Some(a.limit))?;
     let n_scored = scored.len() as i64;
     let hits = head(scored, a.limit);
+    let (positive_query, _excluded) = parse_query_exclusions(query_text);
+    let alias_map = term_alias_targets(&positive_query, ka.as_ref())?;
+    let full_folded = fold(Some(py::str::strip(query_text)));
+    let pos_folded = fold(Some(py::str::strip(&positive_query)));
     let held: HashSet<&String> = hits
         .iter()
         .flat_map(|s| s.why.terms_matched.iter())
         .collect();
     let mut missing = Vec::new();
-    for t in query_terms(query_text) {
+    for t in query_terms(&positive_query) {
         if !held.contains(&t) && is_hint_term(&t) {
-            let n = count_matches(&conn, &quote_fts_term(&t), &f)?;
+            let mut fts_parts = vec![quote_fts_term(&t)];
+            if let Some(targets) = alias_map.get(t.as_str()) {
+                for w in targets {
+                    let q = quote_fts_term(w);
+                    if !fts_parts.contains(&q) {
+                        fts_parts.push(q);
+                    }
+                }
+            }
+            let n = count_matches(&conn, &fts_parts.join(" OR "), &f)?;
+            if n > 0 && (t == full_folded || t == pos_folded) {
+                continue;
+            }
             missing.push((t, n));
         }
     }
@@ -1233,7 +1293,8 @@ mod tests {
                 ..Default::default()
             };
             let extra = rng.below(4) as i64;
-            let (query, items) = local_query_at(&terms, &codes, extra, &a, None, 2.5).unwrap();
+            let (query, items) =
+                local_query_at(&terms, &codes, extra, &a, None, Some(2.5)).unwrap();
             assert_eq!(query.is_empty(), items.is_empty());
             assert!(items.len() as i64 <= a.limit + extra);
             injected += usize::from(!items.is_empty());
@@ -1263,7 +1324,7 @@ mod tests {
             (String::new(), vec![])
         );
         assert!(
-            local_query_at(&["orchid".to_string()], &[], 0, &a, None, 0.0)
+            local_query_at(&["orchid".to_string()], &[], 0, &a, None, Some(0.0))
                 .unwrap()
                 .1
                 .len()
@@ -1341,7 +1402,7 @@ mod tests {
                 let n = 1 + rng.below(30);
                 let (terms, codes) = prompt_units(&mut rng, n);
                 let ids = |tau| -> HashSet<String> {
-                    local_query_at(&terms, &codes, 0, &a, None, tau)
+                    local_query_at(&terms, &codes, 0, &a, None, Some(tau))
                         .unwrap()
                         .1
                         .into_iter()

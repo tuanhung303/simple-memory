@@ -237,6 +237,9 @@ pub struct Parser {
     option_strings: Vec<(String, usize)>,
     /// Each mutually exclusive group, as indexes into `actions`.
     mutex_groups: Vec<Vec<usize>>,
+    /// When true, unquoted `-<word>` (2+ chars, no `=`, not a registered flag) after at least one
+    /// positional argument parses as a positional token instead of an unknown short flag.
+    allow_dash_exclusions: bool,
 }
 
 /// `parse_args` ended the process: the exit status (2 after an error, 0 after help or version).
@@ -265,6 +268,7 @@ impl Parser {
             actions: Vec::new(),
             option_strings: Vec::new(),
             mutex_groups: Vec::new(),
+            allow_dash_exclusions: false,
         };
         p.add_argument(
             &["-h", "--help"],
@@ -275,6 +279,20 @@ impl Parser {
             },
         );
         p
+    }
+
+    pub fn allow_dash_exclusions(&mut self, allow: bool) {
+        self.allow_dash_exclusions = allow;
+    }
+
+    fn is_dash_exclusion(&self, arg: &str) -> bool {
+        let Some(rest) = arg.strip_prefix('-') else {
+            return false;
+        };
+        if rest.starts_with('-') || rest.contains('=') || self.action_index(arg).is_some() {
+            return false;
+        }
+        rest.chars().count() >= 2 && rest.chars().next().is_some_and(crate::py::str::is_word)
     }
 
     /// `add_argument(*names, **kwargs)`; returns the action index.
@@ -404,6 +422,8 @@ impl Parser {
 
         let mut option_indices: HashMap<usize, Vec<OptTuple>> = HashMap::new();
         let mut pattern = String::new();
+        let mut seen_positional = false;
+        let mut skip_opt_val = 0usize;
         let mut iter = arg_strings.iter().enumerate();
         while let Some((i, s)) = iter.next() {
             if s == "--" {
@@ -413,9 +433,33 @@ impl Parser {
                 }
                 break;
             }
+            if self.allow_dash_exclusions
+                && seen_positional
+                && skip_opt_val == 0
+                && self.is_dash_exclusion(s)
+            {
+                pattern.push('A');
+                continue;
+            }
             match self.parse_optional(s) {
-                None => pattern.push('A'),
+                None => {
+                    if self.allow_dash_exclusions && skip_opt_val > 0 {
+                        skip_opt_val -= 1;
+                    } else {
+                        seen_positional = true;
+                    }
+                    pattern.push('A');
+                }
                 Some(t) => {
+                    if self.allow_dash_exclusions {
+                        skip_opt_val = usize::from(
+                            t.len() == 1
+                                && t[0].explicit_arg.is_none()
+                                && t[0]
+                                    .action
+                                    .is_some_and(|a| matches!(self.actions[a].nargs, Nargs::One)),
+                        );
+                    }
                     option_indices.insert(i, t);
                     pattern.push('O');
                 }

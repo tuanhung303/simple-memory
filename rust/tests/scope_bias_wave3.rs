@@ -216,7 +216,7 @@ fn parse_bias_handles_scope_case_validation_utf8_and_surrogate_boundaries() {
     // Non-ASCII strings whose byte index 6 lands inside a multi-byte UTF-8 char must NEVER panic
     // and must keep the exact unchanged non-scope error message.
     const EXPECTED_TAIL: &str = "expected one of recency, relevance, executed, verified, decided, \
-        client-stated, derived, assumed, prior, planned, fact, decision, learning, episode, task, handoff";
+        client-stated, derived, assumed, prior, planned, fact, decision, learning, episode, task, handoff, or scope:<path>";
     for bad in ["12345é", "caféé", "scópé:acme", "newest"] {
         let err = parse_bias(bad).unwrap_err();
         assert_eq!(err.class, "ValueError", "{bad}");
@@ -339,6 +339,7 @@ fn scope_matcher_parity_score_dedup_and_pool_widening() {
             bias: &["scope:acme/GLX".to_string()],
             scope_biases: &dup_scopes,
             explain: None,
+            aliases: None,
         },
     )
     .unwrap();
@@ -373,6 +374,7 @@ fn scope_matcher_parity_score_dedup_and_pool_widening() {
             bias: &["scope:acme/GLX".to_string()],
             scope_biases: &[("scope:acme/GLX".to_string(), repo_m.clone())],
             explain: None,
+            aliases: None,
         },
     )
     .unwrap();
@@ -574,7 +576,7 @@ fn cli_scope_bias_soft_reorders_preserves_footer_and_errors_on_unknown() {
     assert_eq!(header_lines.len(), 3, "{text_out}");
     assert!(
         header_lines[0].contains("[m_a_glx] #1")
-            && header_lines[0].contains("why=phrase,terms:2/2,bias:scope:acme/GLX"),
+            && header_lines[0].contains("why=phrase,terms:2/2,bias:fact,bias:scope:acme/GLX"),
         "{}",
         header_lines[0]
     );
@@ -589,7 +591,7 @@ fn cli_scope_bias_soft_reorders_preserves_footer_and_errors_on_unknown() {
         header_lines[2]
     );
 
-    // JSON carries top-level `bias` and hit `why.bias` with case-preserved `"scope:acme/GLX"`.
+    // JSON carries additive default bias + case-preserved `"scope:acme/GLX"`.
     let (code, json_out, err) = sm_in_cwd(
         &home,
         &cwd_repo,
@@ -609,16 +611,29 @@ fn cli_scope_bias_soft_reorders_preserves_footer_and_errors_on_unknown() {
     );
     assert_eq!(code, 0, "{err}");
     let v: Value = serde_json::from_str(&json_out).unwrap();
-    assert_eq!(v["bias"], json!(["scope:acme/GLX"]));
+    assert_eq!(
+        v["bias"],
+        json!([
+            "recency",
+            "fact",
+            "decision",
+            "learning",
+            "executed",
+            "verified",
+            "decided",
+            "client-stated",
+            "scope:acme/GLX"
+        ])
+    );
     let hits = v["results"].as_array().unwrap();
     assert_eq!(
         hits.iter()
             .map(|r| (r["id"].as_str().unwrap(), r["why"]["bias"].clone()))
             .collect::<Vec<_>>(),
         vec![
-            ("m_a_glx", json!(["scope:acme/GLX"])),
-            ("m_z_cwd", json!([])),
-            ("m_m_other", json!([])),
+            ("m_a_glx", json!(["fact", "scope:acme/GLX"])),
+            ("m_z_cwd", json!(["fact"])),
+            ("m_m_other", json!(["fact"])),
         ]
     );
 
@@ -645,7 +660,10 @@ fn cli_scope_bias_soft_reorders_preserves_footer_and_errors_on_unknown() {
         .map(|r| r["id"].as_str().unwrap())
         .collect();
     assert_eq!(d_ids, vec!["m_g_glx", "m_z_mango_cwd"]);
-    assert_eq!(dv["results"][0]["why"]["bias"], json!(["scope:acme/GLX"]));
+    assert_eq!(
+        dv["results"][0]["why"]["bias"],
+        json!(["fact", "scope:acme/GLX"])
+    );
 
     // Footer preserves normalized `--bias scope:acme/GLX`.
     let (code, lim_out, err) = sm_in_cwd(
@@ -741,7 +759,8 @@ fn hierarchical_specificity_and_relevance_plus_scope_bias() {
         TS,
     );
 
-    // `--bias scope:acme,scope:acme/GLX`: child matches both (+0.6), sibling matches parent (+0.3), outside (0.0).
+    // `--bias scope:acme,scope:acme/GLX` merges additively over defaults: child matches fact + both
+    // scopes (+0.6 over outside), sibling matches fact + parent (+0.3 over outside), outside matches fact.
     let (code, out, err) = sm(
         &home,
         &[
@@ -769,7 +788,48 @@ fn hierarchical_specificity_and_relevance_plus_scope_bias() {
         })
         .collect();
     assert_eq!(
-        rows,
+        rows.iter()
+            .map(|(id, b, _)| (*id, b.clone()))
+            .collect::<Vec<_>>(),
+        vec![
+            ("m_a_glx", json!(["fact", "scope:acme", "scope:acme/GLX"])),
+            ("m_m_sibling", json!(["fact", "scope:acme"])),
+            ("m_z_outside", json!(["fact"])),
+        ]
+    );
+    // Exact +0.3 per scope boost on equal-BM25 items.
+    assert!(((rows[0].2 - rows[1].2) - 0.3).abs() < 1e-4, "{rows:?}");
+    assert!(((rows[1].2 - rows[2].2) - 0.3).abs() < 1e-4, "{rows:?}");
+
+    // With explicit `relevance`, defaults are replaced and exact scores are 1.6 / 1.3 / 1.0.
+    let (code, out_rel_hier, err) = sm(
+        &home,
+        &[
+            "query",
+            "kiwi rollout",
+            "--all",
+            "--bias",
+            "relevance,scope:acme,scope:acme/GLX",
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(code, 0, "{err}");
+    let v_rh: Value = serde_json::from_str(&out_rel_hier).unwrap();
+    let rh_rows: Vec<(&str, Value, f64)> = v_rh["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| {
+            (
+                r["id"].as_str().unwrap(),
+                r["why"]["bias"].clone(),
+                r["why"]["score"].as_f64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        rh_rows,
         vec![
             ("m_a_glx", json!(["scope:acme", "scope:acme/GLX"]), 1.6),
             ("m_m_sibling", json!(["scope:acme"]), 1.3),
@@ -818,8 +878,11 @@ fn hierarchical_specificity_and_relevance_plus_scope_bias() {
         .map(|r| r["id"].as_str().unwrap())
         .collect();
     assert_eq!(ib_ids, vec!["m_a_glx", "m_m_sibling"]);
-    assert_eq!(v_ib["results"][0]["why"]["bias"], json!(["scope:acme/GLX"]));
-    assert_eq!(v_ib["results"][1]["why"]["bias"], json!([]));
+    assert_eq!(
+        v_ib["results"][0]["why"]["bias"],
+        json!(["fact", "scope:acme/GLX"])
+    );
+    assert_eq!(v_ib["results"][1]["why"]["bias"], json!(["fact"]));
 
     // `--bias relevance,scope:acme/GLX`: disables recency + kind/tag boosts while keeping scope:acme/GLX.
     let (_d2, home2) = scratch();
@@ -984,18 +1047,31 @@ fn mcp_memory_query_supports_scope_bias_and_reports_unknown_or_invalid() {
         .unwrap();
     assert!(bias_desc.contains("scope:<path>"), "{bias_desc}");
 
-    // Valid scope:acme/GLX boosts m_a_glx above m_z_cwd without filtering m_z_cwd out.
+    // Valid scope:acme/GLX merges onto default bias and boosts m_a_glx above m_z_cwd without filtering m_z_cwd out.
     assert_eq!(resps[2]["result"]["isError"], json!(false));
     let q_ok = mcp_payload(&resps[2]);
-    assert_eq!(q_ok["bias"], json!(["scope:acme/GLX"]));
+    assert_eq!(
+        q_ok["bias"],
+        json!([
+            "recency",
+            "fact",
+            "decision",
+            "learning",
+            "executed",
+            "verified",
+            "decided",
+            "client-stated",
+            "scope:acme/GLX"
+        ])
+    );
     let hits = q_ok["results"].as_array().unwrap();
     assert_eq!(
         hits.iter()
             .map(|r| (r["id"].as_str().unwrap(), r["why"]["bias"].clone()))
             .collect::<Vec<_>>(),
         vec![
-            ("m_a_glx", json!(["scope:acme/GLX"])),
-            ("m_z_cwd", json!([])),
+            ("m_a_glx", json!(["fact", "scope:acme/GLX"])),
+            ("m_z_cwd", json!(["fact"])),
         ]
     );
 

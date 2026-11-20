@@ -63,7 +63,10 @@ pub fn validate_tag(
     allow_na: bool,
 ) -> Result<String, SmError> {
     let Some(tag) = tag.filter(|t| !strip(t).is_empty()) else {
-        return Err(SmError::value("Evidence tag is required"));
+        return Err(SmError::value(format!(
+            "Evidence tag is required; expected one of {}",
+            VALID_TAGS.join(", ")
+        )));
     };
     let cleaned = lower(strip(tag));
     let allowed: &[&str] = if allow_na { &ALL_TAGS } else { &VALID_TAGS };
@@ -199,7 +202,7 @@ mod tests {
         };
         assert_eq!(
             err("", "some evidence", false),
-            "ValueError: Evidence tag is required"
+            "ValueError: Evidence tag is required; expected one of executed, verified, decided, client-stated, derived, assumed, prior, planned"
         );
         assert_eq!(
             err("n/a", "", false),

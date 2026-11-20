@@ -16,13 +16,18 @@ use crate::py;
 use crate::py::io::Out;
 use crate::py::json::{Opts, dumps, from_json, loads};
 use crate::py::value::PyValue;
+use crate::service::amend::run_amend;
+use crate::service::list::{DEFAULT_LIST_LIMIT, ListArgs, list_json, run_list};
 use crate::service::put::{PutArgs, run_put};
 use crate::service::query::{QueryArgs, StrList, lookup_json, run_lookup};
 use crate::service::related::{DEFAULT_RELATED_LIMIT, related_json, run_related};
+use crate::service::retire::run_retire;
 use crate::service::show::run_show_many;
 use crate::service::supersede::run_supersede;
 use crate::service::upkeep::put_overlaps;
 use crate::service::usage::log_usage;
+use crate::store::items::AmendPatch;
+use crate::store::search::StatusFilter;
 
 /// Newest first (MCP 2025-11-25, basic/lifecycle, "Version Negotiation").
 pub const LEGACY_VERSIONS: [&str; 4] = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
@@ -42,6 +47,10 @@ pub const INSTRUCTIONS: &str = "Simple Memory holds decisions, results and task 
 
 fn tools_json() -> Value {
     let repo = json!({"type": "string", "description": "Repo key; default: the repo of the server's working folder"});
+    let scopes_in = json!({"type": "string", "description": "Comma-separated [scopes] paths (company/client/project) whose items to keep; searches every repo"});
+    let source = json!({"type": "string", "description": "Comma-separated source prefixes (case-sensitive)"});
+    let since = json!({"type": "string", "description": "Keep items with as_of on or after ISO 8601 date or timestamp"});
+    let until = json!({"type": "string", "description": "Keep items with as_of on or before ISO 8601 date or timestamp (date-only includes full day)"});
     json!([
         {
             "name": "memory_query",
@@ -54,10 +63,15 @@ fn tools_json() -> Value {
                     "bias": {"type": "string", "description": "Comma-separated reorder: recency, durable kinds and verified/decided tags by default ([query] default_bias); relevance, a tag, a kind, or scope:<path>"},
                     "kind": {"type": "string", "description": format!("Comma-separated kind filter: {}", VALID_KINDS.join(", "))},
                     "tag": {"type": "string", "description": format!("Comma-separated tag filter: {}", VALID_TAGS.join(", "))},
+                    "source": source,
+                    "since": since,
+                    "until": until,
+                    "recent": {"type": "boolean", "default": false, "description": "Sort matching items newest first (not allowed with bias)"},
+                    "include_history": {"type": "boolean", "default": false, "description": "Include superseded and retired items"},
                     "limit": {"type": "integer", "minimum": 1, "default": DEFAULT_QUERY_LIMIT},
                     "all_repos": {"type": "boolean", "default": false, "description": "Search every repo"},
                     "repo": repo,
-                    "in": {"type": "string", "description": "Comma-separated [scopes] paths (company/client/project) whose items to keep; searches every repo"},
+                    "in": scopes_in,
                 },
                 "required": ["query"],
                 "additionalProperties": false,
@@ -115,6 +129,70 @@ fn tools_json() -> Value {
                 "type": "object",
                 "properties": {"old_id": {"type": "string"}, "new_id": {"type": "string"}},
                 "required": ["old_id", "new_id"],
+                "additionalProperties": false,
+            },
+        },
+        {
+            "name": "memory_list",
+            "title": "List memory items",
+            "description": "Browse stored memory items chronologically with filters and pagination. Returns the JSON of `sm list --format json`.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "limit": {"type": "integer", "minimum": 1, "default": DEFAULT_LIST_LIMIT},
+                    "offset": {"type": "integer", "minimum": 0, "default": 0},
+                    "kind": {"type": "string", "description": format!("Comma-separated kind filter: {}", VALID_KINDS.join(", "))},
+                    "tag": {"type": "string", "description": format!("Comma-separated tag filter: {}", VALID_TAGS.join(", "))},
+                    "source": source,
+                    "since": since,
+                    "until": until,
+                    "status": {"type": "string", "enum": ["active", "superseded", "retired", "all"], "description": "Filter by status (default: active)"},
+                    "include_history": {"type": "boolean", "default": false, "description": "Include superseded and retired items (same as status='all')"},
+                    "all_repos": {"type": "boolean", "default": false, "description": "List across all repos"},
+                    "repo": repo,
+                    "in": scopes_in,
+                },
+                "required": [],
+                "additionalProperties": false,
+            },
+        },
+        {
+            "name": "memory_amend",
+            "title": "Amend a memory item",
+            "description": "Create a revised active copy of an item and supersede the old one atomically.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string", "description": "Active item id to amend"},
+                    "text": {"type": "string", "description": "Replace body text"},
+                    "title": {"type": "string", "description": "Replace title"},
+                    "kind": {"type": "string", "enum": VALID_KINDS, "description": "Replace kind"},
+                    "tag": {"type": "string", "enum": VALID_TAGS, "description": "Replace evidence tag"},
+                    "evidence": {"type": "string", "description": "Replace evidence text"},
+                    "repo": {"type": "string", "description": "Replace repo"},
+                    "add_refs": {"type": "string", "description": "Add references (space- or comma-separated)"},
+                    "remove_refs": {"type": "string", "description": "Remove references (space- or comma-separated)"},
+                    "refs": {"type": "string", "description": "Replace references (space- or comma-separated)"},
+                    "add_tags": {"type": "string", "description": "Add comma-separated freeform tags"},
+                    "remove_tags": {"type": "string", "description": "Remove comma-separated freeform tags"},
+                    "tags": {"type": "string", "description": "Replace comma-separated freeform tags"},
+                    "as_of": {"type": "string", "description": "Replace ISO 8601 timestamp"},
+                },
+                "required": ["id"],
+                "additionalProperties": false,
+            },
+        },
+        {
+            "name": "memory_retire",
+            "title": "Retire a memory item",
+            "description": "Retire an active memory item with a reason so normal queries hide it.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string", "description": "Active item id to retire"},
+                    "reason": {"type": "string", "default": "", "description": "Reason for retiring the item (default: manual)"},
+                },
+                "required": ["id"],
                 "additionalProperties": false,
             },
         },
@@ -286,7 +364,7 @@ pub fn check_arguments(schema: &Value, args: &[(PyValue, PyValue)]) -> Result<Ar
     Ok(out)
 }
 
-fn item_json(it: &crate::core::item::Item) -> Value {
+pub(crate) fn item_json(it: &crate::core::item::Item) -> Value {
     json!({
         "id": it.id, "repo": it.repo, "kind": it.kind, "title": it.title, "tag": it.tag,
         "evidence": it.evidence, "as_of": it.as_of, "source": it.source,
@@ -300,6 +378,17 @@ fn str_arg<'a>(a: &'a Args, key: &str) -> &'a str {
         Some(PyValue::Str(v)) => v,
         _ => "",
     }
+}
+
+fn opt_str<'a>(a: &'a Args, key: &str) -> Option<&'a str> {
+    match arg(a, key) {
+        Some(PyValue::Str(v)) => Some(v.as_str()),
+        _ => None,
+    }
+}
+
+fn bool_arg(a: &Args, key: &str) -> bool {
+    matches!(arg(a, key), Some(PyValue::Bool(true)))
 }
 
 fn opt_str_arg<'a>(a: &'a Args, key: &str) -> StrList<'a> {
@@ -332,20 +421,39 @@ impl Server {
 
     fn query(&self, a: &Args) -> Result<(Value, bool), SmError> {
         let home = self.home.as_deref();
+        let recent = bool_arg(a, "recent");
+        if recent && arg(a, "bias").is_some() {
+            return Err(SmError::value(
+                "argument 'recent' is not allowed with argument 'bias'",
+            ));
+        }
+        let repo = str_arg(a, "repo");
+        let scopes_raw = str_arg(a, "in");
+        if !py::str::strip(scopes_raw).is_empty() && !py::str::strip(repo).is_empty() {
+            return Err(SmError::value(
+                "argument 'repo' is not allowed with argument 'in'",
+            ));
+        }
+        let include_history = bool_arg(a, "include_history");
         let q = QueryArgs {
             limit: int_arg(a, "limit")?,
+            recent,
             tags: opt_str_arg(a, "tag"),
             kinds: opt_str_arg(a, "kind"),
+            sources: opt_str_arg(a, "source"),
+            since: str_arg(a, "since"),
+            until: str_arg(a, "until"),
             bias: opt_str_arg(a, "bias"),
-            all_repos: matches!(arg(a, "all_repos"), Some(PyValue::Bool(true))),
-            repo: str_arg(a, "repo"),
+            all_repos: bool_arg(a, "all_repos"),
+            repo,
+            include_history,
             scopes: opt_str_arg(a, "in"),
             home,
             ..Default::default()
         };
         let lk = run_lookup(str_arg(a, "query"), &q)?;
         let ids: Vec<String> = lk.hits.iter().map(|h| h.item.id.clone()).collect();
-        let flags = dict(vec![
+        let mut flag_pairs = vec![
             (
                 "bias",
                 PyValue::List(lk.bias.iter().map(|b| s(b)).collect()),
@@ -356,7 +464,20 @@ impl Server {
             ("limit", arg(a, "limit").cloned().unwrap_or(PyValue::None)),
             ("all", arg(a, "all_repos").cloned().unwrap_or(PyValue::None)),
             ("via", s("mcp")),
-        ]);
+        ];
+        for key in ["source", "since", "until"] {
+            let val = str_arg(a, key);
+            if !val.is_empty() {
+                flag_pairs.push((key, s(val)));
+            }
+        }
+        if recent {
+            flag_pairs.push(("recent", PyValue::Bool(true)));
+        }
+        if include_history {
+            flag_pairs.push(("include_history", PyValue::Bool(true)));
+        }
+        let flags = dict(flag_pairs);
         log_usage("query", &ids, lk.repo.as_deref(), Some(&flags), home)?;
         Ok((lookup_json(&lk), false))
     }
@@ -429,6 +550,141 @@ impl Server {
         Ok((json!({"old_id": old_id, "superseded_by": new_id}), false))
     }
 
+    fn list(&self, a: &Args) -> Result<(Value, bool), SmError> {
+        let home = self.home.as_deref();
+        let repo = str_arg(a, "repo");
+        let all_repos = bool_arg(a, "all_repos");
+        let scopes_raw = str_arg(a, "in");
+        let scope_flags = usize::from(!py::str::strip(repo).is_empty())
+            + usize::from(all_repos)
+            + usize::from(!py::str::strip(scopes_raw).is_empty());
+        if scope_flags > 1 {
+            return Err(SmError::value(
+                "only one of 'repo', 'all_repos', or 'in' may be set",
+            ));
+        }
+        let include_history = bool_arg(a, "include_history");
+        if opt_str(a, "status").is_some() && include_history {
+            return Err(SmError::value(
+                "argument 'include_history' is not allowed with argument 'status'",
+            ));
+        }
+        let status = match opt_str(a, "status") {
+            Some("active") => StatusFilter::Active,
+            Some("superseded") => StatusFilter::Superseded,
+            Some("retired") => StatusFilter::Retired,
+            Some("all") => StatusFilter::All,
+            Some(other) => return Err(SmError::value(format!("Invalid status '{other}'"))),
+            None if include_history => StatusFilter::All,
+            None => StatusFilter::Active,
+        };
+        let args = ListArgs {
+            limit: int_arg(a, "limit")?,
+            offset: int_arg(a, "offset")?,
+            repo,
+            all_repos,
+            scopes: opt_str_arg(a, "in"),
+            kinds: opt_str_arg(a, "kind"),
+            tags: opt_str_arg(a, "tag"),
+            sources: opt_str_arg(a, "source"),
+            since: str_arg(a, "since"),
+            until: str_arg(a, "until"),
+            status,
+            home,
+            cwd: None,
+        };
+        let page = run_list(&args)?;
+        let ids: Vec<String> = page.items.iter().map(|it| it.id.clone()).collect();
+        let flags = dict(vec![
+            ("kind", s(str_arg(a, "kind"))),
+            ("tag", s(str_arg(a, "tag"))),
+            ("source", s(str_arg(a, "source"))),
+            ("since", s(str_arg(a, "since"))),
+            ("until", s(str_arg(a, "until"))),
+            ("status", s(page.status.as_str())),
+            ("format", s("json")),
+            ("limit", arg(a, "limit").cloned().unwrap_or(PyValue::None)),
+            ("offset", arg(a, "offset").cloned().unwrap_or(PyValue::None)),
+            ("all", arg(a, "all_repos").cloned().unwrap_or(PyValue::None)),
+            ("via", s("mcp")),
+        ]);
+        log_usage("list", &ids, page.repo.as_deref(), Some(&flags), home)?;
+        Ok((list_json(&page), false))
+    }
+
+    fn amend(&self, a: &Args) -> Result<(Value, bool), SmError> {
+        let home = self.home.as_deref();
+        let id = str_arg(a, "id");
+        let replace_refs = opt_str(a, "refs");
+        let replace_tags = opt_str(a, "tags");
+        if replace_refs.is_some()
+            && (opt_str(a, "add_refs").is_some() || opt_str(a, "remove_refs").is_some())
+        {
+            return Err(SmError::value(
+                "argument 'refs' is not allowed with 'add_refs' or 'remove_refs'",
+            ));
+        }
+        if replace_tags.is_some()
+            && (opt_str(a, "add_tags").is_some() || opt_str(a, "remove_tags").is_some())
+        {
+            return Err(SmError::value(
+                "argument 'tags' is not allowed with 'add_tags' or 'remove_tags'",
+            ));
+        }
+
+        let patch = AmendPatch {
+            repo: opt_str(a, "repo"),
+            kind: opt_str(a, "kind"),
+            tag: opt_str(a, "tag"),
+            evidence: opt_str(a, "evidence"),
+            title: opt_str(a, "title"),
+            body: opt_str(a, "text"),
+            add_refs: opt_str(a, "add_refs"),
+            remove_refs: opt_str(a, "remove_refs"),
+            replace_refs,
+            add_tags: opt_str(a, "add_tags"),
+            remove_tags: opt_str(a, "remove_tags"),
+            replace_tags,
+            as_of: opt_str(a, "as_of"),
+        };
+        let (new_id, body_changed) = run_amend(id, &patch, home)?;
+        let overlaps = if body_changed {
+            put_overlaps(&new_id, home, None)?
+        } else {
+            Vec::new()
+        };
+        let old_id = py::str::strip(id);
+        log_usage(
+            "amend",
+            &[old_id.to_string(), new_id.clone()],
+            None,
+            Some(&dict(vec![("via", s("mcp"))])),
+            home,
+        )?;
+        Ok((
+            json!({
+                "old_id": old_id,
+                "id": new_id,
+                "body_changed": body_changed,
+                "overlaps": overlaps,
+            }),
+            false,
+        ))
+    }
+
+    fn retire(&self, a: &Args) -> Result<(Value, bool), SmError> {
+        let home = self.home.as_deref();
+        let (id, reason) = run_retire(str_arg(a, "id"), str_arg(a, "reason"), home)?;
+        log_usage(
+            "retire",
+            std::slice::from_ref(&id),
+            None,
+            Some(&dict(vec![("reason", s(&reason)), ("via", s("mcp"))])),
+            home,
+        )?;
+        Ok((json!({"id": id, "retired": reason}), false))
+    }
+
     /// `call_tool(params)`: a tool failure goes back to the model as a result it can correct.
     pub fn call_tool(&self, params: &PyValue, out: &mut Out) -> Result<PyValue, Fail> {
         let name = match get(params, "name") {
@@ -456,7 +712,11 @@ impl Server {
                 "memory_show" => self.show(&a),
                 "memory_related" => self.related(&a),
                 "memory_put" => self.put(&a),
-                _ => self.supersede(&a),
+                "memory_supersede" => self.supersede(&a),
+                "memory_list" => self.list(&a),
+                "memory_amend" => self.amend(&a),
+                "memory_retire" => self.retire(&a),
+                _ => unreachable!("checked by tool_schema"),
             }
         };
         match run() {
@@ -698,7 +958,7 @@ pub fn error(rid: PyValue, code: i64, message: &str, data: Option<PyValue>) -> P
     ])
 }
 
-/// The version is this package's (an accepted difference: `sm 0.5.0`).
+/// The version is this package's (an accepted difference: `sm 0.6.0`).
 pub fn server_info() -> PyValue {
     dict(vec![
         ("name", s("simple-memory")),
@@ -800,14 +1060,19 @@ mod tests {
         let code = serve(&mut input, &mut out, Some(dir.path().to_str().unwrap())).unwrap();
         out.finish(code);
         let (stdout, stderr) = out.captured();
-        let want =
-            include_str!("testdata/mcp_errors.out").replace("<VERSION>", env!("CARGO_PKG_VERSION"));
+        const V032_QUERY_ARGS: &str = "query, bias, kind, tag, limit, all_repos, repo, in";
+        const V060_QUERY_ARGS: &str = "query, bias, kind, tag, source, since, until, recent, include_history, limit, all_repos, repo, in";
+        let want = include_str!("testdata/mcp_errors.out")
+            .replace("<VERSION>", env!("CARGO_PKG_VERSION"))
+            .replace(V032_QUERY_ARGS, V060_QUERY_ARGS);
+        let want_err =
+            include_str!("testdata/mcp_errors.err").replace(V032_QUERY_ARGS, V060_QUERY_ARGS);
         assert_eq!(code, 0);
         for (n, (got, exp)) in stdout.lines().zip(want.lines()).enumerate() {
             assert_eq!(got, exp, "line {}", n + 1);
         }
         assert_eq!(stdout.lines().count(), want.lines().count());
-        assert_eq!(stderr, include_str!("testdata/mcp_errors.err"));
+        assert_eq!(stderr, want_err);
     }
 
     fn msg(text: &str) -> PyValue {

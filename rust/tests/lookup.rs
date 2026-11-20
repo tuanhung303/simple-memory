@@ -581,12 +581,12 @@ fn query_brief_prints_one_line_per_hit_then_the_footer() {
         "query", "R6", "--repo", "a", "--format", "brief", "--bias", "decided",
     ]);
     let lines = o.lines();
-    let day = lines[0].split_whitespace().nth(4).unwrap();
+    let day = lines[0].split_whitespace().nth(5).unwrap();
     assert_eq!(
         lines,
         [
-            format!("[{first}] #1 decision decided {day} ~13 tok: Kiwi plan for the rollout"),
-            format!("[{second}] #2 fact derived {day} ~13 tok: Kiwi steps of the rollout"),
+            format!("[{first}] #1 a decision decided {day} ~13 tok: Kiwi plan for the rollout"),
+            format!("[{second}] #2 a fact derived {day} ~13 tok: Kiwi steps of the rollout"),
             "refs: abc1234=2 db.pool=2".to_string(),
             format!("next: sm show {first} {second}; sm related {first}"),
         ]

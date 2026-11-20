@@ -130,13 +130,86 @@ fn choices(list: &[&str], default: Option<&str>, help: &str) -> Arg {
     }
 }
 
+fn add_query_args(p: &mut Parser) {
+    p.allow_dash_exclusions(true);
+    p.add_argument(
+        &["query"],
+        Arg {
+            nargs: Some(Nargs::OneOrMore),
+            help: "Search query terms (pass '--' before a leading-dash query like '-R6')".into(),
+            ..Arg::default()
+        },
+    );
+    p.add_argument(
+        &["--limit"],
+        int(Some(4), "Maximum snippets to print (default: 4)"),
+    );
+    let recent = p.add_argument(&["--recent"], flag("Sort matching items newest first"));
+    let bias = p.add_argument(
+        &["--bias"],
+        Arg {
+            kind: Some(Kind::Custom(bias_list)),
+            default: Some(Value::None),
+            help:
+                "Comma-separated ranking preferences; reorders, never filters \
+                 (default: recency, fact, decision, learning, executed, verified, decided, client-stated, or [query] default_bias). \
+                 recency, relevance (no preference), an evidence tag, a kind, or scope:<path>"
+                    .into(),
+            ..Arg::default()
+        },
+    );
+    p.add_mutually_exclusive_group(vec![recent, bias]);
+    p.add_argument(&["--tag"], comma("Filter by comma-separated evidence tags"));
+    p.add_argument(&["--kind"], comma("Filter by comma-separated kinds"));
+    p.add_argument(
+        &["--source"],
+        comma("Filter by comma-separated source prefixes (case-sensitive)"),
+    );
+    p.add_argument(
+        &["--since"],
+        default_str(
+            "",
+            "Keep items with as_of on or after ISO 8601 date or timestamp",
+        ),
+    );
+    p.add_argument(
+        &["--until"],
+        default_str(
+            "",
+            "Keep items with as_of on or before ISO 8601 date or timestamp (date-only includes full day)",
+        ),
+    );
+    let q_in = p.add_argument(
+        &["--in"],
+        comma("Keep items in comma-separated [scopes] paths; searches every repo"),
+    );
+    p.add_argument(
+        &["--all"],
+        Arg {
+            dest: Some("all_repos".into()),
+            ..flag("Search across all repos")
+        },
+    );
+    let q_repo = p.add_argument(&["--repo"], default_str("", "Repo override"));
+    p.add_mutually_exclusive_group(vec![q_in, q_repo]);
+    p.add_argument(&["--include-history"], flag("Include superseded items"));
+    p.add_argument(
+        &["--format"],
+        choices(
+            &["text", "brief", "json"],
+            Some("text"),
+            "text: a header and a snippet per hit; brief: one line per hit; json (default: text)",
+        ),
+    );
+}
+
 pub fn build_parser() -> Parser {
     let mut parser = Parser::new(
         "sm",
         "simple-memory: single-file SQLite + FTS5 CLI memory store",
     );
     parser.add_argument(
-        &["--version"],
+        &["-v", "--version"],
         Arg {
             kind: Some(Kind::Custom(version)),
             nargs: Some(Nargs::Zero),
@@ -197,70 +270,10 @@ pub fn build_parser() -> Parser {
         "query",
         "Search memory items (use '--' before a query starting with '-', e.g. sm query -- -R6)",
     );
-    p_query.add_argument(
-        &["query"],
-        opt("Search query string (pass '--' before a leading-dash query like '-R6')"),
-    );
-    p_query.add_argument(
-        &["--limit"],
-        int(Some(4), "Maximum snippets to print (default: 4)"),
-    );
-    let recent = p_query.add_argument(&["--recent"], flag("Sort matching items newest first"));
-    let bias = p_query.add_argument(
-        &["--bias"],
-        Arg {
-            kind: Some(Kind::Custom(bias_list)),
-            default: Some(Value::None),
-            help:
-                "Comma-separated ranking preferences; reorders, never filters \
-                 (default: recency, fact, decision, learning, executed, verified, decided, client-stated, or [query] default_bias). \
-                 recency, relevance (no preference), an evidence tag, a kind, or scope:<path>"
-                    .into(),
-            ..Arg::default()
-        },
-    );
-    p_query.add_mutually_exclusive_group(vec![recent, bias]);
-    p_query.add_argument(&["--tag"], comma("Filter by comma-separated evidence tags"));
-    p_query.add_argument(&["--kind"], comma("Filter by comma-separated kinds"));
-    p_query.add_argument(
-        &["--source"],
-        comma("Filter by comma-separated source prefixes (case-sensitive)"),
-    );
-    p_query.add_argument(
-        &["--since"],
-        default_str(
-            "",
-            "Keep items with as_of on or after ISO 8601 date or timestamp",
-        ),
-    );
-    p_query.add_argument(
-        &["--until"],
-        default_str(
-            "",
-            "Keep items with as_of on or before ISO 8601 date or timestamp (date-only includes full day)",
-        ),
-    );
-    p_query.add_argument(
-        &["--in"],
-        comma("Keep items in comma-separated [scopes] paths; searches every repo"),
-    );
-    p_query.add_argument(
-        &["--all"],
-        Arg {
-            dest: Some("all_repos".into()),
-            ..flag("Search across all repos")
-        },
-    );
-    p_query.add_argument(&["--repo"], default_str("", "Repo override"));
-    p_query.add_argument(&["--include-history"], flag("Include superseded items"));
-    p_query.add_argument(
-        &["--format"],
-        choices(
-            &["text", "brief", "json"],
-            Some("text"),
-            "text: a header and a snippet per hit; brief: one line per hit; json (default: text)",
-        ),
-    );
+    add_query_args(p_query);
+
+    let p_search = sub.add_parser("search", "Alias for `sm query`");
+    add_query_args(p_search);
 
     let p_show = sub.add_parser(
         "show",
@@ -274,6 +287,14 @@ pub fn build_parser() -> Parser {
             help: "Item id(s)".into(),
             ..Arg::default()
         },
+    );
+    p_show.add_argument(
+        &["--format"],
+        choices(
+            &["text", "json"],
+            Some("text"),
+            "Output format (default: text)",
+        ),
     );
 
     let p_rel = sub.add_parser(
@@ -597,6 +618,12 @@ pub fn build_parser() -> Parser {
         "Serve the memory tools over MCP on stdio (JSON-RPC); logs go to stderr",
     );
 
+    let p_upd = sub.add_parser(
+        "update",
+        "Check for a newer simple-memory release and optionally upgrade",
+    );
+    p_upd.add_argument(&["--check"], flag("Check for updates without installing"));
+
     parser.add_subparsers(sub);
     parser
 }
@@ -612,13 +639,15 @@ mod tests {
 
     #[test]
     fn version_prints_the_package_version_and_exits_0() {
-        let mut out = Out::capture();
-        assert_eq!(
-            build_parser().parse_args(&["--version".into()], &mut out),
-            Err(Exit(0))
-        );
-        out.finish(0);
-        assert_eq!(out.captured().0, "sm 0.5.0\n");
+        for flag in ["--version", "-v"] {
+            let mut out = Out::capture();
+            assert_eq!(
+                build_parser().parse_args(&[flag.into()], &mut out),
+                Err(Exit(0))
+            );
+            out.finish(0);
+            assert_eq!(out.captured().0, "sm 0.6.0\n");
+        }
     }
 
     #[test]

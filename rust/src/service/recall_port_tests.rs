@@ -2577,7 +2577,16 @@ fn junk_backoff_values_read_as_defaults() {
         assert_eq!(runner.n(), 1);
         assert_eq!(
             file_json(&backoff_file(&h)),
-            json!({"failures": 1, "until": 0.0, "error": "claude exited 1: boom", "cause": "error", "notified": []}),
+            json!({
+                "failures": 1,
+                "until": 0.0,
+                "error": "claude exited 1: boom",
+                "cause": "error",
+                "notified": [],
+                "rewrite_cmd": "",
+                "rewrite_model": "haiku",
+                "rewrite_timeout": 8.0,
+            }),
             "{junk}"
         );
     }
@@ -2638,11 +2647,41 @@ fn backoff_round_trip_keeps_the_030_keys() {
     assert!(b + 600.0 <= until && until <= a + 600.0, "{until}");
     assert_eq!(
         written,
-        json!({"failures": 2, "until": until, "error": "rewrite timed out after 8.0 s", "cause": "timeout", "notified": ["s1"]})
+        json!({
+            "failures": 2,
+            "until": until,
+            "error": "rewrite timed out after 8.0 s",
+            "cause": "timeout",
+            "notified": ["s1"],
+            "rewrite_cmd": "",
+            "rewrite_model": "haiku",
+            "rewrite_timeout": 8.0,
+        })
     );
     let p = PyPath::new(&backoff_file(&h));
     Backoff::read(&p).unwrap().write(&p).unwrap();
     assert_eq!(file_json(&backoff_file(&h)), written);
+
+    // A legacy 5-key 0.3.0/0.5.0 backoff.json round-trips cleanly without adding None fields.
+    let legacy = json!({
+        "failures": 2,
+        "until": until,
+        "error": "rewrite timed out after 8.0 s",
+        "cause": "timeout",
+        "notified": ["s1"],
+    });
+    write_state(&backoff_file(&h), &legacy.to_string());
+    let parsed_legacy = Backoff::read(&p).unwrap();
+    assert_eq!(
+        (
+            parsed_legacy.rewrite_cmd.as_deref(),
+            parsed_legacy.rewrite_model.as_deref(),
+            parsed_legacy.rewrite_timeout,
+        ),
+        (None, None, None)
+    );
+    parsed_legacy.write(&p).unwrap();
+    assert_eq!(file_json(&backoff_file(&h)), legacy);
 }
 
 #[test]

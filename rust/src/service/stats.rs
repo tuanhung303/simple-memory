@@ -838,7 +838,7 @@ impl Stats {
     pub fn value(&self) -> PyValue {
         let st = &self.store;
         let store = PyValue::Dict(vec![
-            (s("status"), counts_value(&st.status)),
+            (s("status"), counts_value(&st.status_breakdown())),
             (s("active"), PyValue::int(st.active)),
             (s("repos"), counts_value(&st.repos)),
             (s("repo_count"), PyValue::int(st.repo_count)),
@@ -1055,5 +1055,29 @@ mod tests {
         let (rows, bad) = read_rows(&PyPath::new(p.to_str().unwrap())).unwrap();
         assert_eq!((rows.len(), bad), (2, 3));
         assert_eq!(rows[1].0.isoformat(), "2026-01-01T00:00:00+00:00");
+    }
+
+    #[test]
+    fn stats_value_reports_retired_separately_in_store_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().to_str().unwrap();
+        let conn = connect(&format!("{home}/memory.db"), None).unwrap();
+        let a = crate::core::item::Item::bare("m_a", "alpha", "fact", "A", "body a", "decided");
+        crate::store::items::put_item(&conn, &a.post_init(), None).unwrap();
+        let mut r = crate::core::item::Item::bare("m_r", "alpha", "fact", "R", "body r", "decided");
+        r.status = "superseded".into();
+        r.tags = "retired:manual".into();
+        crate::store::items::put_item(&conn, &r.post_init(), None).unwrap();
+        drop(conn);
+
+        let st = run_stats(7.0, Some(home), None).unwrap();
+        let json_str =
+            crate::py::json::dumps(&st.value(), &crate::py::json::Opts::unicode()).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(
+            v["store"]["status"],
+            serde_json::json!({"active": 1, "superseded": 0, "retired": 1})
+        );
+        assert_eq!(v["store"]["active"], 1);
     }
 }

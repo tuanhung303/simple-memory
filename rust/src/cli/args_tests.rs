@@ -235,7 +235,7 @@ fn base_query() -> Vec<(&'static str, V)> {
     vec![
         ("version", V::None),
         ("command", V::Str("query".to_string())),
-        ("query", V::Str("x".to_string())),
+        ("query", V::List(vec![V::Str("x".to_string())])),
         ("limit", V::Int(4)),
         ("recent", V::Bool(false)),
         ("bias", V::None),
@@ -270,6 +270,7 @@ fn base_show() -> Vec<(&'static str, V)> {
             "ids",
             V::List(vec![V::Str("a".to_string()), V::Str("b".to_string())]),
         ),
+        ("format", V::Str("text".to_string())),
     ]
 }
 
@@ -323,7 +324,14 @@ fn argparse_root_cases() {
     assert_err(
         vec![Arg::Text("--version=1".to_string())],
         2,
-        "sm: error: argument --version: ignored explicit argument '1'",
+        "sm: error: argument -v/--version: ignored explicit argument '1'",
+    );
+    // v0.6.0: -v alias for --version
+    assert_err(vec![Arg::Text("-v".to_string())], 0, "");
+    assert_err(
+        vec![Arg::Text("-v=1".to_string())],
+        2,
+        "sm: error: argument -v/--version: ignored explicit argument '1'",
     );
     // case 7
     assert_err(vec![Arg::Text("--he".to_string())], 0, "");
@@ -385,37 +393,37 @@ fn argparse_root_cases() {
     assert_err(
         vec![Arg::Text("qury".to_string())],
         2,
-        "sm: error: argument command: invalid choice: 'qury', maybe you meant 'query'? (choose from 'put', 'query', 'show', 'related', 'supersede', 'retire', 'amend', 'list', 'import', 'export', 'backup', 'hook', 'doctor', 'upkeep', 'stats', 'init', 'config', 'hooks', 'mcp')",
+        "sm: error: argument command: invalid choice: 'qury', maybe you meant 'query'? (choose from 'put', 'query', 'search', 'show', 'related', 'supersede', 'retire', 'amend', 'list', 'import', 'export', 'backup', 'hook', 'doctor', 'upkeep', 'stats', 'init', 'config', 'hooks', 'mcp', 'update')",
     );
     // case 18
     assert_err(
         vec![Arg::Text("quer".to_string())],
         2,
-        "sm: error: argument command: invalid choice: 'quer', maybe you meant 'query'? (choose from 'put', 'query', 'show', 'related', 'supersede', 'retire', 'amend', 'list', 'import', 'export', 'backup', 'hook', 'doctor', 'upkeep', 'stats', 'init', 'config', 'hooks', 'mcp')",
+        "sm: error: argument command: invalid choice: 'quer', maybe you meant 'query'? (choose from 'put', 'query', 'search', 'show', 'related', 'supersede', 'retire', 'amend', 'list', 'import', 'export', 'backup', 'hook', 'doctor', 'upkeep', 'stats', 'init', 'config', 'hooks', 'mcp', 'update')",
     );
     // case 19
     assert_err(
         vec![Arg::Text("Put".to_string())],
         2,
-        "sm: error: argument command: invalid choice: 'Put', maybe you meant 'put'? (choose from 'put', 'query', 'show', 'related', 'supersede', 'retire', 'amend', 'list', 'import', 'export', 'backup', 'hook', 'doctor', 'upkeep', 'stats', 'init', 'config', 'hooks', 'mcp')",
+        "sm: error: argument command: invalid choice: 'Put', maybe you meant 'put'? (choose from 'put', 'query', 'search', 'show', 'related', 'supersede', 'retire', 'amend', 'list', 'import', 'export', 'backup', 'hook', 'doctor', 'upkeep', 'stats', 'init', 'config', 'hooks', 'mcp', 'update')",
     );
     // case 20
     assert_err(
         vec![Arg::Text("impor".to_string())],
         2,
-        "sm: error: argument command: invalid choice: 'impor', maybe you meant 'import'? (choose from 'put', 'query', 'show', 'related', 'supersede', 'retire', 'amend', 'list', 'import', 'export', 'backup', 'hook', 'doctor', 'upkeep', 'stats', 'init', 'config', 'hooks', 'mcp')",
+        "sm: error: argument command: invalid choice: 'impor', maybe you meant 'import'? (choose from 'put', 'query', 'search', 'show', 'related', 'supersede', 'retire', 'amend', 'list', 'import', 'export', 'backup', 'hook', 'doctor', 'upkeep', 'stats', 'init', 'config', 'hooks', 'mcp', 'update')",
     );
     // case 21
     assert_err(
         vec![Arg::Text("hook2".to_string())],
         2,
-        "sm: error: argument command: invalid choice: 'hook2', maybe you meant 'hook'? (choose from 'put', 'query', 'show', 'related', 'supersede', 'retire', 'amend', 'list', 'import', 'export', 'backup', 'hook', 'doctor', 'upkeep', 'stats', 'init', 'config', 'hooks', 'mcp')",
+        "sm: error: argument command: invalid choice: 'hook2', maybe you meant 'hook'? (choose from 'put', 'query', 'search', 'show', 'related', 'supersede', 'retire', 'amend', 'list', 'import', 'export', 'backup', 'hook', 'doctor', 'upkeep', 'stats', 'init', 'config', 'hooks', 'mcp', 'update')",
     );
     // case 22
     assert_err(
         vec![Arg::Text("-".to_string())],
         2,
-        "sm: error: argument command: invalid choice: '-' (choose from 'put', 'query', 'show', 'related', 'supersede', 'retire', 'amend', 'list', 'import', 'export', 'backup', 'hook', 'doctor', 'upkeep', 'stats', 'init', 'config', 'hooks', 'mcp')",
+        "sm: error: argument command: invalid choice: '-' (choose from 'put', 'query', 'search', 'show', 'related', 'supersede', 'retire', 'amend', 'list', 'import', 'export', 'backup', 'hook', 'doctor', 'upkeep', 'stats', 'init', 'config', 'hooks', 'mcp', 'update')",
     );
     // case 23
     assert_err(
@@ -431,67 +439,67 @@ fn argparse_root_cases() {
             Arg::Text("put".to_string()),
         ],
         2,
-        "sm: error: argument command: invalid choice: '--' (choose from 'put', 'query', 'show', 'related', 'supersede', 'retire', 'amend', 'list', 'import', 'export', 'backup', 'hook', 'doctor', 'upkeep', 'stats', 'init', 'config', 'hooks', 'mcp')",
+        "sm: error: argument command: invalid choice: '--' (choose from 'put', 'query', 'search', 'show', 'related', 'supersede', 'retire', 'amend', 'list', 'import', 'export', 'backup', 'hook', 'doctor', 'upkeep', 'stats', 'init', 'config', 'hooks', 'mcp', 'update')",
     );
     // case 26
     assert_err(
         vec![Arg::Text("".to_string())],
         2,
-        "sm: error: argument command: invalid choice: '' (choose from 'put', 'query', 'show', 'related', 'supersede', 'retire', 'amend', 'list', 'import', 'export', 'backup', 'hook', 'doctor', 'upkeep', 'stats', 'init', 'config', 'hooks', 'mcp')",
+        "sm: error: argument command: invalid choice: '' (choose from 'put', 'query', 'search', 'show', 'related', 'supersede', 'retire', 'amend', 'list', 'import', 'export', 'backup', 'hook', 'doctor', 'upkeep', 'stats', 'init', 'config', 'hooks', 'mcp', 'update')",
     );
     // case 27
     assert_err(
         vec![Arg::Text("".to_string()), Arg::Text("x".to_string())],
         2,
-        "sm: error: argument command: invalid choice: '' (choose from 'put', 'query', 'show', 'related', 'supersede', 'retire', 'amend', 'list', 'import', 'export', 'backup', 'hook', 'doctor', 'upkeep', 'stats', 'init', 'config', 'hooks', 'mcp')",
+        "sm: error: argument command: invalid choice: '' (choose from 'put', 'query', 'search', 'show', 'related', 'supersede', 'retire', 'amend', 'list', 'import', 'export', 'backup', 'hook', 'doctor', 'upkeep', 'stats', 'init', 'config', 'hooks', 'mcp', 'update')",
     );
     // case 28
     assert_err(
         vec![Arg::Text(S("x").repeat(250))],
         2,
-        "sm: error: argument command: invalid choice: 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx' (choose from 'put', 'query', 'show', 'related', 'supersede', 'retire', 'amend', 'list', 'import', 'export', 'backup', 'hook', 'doctor', 'upkeep', 'stats', 'init', 'config', 'hooks', 'mcp')",
+        "sm: error: argument command: invalid choice: 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx' (choose from 'put', 'query', 'search', 'show', 'related', 'supersede', 'retire', 'amend', 'list', 'import', 'export', 'backup', 'hook', 'doctor', 'upkeep', 'stats', 'init', 'config', 'hooks', 'mcp', 'update')",
     );
     // case 29
     assert_err(
         vec![Arg::Text(format!("qu{}", S("e").repeat(300)))],
         2,
-        "sm: error: argument command: invalid choice: 'queeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee' (choose from 'put', 'query', 'show', 'related', 'supersede', 'retire', 'amend', 'list', 'import', 'export', 'backup', 'hook', 'doctor', 'upkeep', 'stats', 'init', 'config', 'hooks', 'mcp')",
+        "sm: error: argument command: invalid choice: 'queeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee' (choose from 'put', 'query', 'search', 'show', 'related', 'supersede', 'retire', 'amend', 'list', 'import', 'export', 'backup', 'hook', 'doctor', 'upkeep', 'stats', 'init', 'config', 'hooks', 'mcp', 'update')",
     );
     // case 30
     assert_err(
         vec![Arg::Text(S("querx").repeat(50))],
         2,
-        "sm: error: argument command: invalid choice: 'querxquerxquerxquerxquerxquerxquerxquerxquerxquerxquerxquerxquerxquerxquerxquerxquerxquerxquerxquerxquerxquerxquerxquerxquerxquerxquerxquerxquerxquerxquerxquerxquerxquerxquerxquerxquerxquerxquerxquerxquerxquerxquerxquerxquerxquerxquerxquerxquerxquerx' (choose from 'put', 'query', 'show', 'related', 'supersede', 'retire', 'amend', 'list', 'import', 'export', 'backup', 'hook', 'doctor', 'upkeep', 'stats', 'init', 'config', 'hooks', 'mcp')",
+        "sm: error: argument command: invalid choice: 'querxquerxquerxquerxquerxquerxquerxquerxquerxquerxquerxquerxquerxquerxquerxquerxquerxquerxquerxquerxquerxquerxquerxquerxquerxquerxquerxquerxquerxquerxquerxquerxquerxquerxquerxquerxquerxquerxquerxquerxquerxquerxquerxquerxquerxquerxquerxquerxquerxquerx' (choose from 'put', 'query', 'search', 'show', 'related', 'supersede', 'retire', 'amend', 'list', 'import', 'export', 'backup', 'hook', 'doctor', 'upkeep', 'stats', 'init', 'config', 'hooks', 'mcp', 'update')",
     );
     // case 31
     assert_err(
         vec![Arg::Text("\u{65e5}\u{672c}".to_string())],
         2,
-        "sm: error: argument command: invalid choice: '\u{65e5}\u{672c}' (choose from 'put', 'query', 'show', 'related', 'supersede', 'retire', 'amend', 'list', 'import', 'export', 'backup', 'hook', 'doctor', 'upkeep', 'stats', 'init', 'config', 'hooks', 'mcp')",
+        "sm: error: argument command: invalid choice: '\u{65e5}\u{672c}' (choose from 'put', 'query', 'search', 'show', 'related', 'supersede', 'retire', 'amend', 'list', 'import', 'export', 'backup', 'hook', 'doctor', 'upkeep', 'stats', 'init', 'config', 'hooks', 'mcp', 'update')",
     );
     // case 32
     assert_err(
         vec![Arg::Bytes(vec![0xff])],
         2,
-        "sm: error: argument command: invalid choice: '\\udcff' (choose from 'put', 'query', 'show', 'related', 'supersede', 'retire', 'amend', 'list', 'import', 'export', 'backup', 'hook', 'doctor', 'upkeep', 'stats', 'init', 'config', 'hooks', 'mcp')",
+        "sm: error: argument command: invalid choice: '\\udcff' (choose from 'put', 'query', 'search', 'show', 'related', 'supersede', 'retire', 'amend', 'list', 'import', 'export', 'backup', 'hook', 'doctor', 'upkeep', 'stats', 'init', 'config', 'hooks', 'mcp', 'update')",
     );
     // case 33
     assert_err(
         vec![Arg::Bytes(vec![0x71, 0x75, 0xff, 0x65, 0x72, 0x79])],
         2,
-        "sm: error: argument command: invalid choice: 'qu\\udcffery', maybe you meant 'query'? (choose from 'put', 'query', 'show', 'related', 'supersede', 'retire', 'amend', 'list', 'import', 'export', 'backup', 'hook', 'doctor', 'upkeep', 'stats', 'init', 'config', 'hooks', 'mcp')",
+        "sm: error: argument command: invalid choice: 'qu\\udcffery', maybe you meant 'query'? (choose from 'put', 'query', 'search', 'show', 'related', 'supersede', 'retire', 'amend', 'list', 'import', 'export', 'backup', 'hook', 'doctor', 'upkeep', 'stats', 'init', 'config', 'hooks', 'mcp', 'update')",
     );
     // case 34
     assert_err(
         vec![Arg::Text("acp".to_string())],
         2,
-        "sm: error: argument command: invalid choice: 'acp', maybe you meant 'mcp'? (choose from 'put', 'query', 'show', 'related', 'supersede', 'retire', 'amend', 'list', 'import', 'export', 'backup', 'hook', 'doctor', 'upkeep', 'stats', 'init', 'config', 'hooks', 'mcp')",
+        "sm: error: argument command: invalid choice: 'acp', maybe you meant 'mcp'? (choose from 'put', 'query', 'search', 'show', 'related', 'supersede', 'retire', 'amend', 'list', 'import', 'export', 'backup', 'hook', 'doctor', 'upkeep', 'stats', 'init', 'config', 'hooks', 'mcp', 'update')",
     );
     // case 35
     assert_err(
         vec![Arg::Text("bcp".to_string())],
         2,
-        "sm: error: argument command: invalid choice: 'bcp', maybe you meant 'mcp'? (choose from 'put', 'query', 'show', 'related', 'supersede', 'retire', 'amend', 'list', 'import', 'export', 'backup', 'hook', 'doctor', 'upkeep', 'stats', 'init', 'config', 'hooks', 'mcp')",
+        "sm: error: argument command: invalid choice: 'bcp', maybe you meant 'mcp'? (choose from 'put', 'query', 'search', 'show', 'related', 'supersede', 'retire', 'amend', 'list', 'import', 'export', 'backup', 'hook', 'doctor', 'upkeep', 'stats', 'init', 'config', 'hooks', 'mcp', 'update')",
     );
     // case 36
     assert_err(
@@ -1075,7 +1083,7 @@ fn argparse_query_cases() {
         vec![
             ("version", V::None),
             ("command", V::Str("query".to_string())),
-            ("query", V::Str("x".to_string())),
+            ("query", V::List(vec![V::Str("x".to_string())])),
             ("limit", V::Int(4)),
             ("recent", V::Bool(false)),
             ("bias", V::None),
@@ -1095,7 +1103,7 @@ fn argparse_query_cases() {
         vec![
             ("version", V::None),
             ("command", V::Str("query".to_string())),
-            ("query", V::Str("-5".to_string())),
+            ("query", V::List(vec![V::Str("-5".to_string())])),
             ("limit", V::Int(4)),
             ("recent", V::Bool(false)),
             ("bias", V::None),
@@ -1125,7 +1133,7 @@ fn argparse_query_cases() {
         vec![
             ("version", V::None),
             ("command", V::Str("query".to_string())),
-            ("query", V::Str("-R6".to_string())),
+            ("query", V::List(vec![V::Str("-R6".to_string())])),
             ("limit", V::Int(4)),
             ("recent", V::Bool(false)),
             ("bias", V::None),
@@ -1138,15 +1146,18 @@ fn argparse_query_cases() {
             ("format", V::Str("text".to_string())),
         ],
     );
-    // case 93
-    assert_err(
+    // case 93 (query accepts nargs="+" unquoted multi-word terms)
+    assert_ok_fields(
         vec![
             Arg::Text("query".to_string()),
             Arg::Text("x".to_string()),
             Arg::Text("y".to_string()),
         ],
-        2,
-        "sm: error: unrecognized arguments: y",
+        base_query(),
+        vec![(
+            "query",
+            V::List(vec![V::Str("x".to_string()), V::Str("y".to_string())]),
+        )],
     );
     // case 94
     assert_ok_fields(
@@ -1160,7 +1171,7 @@ fn argparse_query_cases() {
         vec![
             ("version", V::None),
             ("command", V::Str("query".to_string())),
-            ("query", V::Str("x".to_string())),
+            ("query", V::List(vec![V::Str("x".to_string())])),
             ("limit", V::Int(3)),
             ("recent", V::Bool(false)),
             ("bias", V::None),
@@ -1184,7 +1195,7 @@ fn argparse_query_cases() {
         vec![
             ("version", V::None),
             ("command", V::Str("query".to_string())),
-            ("query", V::Str("x".to_string())),
+            ("query", V::List(vec![V::Str("x".to_string())])),
             ("limit", V::Int(3)),
             ("recent", V::Bool(false)),
             ("bias", V::None),
@@ -1209,7 +1220,7 @@ fn argparse_query_cases() {
         vec![
             ("version", V::None),
             ("command", V::Str("query".to_string())),
-            ("query", V::Str("x".to_string())),
+            ("query", V::List(vec![V::Str("x".to_string())])),
             ("limit", V::Int(3)),
             ("recent", V::Bool(false)),
             ("bias", V::None),
@@ -1234,7 +1245,7 @@ fn argparse_query_cases() {
         vec![
             ("version", V::None),
             ("command", V::Str("query".to_string())),
-            ("query", V::Str("x".to_string())),
+            ("query", V::List(vec![V::Str("x".to_string())])),
             ("limit", V::Int(3)),
             ("recent", V::Bool(false)),
             ("bias", V::None),
@@ -1259,7 +1270,7 @@ fn argparse_query_cases() {
         vec![
             ("version", V::None),
             ("command", V::Str("query".to_string())),
-            ("query", V::Str("x".to_string())),
+            ("query", V::List(vec![V::Str("x".to_string())])),
             ("limit", V::Int(3)),
             ("recent", V::Bool(false)),
             ("bias", V::None),
@@ -1284,7 +1295,7 @@ fn argparse_query_cases() {
         vec![
             ("version", V::None),
             ("command", V::Str("query".to_string())),
-            ("query", V::Str("x".to_string())),
+            ("query", V::List(vec![V::Str("x".to_string())])),
             ("limit", V::Int(10)),
             ("recent", V::Bool(false)),
             ("bias", V::None),
@@ -1309,7 +1320,7 @@ fn argparse_query_cases() {
         vec![
             ("version", V::None),
             ("command", V::Str("query".to_string())),
-            ("query", V::Str("x".to_string())),
+            ("query", V::List(vec![V::Str("x".to_string())])),
             ("limit", V::Int(7)),
             ("recent", V::Bool(false)),
             ("bias", V::None),
@@ -1334,7 +1345,7 @@ fn argparse_query_cases() {
         vec![
             ("version", V::None),
             ("command", V::Str("query".to_string())),
-            ("query", V::Str("x".to_string())),
+            ("query", V::List(vec![V::Str("x".to_string())])),
             ("limit", V::Int(5)),
             ("recent", V::Bool(false)),
             ("bias", V::None),
@@ -1359,7 +1370,7 @@ fn argparse_query_cases() {
         vec![
             ("version", V::None),
             ("command", V::Str("query".to_string())),
-            ("query", V::Str("x".to_string())),
+            ("query", V::List(vec![V::Str("x".to_string())])),
             ("limit", V::Int(-5)),
             ("recent", V::Bool(false)),
             ("bias", V::None),
@@ -1384,7 +1395,7 @@ fn argparse_query_cases() {
         vec![
             ("version", V::None),
             ("command", V::Str("query".to_string())),
-            ("query", V::Str("x".to_string())),
+            ("query", V::List(vec![V::Str("x".to_string())])),
             ("limit", V::Int(0)),
             ("recent", V::Bool(false)),
             ("bias", V::None),
@@ -1486,7 +1497,7 @@ fn argparse_query_cases() {
         vec![
             ("version", V::None),
             ("command", V::Str("query".to_string())),
-            ("query", V::Str("x".to_string())),
+            ("query", V::List(vec![V::Str("x".to_string())])),
             ("limit", V::BigInt(S("9").repeat(23))),
             ("recent", V::Bool(false)),
             ("bias", V::None),
@@ -1511,7 +1522,7 @@ fn argparse_query_cases() {
         vec![
             ("version", V::None),
             ("command", V::Str("query".to_string())),
-            ("query", V::Str("x".to_string())),
+            ("query", V::List(vec![V::Str("x".to_string())])),
             ("limit", V::BigInt((i128::from(i64::MIN) - 1).to_string())),
             ("recent", V::Bool(false)),
             ("bias", V::None),
@@ -1536,7 +1547,7 @@ fn argparse_query_cases() {
         vec![
             ("version", V::None),
             ("command", V::Str("query".to_string())),
-            ("query", V::Str("x".to_string())),
+            ("query", V::List(vec![V::Str("x".to_string())])),
             ("limit", V::Int(i64::MAX)),
             ("recent", V::Bool(false)),
             ("bias", V::None),
@@ -1561,7 +1572,7 @@ fn argparse_query_cases() {
         vec![
             ("version", V::None),
             ("command", V::Str("query".to_string())),
-            ("query", V::Str("x".to_string())),
+            ("query", V::List(vec![V::Str("x".to_string())])),
             ("limit", V::BigInt(S("9").repeat(4300))),
             ("recent", V::Bool(false)),
             ("bias", V::None),
@@ -1597,7 +1608,7 @@ fn argparse_query_cases() {
         vec![
             ("version", V::None),
             ("command", V::Str("query".to_string())),
-            ("query", V::Str("x".to_string())),
+            ("query", V::List(vec![V::Str("x".to_string())])),
             ("limit", V::Int(7)),
             ("recent", V::Bool(false)),
             ("bias", V::None),
@@ -1622,7 +1633,7 @@ fn argparse_query_cases() {
         vec![
             ("version", V::None),
             ("command", V::Str("query".to_string())),
-            ("query", V::Str("x".to_string())),
+            ("query", V::List(vec![V::Str("x".to_string())])),
             ("limit", V::Int(33)),
             ("recent", V::Bool(false)),
             ("bias", V::None),
@@ -1647,7 +1658,7 @@ fn argparse_query_cases() {
         vec![
             ("version", V::None),
             ("command", V::Str("query".to_string())),
-            ("query", V::Str("x".to_string())),
+            ("query", V::List(vec![V::Str("x".to_string())])),
             ("limit", V::Int(5)),
             ("recent", V::Bool(false)),
             ("bias", V::None),
@@ -1672,7 +1683,7 @@ fn argparse_query_cases() {
         vec![
             ("version", V::None),
             ("command", V::Str("query".to_string())),
-            ("query", V::Str("x".to_string())),
+            ("query", V::List(vec![V::Str("x".to_string())])),
             ("limit", V::Int(5)),
             ("recent", V::Bool(false)),
             ("bias", V::None),
@@ -1708,7 +1719,7 @@ fn argparse_query_cases() {
         vec![
             ("version", V::None),
             ("command", V::Str("query".to_string())),
-            ("query", V::Str("x".to_string())),
+            ("query", V::List(vec![V::Str("x".to_string())])),
             ("limit", V::Int(5)),
             ("recent", V::Bool(false)),
             ("bias", V::None),
@@ -1755,7 +1766,7 @@ fn argparse_query_cases() {
         vec![
             ("version", V::None),
             ("command", V::Str("query".to_string())),
-            ("query", V::Str("x".to_string())),
+            ("query", V::List(vec![V::Str("x".to_string())])),
             ("limit", V::Int(5)),
             ("recent", V::Bool(false)),
             ("bias", V::None),
@@ -1802,7 +1813,7 @@ fn argparse_query_cases() {
         vec![
             ("version", V::None),
             ("command", V::Str("query".to_string())),
-            ("query", V::Str("x".to_string())),
+            ("query", V::List(vec![V::Str("x".to_string())])),
             ("limit", V::Int(5)),
             ("recent", V::Bool(false)),
             ("bias", V::None),
@@ -1848,7 +1859,7 @@ fn argparse_query_cases() {
         vec![
             ("version", V::None),
             ("command", V::Str("query".to_string())),
-            ("query", V::Str("x".to_string())),
+            ("query", V::List(vec![V::Str("x".to_string())])),
             ("limit", V::Int(4)),
             ("recent", V::Bool(true)),
             ("bias", V::None),
@@ -1897,7 +1908,7 @@ fn argparse_query_cases() {
         vec![
             ("version", V::None),
             ("command", V::Str("query".to_string())),
-            ("query", V::Str("x".to_string())),
+            ("query", V::List(vec![V::Str("x".to_string())])),
             ("limit", V::Int(4)),
             ("recent", V::Bool(false)),
             (
@@ -1931,7 +1942,7 @@ fn argparse_query_cases() {
         vec![
             ("version", V::None),
             ("command", V::Str("query".to_string())),
-            ("query", V::Str("x".to_string())),
+            ("query", V::List(vec![V::Str("x".to_string())])),
             ("limit", V::Int(4)),
             ("recent", V::Bool(false)),
             (
@@ -1963,7 +1974,7 @@ fn argparse_query_cases() {
         vec![
             ("version", V::None),
             ("command", V::Str("query".to_string())),
-            ("query", V::Str("x".to_string())),
+            ("query", V::List(vec![V::Str("x".to_string())])),
             ("limit", V::Int(4)),
             ("recent", V::Bool(false)),
             ("bias", V::default_bias()),
@@ -1988,7 +1999,7 @@ fn argparse_query_cases() {
             Arg::Text("x".to_string()),
         ],
         2,
-        "sm query: error: argument --bias: Invalid bias 'x'; expected one of recency, relevance, executed, verified, decided, client-stated, derived, assumed, prior, planned, fact, decision, learning, episode, task, handoff",
+        "sm query: error: argument --bias: Invalid bias 'x'; expected one of recency, relevance, executed, verified, decided, client-stated, derived, assumed, prior, planned, fact, decision, learning, episode, task, handoff, or scope:<path>",
     );
     // case 137
     assert_err(
@@ -1999,7 +2010,7 @@ fn argparse_query_cases() {
             Arg::Text("zz".to_string()),
         ],
         2,
-        "sm query: error: argument --bias: Invalid bias 'zz'; expected one of recency, relevance, executed, verified, decided, client-stated, derived, assumed, prior, planned, fact, decision, learning, episode, task, handoff",
+        "sm query: error: argument --bias: Invalid bias 'zz'; expected one of recency, relevance, executed, verified, decided, client-stated, derived, assumed, prior, planned, fact, decision, learning, episode, task, handoff, or scope:<path>",
     );
     // case 138
     assert_ok_fields(
@@ -2013,7 +2024,7 @@ fn argparse_query_cases() {
         vec![
             ("version", V::None),
             ("command", V::Str("query".to_string())),
-            ("query", V::Str("x".to_string())),
+            ("query", V::List(vec![V::Str("x".to_string())])),
             ("limit", V::Int(4)),
             ("recent", V::Bool(false)),
             ("bias", V::List(vec![V::Str("recency".to_string())])),
@@ -2038,7 +2049,7 @@ fn argparse_query_cases() {
             Arg::Text("zz".to_string()),
         ],
         2,
-        "sm query: error: argument --bias: Invalid bias 'zz'; expected one of recency, relevance, executed, verified, decided, client-stated, derived, assumed, prior, planned, fact, decision, learning, episode, task, handoff",
+        "sm query: error: argument --bias: Invalid bias 'zz'; expected one of recency, relevance, executed, verified, decided, client-stated, derived, assumed, prior, planned, fact, decision, learning, episode, task, handoff, or scope:<path>",
     );
     // case 140
     assert_ok_fields(
@@ -2052,7 +2063,7 @@ fn argparse_query_cases() {
         vec![
             ("version", V::None),
             ("command", V::Str("query".to_string())),
-            ("query", V::Str("x".to_string())),
+            ("query", V::List(vec![V::Str("x".to_string())])),
             ("limit", V::Int(4)),
             ("recent", V::Bool(false)),
             ("bias", V::default_bias()),
@@ -2078,7 +2089,7 @@ fn argparse_query_cases() {
         vec![
             ("version", V::None),
             ("command", V::Str("query".to_string())),
-            ("query", V::Str("x".to_string())),
+            ("query", V::List(vec![V::Str("x".to_string())])),
             ("limit", V::Int(4)),
             ("recent", V::Bool(false)),
             ("bias", V::List(vec![V::Str("relevance".to_string())])),
@@ -2104,7 +2115,7 @@ fn argparse_query_cases() {
         vec![
             ("version", V::None),
             ("command", V::Str("query".to_string())),
-            ("query", V::Str("x".to_string())),
+            ("query", V::List(vec![V::Str("x".to_string())])),
             ("limit", V::Int(4)),
             ("recent", V::Bool(false)),
             ("bias", V::List(vec![V::Str("task".to_string())])),
@@ -2130,7 +2141,7 @@ fn argparse_query_cases() {
         vec![
             ("version", V::None),
             ("command", V::Str("query".to_string())),
-            ("query", V::Str("x".to_string())),
+            ("query", V::List(vec![V::Str("x".to_string())])),
             ("limit", V::Int(4)),
             ("recent", V::Bool(false)),
             ("bias", V::List(vec![V::Str("task".to_string())])),
@@ -2165,7 +2176,7 @@ fn argparse_query_cases() {
         vec![
             ("version", V::None),
             ("command", V::Str("query".to_string())),
-            ("query", V::Str("x".to_string())),
+            ("query", V::List(vec![V::Str("x".to_string())])),
             ("limit", V::Int(4)),
             ("recent", V::Bool(true)),
             ("bias", V::None),
@@ -2190,7 +2201,7 @@ fn argparse_query_cases() {
         vec![
             ("version", V::None),
             ("command", V::Str("query".to_string())),
-            ("query", V::Str("x".to_string())),
+            ("query", V::List(vec![V::Str("x".to_string())])),
             ("limit", V::Int(4)),
             ("recent", V::Bool(false)),
             ("bias", V::None),
@@ -2217,7 +2228,7 @@ fn argparse_query_cases() {
         vec![
             ("version", V::None),
             ("command", V::Str("query".to_string())),
-            ("query", V::Str("x".to_string())),
+            ("query", V::List(vec![V::Str("x".to_string())])),
             ("limit", V::Int(4)),
             ("recent", V::Bool(false)),
             ("bias", V::None),
@@ -2242,7 +2253,7 @@ fn argparse_query_cases() {
         vec![
             ("version", V::None),
             ("command", V::Str("query".to_string())),
-            ("query", V::Str("x".to_string())),
+            ("query", V::List(vec![V::Str("x".to_string())])),
             ("limit", V::Int(4)),
             ("recent", V::Bool(false)),
             ("bias", V::None),
@@ -2266,7 +2277,7 @@ fn argparse_query_cases() {
         vec![
             ("version", V::None),
             ("command", V::Str("query".to_string())),
-            ("query", V::Str("x".to_string())),
+            ("query", V::List(vec![V::Str("x".to_string())])),
             ("limit", V::Int(4)),
             ("recent", V::Bool(false)),
             ("bias", V::None),
@@ -2290,7 +2301,7 @@ fn argparse_query_cases() {
         vec![
             ("version", V::None),
             ("command", V::Str("query".to_string())),
-            ("query", V::Str("x".to_string())),
+            ("query", V::List(vec![V::Str("x".to_string())])),
             ("limit", V::Int(4)),
             ("recent", V::Bool(false)),
             ("bias", V::None),
@@ -2314,7 +2325,7 @@ fn argparse_query_cases() {
         vec![
             ("version", V::None),
             ("command", V::Str("query".to_string())),
-            ("query", V::Str("x".to_string())),
+            ("query", V::List(vec![V::Str("x".to_string())])),
             ("limit", V::Int(4)),
             ("recent", V::Bool(false)),
             ("bias", V::None),
@@ -2338,7 +2349,7 @@ fn argparse_query_cases() {
         vec![
             ("version", V::None),
             ("command", V::Str("query".to_string())),
-            ("query", V::Str("x".to_string())),
+            ("query", V::List(vec![V::Str("x".to_string())])),
             ("limit", V::Int(4)),
             ("recent", V::Bool(false)),
             ("bias", V::None),
@@ -2362,7 +2373,7 @@ fn argparse_query_cases() {
         vec![
             ("version", V::None),
             ("command", V::Str("query".to_string())),
-            ("query", V::Str("x".to_string())),
+            ("query", V::List(vec![V::Str("x".to_string())])),
             ("limit", V::Int(4)),
             ("recent", V::Bool(false)),
             ("bias", V::None),
@@ -2397,7 +2408,7 @@ fn argparse_query_cases() {
         vec![
             ("version", V::None),
             ("command", V::Str("query".to_string())),
-            ("query", V::Str("x".to_string())),
+            ("query", V::List(vec![V::Str("x".to_string())])),
             ("limit", V::Int(4)),
             ("recent", V::Bool(false)),
             ("bias", V::None),
@@ -2455,7 +2466,7 @@ fn argparse_query_cases() {
         vec![
             ("version", V::None),
             ("command", V::Str("query".to_string())),
-            ("query", V::Str("x".to_string())),
+            ("query", V::List(vec![V::Str("x".to_string())])),
             ("limit", V::Int(4)),
             ("recent", V::Bool(false)),
             ("bias", V::None),
@@ -2479,7 +2490,7 @@ fn argparse_query_cases() {
         vec![
             ("version", V::None),
             ("command", V::Str("query".to_string())),
-            ("query", V::Str("x".to_string())),
+            ("query", V::List(vec![V::Str("x".to_string())])),
             ("limit", V::Int(4)),
             ("recent", V::Bool(false)),
             ("bias", V::None),
@@ -2595,7 +2606,7 @@ fn argparse_query_cases() {
         vec![
             ("version", V::None),
             ("command", V::Str("query".to_string())),
-            ("query", V::Str("a b".to_string())),
+            ("query", V::List(vec![V::Str("a b".to_string())])),
             ("limit", V::Int(4)),
             ("recent", V::Bool(false)),
             ("bias", V::None),
@@ -2618,7 +2629,7 @@ fn argparse_query_cases() {
         vec![
             ("version", V::None),
             ("command", V::Str("query".to_string())),
-            ("query", V::Str("-a b".to_string())),
+            ("query", V::List(vec![V::Str("-a b".to_string())])),
             ("limit", V::Int(4)),
             ("recent", V::Bool(false)),
             ("bias", V::None),
@@ -2638,7 +2649,7 @@ fn argparse_query_cases() {
         vec![
             ("version", V::None),
             ("command", V::Str("query".to_string())),
-            ("query", V::Str("-.5".to_string())),
+            ("query", V::List(vec![V::Str("-.5".to_string())])),
             ("limit", V::Int(4)),
             ("recent", V::Bool(false)),
             ("bias", V::None),
@@ -2667,7 +2678,7 @@ fn argparse_query_cases() {
         vec![
             ("version", V::None),
             ("command", V::Str("query".to_string())),
-            ("query", V::Str("-\u{663}".to_string())),
+            ("query", V::List(vec![V::Str("-\u{663}".to_string())])),
             ("limit", V::Int(4)),
             ("recent", V::Bool(false)),
             ("bias", V::None),
@@ -2691,7 +2702,7 @@ fn argparse_query_cases() {
         vec![
             ("version", V::None),
             ("command", V::Str("query".to_string())),
-            ("query", V::Str("--".to_string())),
+            ("query", V::List(vec![V::Str("--".to_string())])),
             ("limit", V::Int(4)),
             ("recent", V::Bool(false)),
             ("bias", V::None),
@@ -2718,7 +2729,7 @@ fn argparse_query_cases() {
         vec![
             ("version", V::None),
             ("command", V::Str("query".to_string())),
-            ("query", V::Str("x".to_string())),
+            ("query", V::List(vec![V::Str("x".to_string())])),
             ("limit", V::Int(5)),
             ("recent", V::Bool(false)),
             ("bias", V::None),
@@ -2769,7 +2780,7 @@ fn argparse_query_cases() {
         vec![
             ("version", V::None),
             ("command", V::Str("query".to_string())),
-            ("query", V::Str("x".to_string())),
+            ("query", V::List(vec![V::Str("x".to_string())])),
             ("limit", V::Int(3)),
             ("recent", V::Bool(false)),
             ("bias", V::None),
@@ -2824,27 +2835,33 @@ fn argparse_query_cases() {
         2,
         "sm query: error: argument --tag: expected one argument",
     );
-    // case 185
-    assert_err(
+    // case 185 (query accepts nargs="+")
+    assert_ok_fields(
         vec![
             Arg::Text("query".to_string()),
             Arg::Text("--".to_string()),
             Arg::Text("x".to_string()),
             Arg::Text("y".to_string()),
         ],
-        2,
-        "sm: error: unrecognized arguments: y",
+        base_query(),
+        vec![(
+            "query",
+            V::List(vec![V::Str("x".to_string()), V::Str("y".to_string())]),
+        )],
     );
-    // case 186
-    assert_err(
+    // case 186 (query accepts nargs="+")
+    assert_ok_fields(
         vec![
             Arg::Text("query".to_string()),
             Arg::Text("x".to_string()),
             Arg::Text("--".to_string()),
             Arg::Text("y".to_string()),
         ],
-        2,
-        "sm: error: unrecognized arguments: y",
+        base_query(),
+        vec![(
+            "query",
+            V::List(vec![V::Str("x".to_string()), V::Str("y".to_string())]),
+        )],
     );
     // case 187
     assert_ok_fields(
@@ -2857,7 +2874,7 @@ fn argparse_query_cases() {
         vec![
             ("version", V::None),
             ("command", V::Str("query".to_string())),
-            ("query", V::Str("x".to_string())),
+            ("query", V::List(vec![V::Str("x".to_string())])),
             ("limit", V::Int(4)),
             ("recent", V::Bool(false)),
             ("bias", V::default_bias()),
@@ -2883,7 +2900,7 @@ fn argparse_query_cases() {
         vec![
             ("version", V::None),
             ("command", V::Str("query".to_string())),
-            ("query", V::Str("x".to_string())),
+            ("query", V::List(vec![V::Str("x".to_string())])),
             ("limit", V::Int(4)),
             ("recent", V::Bool(false)),
             ("bias", V::None),
@@ -2903,7 +2920,7 @@ fn argparse_query_cases() {
         vec![
             ("version", V::None),
             ("command", V::Str("query".to_string())),
-            ("query", V::BytesStr(vec![0xff])),
+            ("query", V::List(vec![V::BytesStr(vec![0xff])])),
             ("limit", V::Int(4)),
             ("recent", V::Bool(false)),
             ("bias", V::None),
@@ -2958,7 +2975,7 @@ fn argparse_query_cases() {
             Arg::Bytes(vec![0xff]),
         ],
         2,
-        "sm query: error: argument --bias: Invalid bias '\\udcff'; expected one of recency, relevance, executed, verified, decided, client-stated, derived, assumed, prior, planned, fact, decision, learning, episode, task, handoff",
+        "sm query: error: argument --bias: Invalid bias '\\udcff'; expected one of recency, relevance, executed, verified, decided, client-stated, derived, assumed, prior, planned, fact, decision, learning, episode, task, handoff, or scope:<path>",
     );
     // case 194
     assert_err(
@@ -2970,25 +2987,89 @@ fn argparse_query_cases() {
         2,
         "sm: error: unrecognized arguments: --zz=1",
     );
-    // case 195
-    assert_err(
+    // case 195 (query accepts nargs="+")
+    assert_ok_fields(
         vec![
             Arg::Text("query".to_string()),
             Arg::Text("x".to_string()),
             Arg::Text("-5".to_string()),
         ],
-        2,
-        "sm: error: unrecognized arguments: -5",
+        base_query(),
+        vec![(
+            "query",
+            V::List(vec![V::Str("x".to_string()), V::Str("-5".to_string())]),
+        )],
     );
-    // case 196
-    assert_err(
+    // case 196 (query accepts nargs="+")
+    assert_ok_fields(
         vec![
             Arg::Text("query".to_string()),
             Arg::Text("-5".to_string()),
             Arg::Text("-6".to_string()),
         ],
+        base_query(),
+        vec![(
+            "query",
+            V::List(vec![V::Str("-5".to_string()), V::Str("-6".to_string())]),
+        )],
+    );
+    // v0.6.0: --in and --repo are mutually exclusive on query and search
+    assert_err(
+        vec![
+            Arg::Text("query".to_string()),
+            Arg::Text("x".to_string()),
+            Arg::Text("--in".to_string()),
+            Arg::Text("acme".to_string()),
+            Arg::Text("--repo".to_string()),
+            Arg::Text("anvil".to_string()),
+        ],
         2,
-        "sm: error: unrecognized arguments: -6",
+        "sm query: error: argument --repo: not allowed with argument --in",
+    );
+    assert_err(
+        vec![
+            Arg::Text("query".to_string()),
+            Arg::Text("x".to_string()),
+            Arg::Text("--repo".to_string()),
+            Arg::Text("anvil".to_string()),
+            Arg::Text("--in".to_string()),
+            Arg::Text("acme".to_string()),
+        ],
+        2,
+        "sm query: error: argument --in: not allowed with argument --repo",
+    );
+    assert_ok_fields(
+        vec![
+            Arg::Text("search".to_string()),
+            Arg::Text("alpha".to_string()),
+            Arg::Text("beta".to_string()),
+            Arg::Text("--limit".to_string()),
+            Arg::Text("3".to_string()),
+        ],
+        base_query(),
+        vec![
+            ("command", V::Str("search".to_string())),
+            (
+                "query",
+                V::List(vec![
+                    V::Str("alpha".to_string()),
+                    V::Str("beta".to_string()),
+                ]),
+            ),
+            ("limit", V::Int(3)),
+        ],
+    );
+    assert_err(
+        vec![
+            Arg::Text("search".to_string()),
+            Arg::Text("x".to_string()),
+            Arg::Text("--in".to_string()),
+            Arg::Text("acme".to_string()),
+            Arg::Text("--repo".to_string()),
+            Arg::Text("anvil".to_string()),
+        ],
+        2,
+        "sm search: error: argument --repo: not allowed with argument --in",
     );
     // wave2: --source (repeatable comma list), --since, --until
     assert_ok_fields(
@@ -3092,6 +3173,56 @@ fn argparse_show_cases() {
         vec![Arg::Text("show".to_string()), Arg::Text("-h".to_string())],
         0,
         "",
+    );
+    // v0.6.0: show --format text|json
+    assert_ok_fields(
+        vec![
+            Arg::Text("show".to_string()),
+            Arg::Text("a".to_string()),
+            Arg::Text("b".to_string()),
+            Arg::Text("--format".to_string()),
+            Arg::Text("json".to_string()),
+        ],
+        base_show(),
+        vec![("format", V::Str("json".to_string()))],
+    );
+    assert_err(
+        vec![
+            Arg::Text("show".to_string()),
+            Arg::Text("a".to_string()),
+            Arg::Text("--format".to_string()),
+            Arg::Text("xml".to_string()),
+        ],
+        2,
+        "sm show: error: argument --format: invalid choice: 'xml' (choose from 'text', 'json')",
+    );
+}
+
+#[test]
+fn argparse_update_cases() {
+    let base_update = || {
+        vec![
+            ("version", V::None),
+            ("command", V::Str("update".to_string())),
+            ("check", V::Bool(false)),
+        ]
+    };
+    assert_ok_fields(vec![Arg::Text("update".to_string())], base_update(), vec![]);
+    assert_ok_fields(
+        vec![
+            Arg::Text("update".to_string()),
+            Arg::Text("--check".to_string()),
+        ],
+        base_update(),
+        vec![("check", V::Bool(true))],
+    );
+    assert_err(
+        vec![
+            Arg::Text("update".to_string()),
+            Arg::Text("--bogus".to_string()),
+        ],
+        2,
+        "sm: error: unrecognized arguments: --bogus",
     );
 }
 

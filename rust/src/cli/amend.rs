@@ -20,6 +20,7 @@ pub fn run(ns: &Namespace, out: &mut Out) -> Result<i32, SmError> {
         add_tags: ns.get_opt_str("add_tags"),
         remove_tags: ns.get_opt_str("remove_tags"),
         as_of: ns.get_opt_str("as_of"),
+        ..Default::default()
     };
     let (new_id, body_changed) = run_amend(ns.get_str("id"), &patch, None)?;
     out.print(&new_id)?;

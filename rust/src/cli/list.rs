@@ -4,11 +4,9 @@ use std::collections::BTreeSet;
 
 use crate::cli::query::{
     HEADER_REFS_CHARS, HOOK_TITLE_CHARS, MAX_TOTAL_CHARS, MIN_TEXT_CHARS, compact_refs,
-    refs_without_source, shlex_quote,
+    refs_without_source, shlex_quote, status_marker,
 };
-use crate::core::item::Item;
 use crate::core::rank::match_snippet;
-use crate::core::tags::retired_label;
 use crate::error::SmError;
 use crate::py;
 use crate::py::argparse::{Namespace, Value};
@@ -33,27 +31,8 @@ fn s(v: &str) -> PyValue {
     PyValue::Str(v.to_string())
 }
 
-fn status_marker(it: &Item) -> Option<String> {
-    match it.superseded_by.as_deref() {
-        Some(by) if it.status == "superseded" && !by.is_empty() => {
-            Some(format!("superseded_by={by}"))
-        }
-        _ if it.status == "superseded" => Some(format!("retired: {}", retired_label(&it.tags))),
-        _ => None,
-    }
-}
-
-fn list_flags(ns: &Namespace, next_offset: i128, page: &ListPage) -> Vec<String> {
+fn list_filter_flags(ns: &Namespace) -> Vec<String> {
     let mut flags: Vec<String> = Vec::new();
-    let repo = ns.get_str("repo");
-    let paths = split_list(StrList::Str(ns.get_str("in")));
-    if !paths.is_empty() {
-        flags.extend(["--in".to_string(), paths.join(",")]);
-    } else if ns.get_bool("all_repos") {
-        flags.push("--all".to_string());
-    } else if !repo.is_empty() {
-        flags.extend(["--repo".to_string(), shlex_quote(repo)]);
-    }
     for (flag, dest) in [("--kind", "kind"), ("--tag", "tag")] {
         let vals = split_list(StrList::Str(ns.get_str(dest)));
         if !vals.is_empty() {
@@ -75,6 +54,35 @@ fn list_flags(ns: &Namespace, next_offset: i128, page: &ListPage) -> Vec<String>
     } else if ns.get_bool("include_history") {
         flags.push("--include-history".to_string());
     }
+    flags
+}
+
+fn format_other_repos_hint(other_repos: &[(String, i64)], ns: &Namespace) -> Option<String> {
+    if other_repos.is_empty() {
+        return None;
+    }
+    let counts = other_repos
+        .iter()
+        .map(|(r, n)| format!("{r}={n}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut cmd = vec!["sm list --all".to_string()];
+    cmd.extend(list_filter_flags(ns));
+    Some(format!("other repos: {counts} -> {}", cmd.join(" ")))
+}
+
+fn list_flags(ns: &Namespace, next_offset: i128, page: &ListPage) -> Vec<String> {
+    let mut flags: Vec<String> = Vec::new();
+    let repo = ns.get_str("repo");
+    let paths = split_list(StrList::Str(ns.get_str("in")));
+    if !paths.is_empty() {
+        flags.extend(["--in".to_string(), paths.join(",")]);
+    } else if ns.get_bool("all_repos") {
+        flags.push("--all".to_string());
+    } else if !repo.is_empty() {
+        flags.extend(["--repo".to_string(), shlex_quote(repo)]);
+    }
+    flags.extend(list_filter_flags(ns));
     let format = ns.get_str("format");
     if format != "brief" {
         flags.extend(["--format".to_string(), format.to_string()]);
@@ -263,6 +271,14 @@ pub fn run(ns: &Namespace, out: &mut Out) -> Result<i32, SmError> {
         r => r?,
     };
     print_list(&page, ns, out)?;
+    if page.total == 0
+        && !page.all_repos
+        && page.scopes.is_empty()
+        && ns.get_str("format") != "json"
+        && let Some(hint) = format_other_repos_hint(&page.other_repos, ns)
+    {
+        out.print(&hint)?;
+    }
     let ids: Vec<String> = page.items.iter().map(|it| it.id.clone()).collect();
     let flags = PyValue::Dict(vec![
         (s("kind"), s(ns.get_str("kind"))),
@@ -283,6 +299,24 @@ pub fn run(ns: &Namespace, out: &mut Out) -> Result<i32, SmError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::item::Item;
+
+    #[test]
+    fn other_repos_hint_formats_counts_or_none() {
+        let ns_plain = parse(&["list", "--repo", "anvil"]);
+        assert_eq!(format_other_repos_hint(&[], &ns_plain), None);
+        assert_eq!(
+            format_other_repos_hint(&[("beta".into(), 3), ("global".into(), 1)], &ns_plain),
+            Some("other repos: beta=3 global=1 -> sm list --all".into())
+        );
+        let ns_filtered = parse(&[
+            "list", "--repo", "anvil", "--kind", "handoff", "--status", "retired",
+        ]);
+        assert_eq!(
+            format_other_repos_hint(&[("beta".into(), 1)], &ns_filtered),
+            Some("other repos: beta=1 -> sm list --all --kind handoff --status retired".into())
+        );
+    }
 
     fn sample_item(id: &str, title: &str, body: &str) -> Item {
         let mut it = Item::bare(id, "anvil", "fact", title, body, "decided");
@@ -318,6 +352,7 @@ mod tests {
             repo: Some("anvil".into()),
             all_repos: false,
             scopes: vec![],
+            other_repos: vec![],
         };
         let ns = parse(&[
             "list",
@@ -371,6 +406,7 @@ mod tests {
             repo: None,
             all_repos: true,
             scopes: vec![],
+            other_repos: vec![],
         };
         let ns_all = parse(&["list", "--all", "--offset", "99999999999999999999"]);
         assert_eq!(footer_lines(&huge, &ns_all), vec!["next: sm show m_max"]);

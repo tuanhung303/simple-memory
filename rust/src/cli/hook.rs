@@ -2,7 +2,9 @@
 
 use std::io::Read;
 
-use crate::cli::query::{HOOK_REFS_CHARS, HOOK_TITLE_CHARS, compact_refs, refs_without_source};
+use crate::cli::query::{
+    HOOK_REFS_CHARS, HOOK_TITLE_CHARS, compact_refs, refs_without_source, shlex_quote,
+};
 use crate::core::item::Item;
 use crate::error::SmError;
 use crate::py;
@@ -80,8 +82,13 @@ pub fn hook_context(
         } else {
             format!("local keywords \"{q}\"; model {}", found.fallback)
         };
+        let in_part = if found.scopes.is_empty() {
+            String::new()
+        } else {
+            format!(" --in {}", shlex_quote(&found.scopes.join(",")))
+        };
         parts.push(format!(
-            "sm recall for this prompt ({source}): leads with their as_of dates, not facts. `sm show <id>` gives the full text; `sm query \"{q}\" --limit 10` gives more.\n{}",
+            "sm recall for this prompt ({source}): leads with their as_of dates, not facts. `sm show <id>` gives the full text; `sm query \"{q}\"{in_part} --limit 10` gives more.\n{}",
             format_recall_lines(&found.items)
         ));
     }
@@ -357,6 +364,38 @@ mod tests {
         assert_eq!(
             context.lines().next().unwrap(),
             "sm recall for this prompt (local keywords \"r6 revert\"; model off): leads with their as_of dates, not facts. `sm show <id>` gives the full text; `sm query \"r6 revert\" --limit 10` gives more."
+        );
+    }
+
+    #[test]
+    fn cli_header_includes_in_scopes_only_when_scopes_matched() {
+        let h = py_home();
+        set_config(
+            &h,
+            "[prompt_hook]\nmin_idf = 0.0\n[prompt_hook.projects]\nGLX = \"Globex\"\n[scopes]\n\"acme/GLX\" = [\"GLX\"]\n",
+        );
+        put_titled(&h, "R6 GLX rollout note", "decided");
+        let with_scope = ctx(
+            &h,
+            &PFake::out("R6 rollout"),
+            json!({"prompt": "check GLX R6 rollout now", "cwd": "/nonexistent-sm-r2"}),
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            with_scope.lines().next().unwrap(),
+            "sm recall for this prompt (query \"R6 rollout\"): leads with their as_of dates, not facts. `sm show <id>` gives the full text; `sm query \"R6 rollout\" --in acme/GLX --limit 10` gives more."
+        );
+        let without_scope = ctx(
+            &h,
+            &PFake::out("R6 rollout"),
+            json!({"prompt": "check generic R6 rollout now", "cwd": "/nonexistent-sm-r2"}),
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            without_scope.lines().next().unwrap(),
+            "sm recall for this prompt (query \"R6 rollout\"): leads with their as_of dates, not facts. `sm show <id>` gives the full text; `sm query \"R6 rollout\" --limit 10` gives more."
         );
     }
 

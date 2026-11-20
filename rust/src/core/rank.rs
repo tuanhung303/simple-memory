@@ -1,12 +1,12 @@
 use std::cmp::Ordering;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::clock;
 use crate::core::fold::{fold, has_accents};
 use crate::core::item::{Item, parse_as_of_epoch};
 use crate::core::refs::{RefsArg, extract_refs, split_refs};
 use crate::core::tags::{VALID_KINDS, VALID_TAGS};
-use crate::core::terms::{search_word_literal, stands_as_word, word_runs};
+use crate::core::terms::{Aliases, expand_aliases, search_word_literal, stands_as_word, word_runs};
 use crate::error::SmError;
 use crate::py;
 
@@ -121,7 +121,7 @@ fn parse_bias_items<I: IntoIterator<Item = (String, String)>>(
             let cleaned = py::str::lower(trimmed);
             if !allowed.contains(&cleaned.as_str()) {
                 return Err(SmError::value(format!(
-                    "Invalid bias {repr}; expected one of {}",
+                    "Invalid bias {repr}; expected one of {}, or scope:<path>",
                     allowed.join(", ")
                 )));
             }
@@ -178,6 +178,195 @@ pub fn query_terms(query: &str) -> Vec<String> {
     out
 }
 
+/// Split a raw query into `(positive_query, excluded)` folded terms/phrases.
+///
+/// Unquoted `-<word>` / `-"<phrase>"` tokens become exclusions only when at least one positive
+/// token exists (preserving literal leading-dash queries like `sm query -- -R6`).
+/// Standalone unquoted uppercase `OR` / `AND` tokens are stripped as boolean noise.
+pub fn parse_query_exclusions(query: &str) -> (String, Vec<String>) {
+    enum Token<'a> {
+        Positive(&'a str),
+        Exclusion { raw: &'a str, folded: String },
+    }
+    let mut tokens: Vec<Token<'_>> = Vec::new();
+    let bytes = query.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let ch = query[i..].chars().next().expect("i < bytes.len()");
+        if py::str::isspace(ch) {
+            i += ch.len_utf8();
+            continue;
+        }
+        let start = i;
+        if query[i..].starts_with("-\"") {
+            i += 2;
+            let inner_start = i;
+            while i < bytes.len() && bytes[i] != b'"' {
+                let c = query[i..].chars().next().expect("i < bytes.len()");
+                i += c.len_utf8();
+            }
+            let inner_end = i;
+            if i < bytes.len() && bytes[i] == b'"' {
+                i += 1;
+            }
+            let raw = &query[start..i];
+            let folded = word_runs(&fold(Some(&query[inner_start..inner_end]))).join(" ");
+            if folded.is_empty() {
+                tokens.push(Token::Positive(raw));
+            } else {
+                tokens.push(Token::Exclusion { raw, folded });
+            }
+        } else if bytes[i] == b'"' {
+            i += 1;
+            while i < bytes.len() && bytes[i] != b'"' {
+                let c = query[i..].chars().next().expect("i < bytes.len()");
+                i += c.len_utf8();
+            }
+            if i < bytes.len() && bytes[i] == b'"' {
+                i += 1;
+            }
+            tokens.push(Token::Positive(&query[start..i]));
+        } else {
+            while i < bytes.len() {
+                let c = query[i..].chars().next().expect("i < bytes.len()");
+                if py::str::isspace(c) {
+                    break;
+                }
+                i += c.len_utf8();
+            }
+            let tok = &query[start..i];
+            if tok == "OR" || tok == "AND" {
+                continue;
+            }
+            if let Some(rest) = tok.strip_prefix('-')
+                && rest.chars().next().is_some_and(py::str::is_word)
+            {
+                let folded = word_runs(&fold(Some(rest))).join(" ");
+                if !folded.is_empty() {
+                    tokens.push(Token::Exclusion { raw: tok, folded });
+                    continue;
+                }
+            }
+            tokens.push(Token::Positive(tok));
+        }
+    }
+
+    let has_positive = tokens.iter().any(|t| matches!(t, Token::Positive(_)));
+    if !has_positive {
+        let raw: Vec<&str> = tokens
+            .into_iter()
+            .map(|t| match t {
+                Token::Positive(r) | Token::Exclusion { raw: r, .. } => r,
+            })
+            .collect();
+        return (raw.join(" "), Vec::new());
+    }
+
+    let mut pos = Vec::new();
+    let mut excl = Vec::new();
+    for t in tokens {
+        match t {
+            Token::Positive(r) => pos.push(r),
+            Token::Exclusion { folded, .. } => {
+                if !excl.contains(&folded) {
+                    excl.push(folded);
+                }
+            }
+        }
+    }
+    (pos.join(" "), excl)
+}
+
+/// True when `item`'s folded `refs + title + tags + body` contains any excluded word or phrase.
+pub fn item_matches_exclusion(item: &Item, excluded: &[String]) -> bool {
+    if excluded.is_empty() {
+        return false;
+    }
+    let haystack = haystack_words(item);
+    let sub_haystack = split_underscores(&haystack);
+    let mut joined_phrase: Option<String> = None;
+    for ex in excluded {
+        if ex.is_empty() {
+            continue;
+        }
+        if ex.contains(' ') {
+            let norm: Vec<&str> = ex.split([' ', '_']).filter(|p| !p.is_empty()).collect();
+            if norm.is_empty() {
+                continue;
+            }
+            let phrase_hay =
+                joined_phrase.get_or_insert_with(|| format!(" {} ", sub_haystack.join(" ")));
+            if phrase_hay.contains(&format!(" {} ", norm.join(" "))) {
+                return true;
+            }
+        } else if ex.contains('_') {
+            if haystack.iter().any(|hw| hw == ex) {
+                return true;
+            }
+            let parts: Vec<&str> = ex.split('_').filter(|p| !p.is_empty()).collect();
+            if parts.len() >= 2 {
+                let phrase_hay =
+                    joined_phrase.get_or_insert_with(|| format!(" {} ", sub_haystack.join(" ")));
+                if phrase_hay.contains(&format!(" {} ", parts.join(" "))) {
+                    return true;
+                }
+            } else if let Some(&only) = parts.first()
+                && simple_word_matches(only, &sub_haystack)
+            {
+                return true;
+            }
+        } else if simple_word_matches(ex, &sub_haystack) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Map each folded query term covered by an active alias key to the folded alias target words
+/// that differ from that key's own words.
+pub fn term_alias_targets(
+    query: &str,
+    aliases: Option<&Aliases>,
+) -> Result<HashMap<String, Vec<String>>, SmError> {
+    let mut map: HashMap<String, Vec<String>> = HashMap::new();
+    let Some(aliases) = aliases.filter(|a| !query.is_empty() && !a.is_empty()) else {
+        return Ok(map);
+    };
+    for entry in aliases {
+        let single = vec![entry.clone()];
+        let exps = expand_aliases(query, Some(&single))?;
+        if exps.is_empty() {
+            continue;
+        }
+        let key_folded = fold(Some(py::str::strip(&entry.0)));
+        let key_words: Vec<String> = word_runs(&key_folded)
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let mut target_words: Vec<String> = Vec::new();
+        for exp in exps {
+            let exp_folded = fold(Some(&exp));
+            for w in word_runs(&exp_folded) {
+                if !key_words.iter().any(|kw| kw == w) && !target_words.iter().any(|tw| tw == w) {
+                    target_words.push(w.to_string());
+                }
+            }
+        }
+        if target_words.is_empty() {
+            continue;
+        }
+        for kw in key_words {
+            let slot = map.entry(kw).or_default();
+            for tw in &target_words {
+                if !slot.contains(tw) {
+                    slot.push(tw.clone());
+                }
+            }
+        }
+    }
+    Ok(map)
+}
+
 fn haystack_words(item: &Item) -> Vec<String> {
     let text = fold(Some(&format!(
         "{} {} {} {}",
@@ -186,20 +375,60 @@ fn haystack_words(item: &Item) -> Vec<String> {
     word_runs(&text).into_iter().map(String::from).collect()
 }
 
-fn word_matches(qw: &str, haystack: &[String]) -> bool {
+fn simple_word_matches(qw: &str, haystack: &[&str]) -> bool {
     if py::str::len(qw) >= 4 && qw.is_ascii() && py::str::all_chars(qw, py::str::isalpha) {
         return haystack.iter().any(|hw| hw.starts_with(qw));
     }
-    haystack.iter().any(|hw| hw == qw)
+    haystack.contains(&qw)
 }
 
-/// `terms_held(item, terms)`: a prefix for ASCII words of 4+ letters, else the whole word.
-pub fn terms_held<S: AsRef<str>>(item: &Item, terms: &[S]) -> Vec<String> {
+fn split_underscores(words: &[String]) -> Vec<&str> {
+    words
+        .iter()
+        .flat_map(|hw| hw.split('_').filter(|p| !p.is_empty()))
+        .collect()
+}
+
+fn word_matches_strict(qw: &str, haystack: &[String]) -> bool {
+    if qw.contains('_') {
+        let parts: Vec<&str> = qw.split('_').filter(|p| !p.is_empty()).collect();
+        if !parts.is_empty() {
+            let sub_haystack = split_underscores(haystack);
+            return parts.iter().all(|p| simple_word_matches(p, &sub_haystack));
+        }
+    }
+    let whole: Vec<&str> = haystack.iter().map(String::as_str).collect();
+    simple_word_matches(qw, &whole)
+}
+
+fn word_matches(qw: &str, haystack: &[String]) -> bool {
+    let sub_haystack = split_underscores(haystack);
+    if qw.contains('_') {
+        let parts: Vec<&str> = qw.split('_').filter(|p| !p.is_empty()).collect();
+        if !parts.is_empty() {
+            return parts.iter().all(|p| simple_word_matches(p, &sub_haystack));
+        }
+    }
+    simple_word_matches(qw, &sub_haystack)
+}
+
+/// `terms_held(item, terms, alias_map)`: prefix for ASCII words of 4+ letters, snake_case
+/// sub-parts matching FTS5 unicode61, or active alias target words.
+fn terms_held(
+    item: &Item,
+    terms: &[String],
+    alias_map: &HashMap<String, Vec<String>>,
+) -> Vec<String> {
     let haystack = haystack_words(item);
     terms
         .iter()
-        .filter(|t| word_matches(t.as_ref(), &haystack))
-        .map(|t| t.as_ref().to_string())
+        .filter(|t| {
+            word_matches(t, &haystack)
+                || alias_map
+                    .get(t.as_str())
+                    .is_some_and(|targets| targets.iter().any(|w| word_matches(w, &haystack)))
+        })
+        .cloned()
         .collect()
 }
 
@@ -236,7 +465,7 @@ fn item_matches_all_query_words(item: &Item, q_words: &[String]) -> bool {
         return true;
     }
     let haystack = haystack_words(item);
-    q_words.iter().all(|qw| word_matches(qw, &haystack))
+    q_words.iter().all(|qw| word_matches_strict(qw, &haystack))
 }
 
 /// Whether `item` matches any `[scopes]` matcher (exact parity with SQL `matcher_clauses` + `sm_word`).
@@ -269,6 +498,7 @@ pub struct ScoreOpts<'a> {
     /// Only the first `explain` results get terms_matched and terms_missing; None: all. A
     /// negative value slices from the end, as `scored[:explain]` does.
     pub explain: Option<i64>,
+    pub aliases: Option<&'a Aliases>,
 }
 
 /// Python's `<` on two floats of a key tuple: equal unless one is less (nan is never less).
@@ -288,6 +518,7 @@ pub fn score_candidates(
         return Ok(Vec::new());
     }
     let terms = query_terms(query);
+    let alias_map = term_alias_targets(query, opts.aliases)?;
     if opts.recent {
         let all_matched: Vec<&Candidate> = candidates
             .iter()
@@ -310,7 +541,7 @@ pub fn score_candidates(
                 why: Why::default(),
             })
             .collect();
-        return Ok(explain_terms(scored, &terms, opts.explain));
+        return Ok(explain_terms(scored, &terms, &alias_map, opts.explain));
     }
 
     let now_ts = opts.now_epoch.unwrap_or_else(clock::now_epoch);
@@ -353,6 +584,7 @@ pub fn score_candidates(
         .fold(raw_rels[0], |m, &x| if x > m { x } else { m });
 
     struct Key {
+        active: u8,
         ref_hits: usize,
         phrase: u8,
         accent: u8,
@@ -460,6 +692,7 @@ pub fn score_candidates(
             ..Why::default()
         };
         let key = Key {
+            active: u8::from(item.status == "active"),
             ref_hits,
             phrase: u8::from(fold_phrase_hit),
             accent: u8::from(accent_hit),
@@ -477,8 +710,9 @@ pub fn score_candidates(
     }
 
     keyed.sort_by(|(a, _), (b, _)| {
-        b.ref_hits
-            .cmp(&a.ref_hits)
+        b.active
+            .cmp(&a.active)
+            .then(b.ref_hits.cmp(&a.ref_hits))
             .then(b.phrase.cmp(&a.phrase))
             .then(b.accent.cmp(&a.accent))
             .then(cmp_f64(b.score, a.score))
@@ -488,11 +722,17 @@ pub fn score_candidates(
     Ok(explain_terms(
         keyed.into_iter().map(|(_, s)| s).collect(),
         &terms,
+        &alias_map,
         opts.explain,
     ))
 }
 
-fn explain_terms(mut scored: Vec<Scored>, terms: &[String], explain: Option<i64>) -> Vec<Scored> {
+fn explain_terms(
+    mut scored: Vec<Scored>,
+    terms: &[String],
+    alias_map: &HashMap<String, Vec<String>>,
+    explain: Option<i64>,
+) -> Vec<Scored> {
     let n = scored.len() as i64;
     let upto = match explain {
         None => n,
@@ -500,7 +740,7 @@ fn explain_terms(mut scored: Vec<Scored>, terms: &[String], explain: Option<i64>
         Some(e) => e.min(n),
     } as usize;
     for s in scored.iter_mut().take(upto) {
-        s.why.terms_matched = terms_held(&s.item, terms);
+        s.why.terms_matched = terms_held(&s.item, terms, alias_map);
         s.why.terms_missing = terms
             .iter()
             .filter(|t| !s.why.terms_matched.contains(t) && is_hint_term(t))
@@ -725,6 +965,7 @@ mod tests {
             bias,
             scope_biases: &[],
             explain: None,
+            aliases: None,
         }
     }
 
@@ -797,7 +1038,7 @@ mod tests {
         assert_eq!(
             err.msg,
             "Invalid bias 'newest'; expected one of recency, relevance, executed, verified, decided, \
-             client-stated, derived, assumed, prior, planned, fact, decision, learning, episode, task, handoff"
+             client-stated, derived, assumed, prior, planned, fact, decision, learning, episode, task, handoff, or scope:<path>"
         );
     }
 
@@ -1553,5 +1794,247 @@ mod tests {
             out_dep.starts_with("...") && out_dep.contains("deploying"),
             "{out_dep}"
         );
+    }
+
+    #[test]
+    fn parse_query_exclusions_handles_terms_phrases_operators_and_pure_dash_literal() {
+        let s = |v: &[&str]| v.iter().map(|x| (*x).to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            parse_query_exclusions("postgres -legacy"),
+            ("postgres".into(), s(&["legacy"]))
+        );
+        assert_eq!(
+            parse_query_exclusions("-legacy postgres"),
+            ("postgres".into(), s(&["legacy"]))
+        );
+        assert_eq!(
+            parse_query_exclusions("auth -oauth -saml -oauth"),
+            ("auth".into(), s(&["oauth", "saml"]))
+        );
+        assert_eq!(
+            parse_query_exclusions("deploy -\"connection pool\" -café"),
+            ("deploy".into(), s(&["connection pool", "cafe"]))
+        );
+        // Quoted leading-dash token and standalone -, --, --flag, hyphenated words stay positive.
+        assert_eq!(
+            parse_query_exclusions("\"-excl\" term"),
+            ("\"-excl\" term".into(), Vec::<String>::new())
+        );
+        assert_eq!(
+            parse_query_exclusions("deploy - -- --flag rate-limit ALP-489"),
+            (
+                "deploy - -- --flag rate-limit ALP-489".into(),
+                Vec::<String>::new()
+            )
+        );
+        // Zero positive tokens: pure leading-dash queries stay literal (preserve `sm query -- -R6`).
+        assert_eq!(parse_query_exclusions("-R6"), ("-R6".into(), Vec::new()));
+        assert_eq!(parse_query_exclusions("-yak"), ("-yak".into(), Vec::new()));
+        // Standalone unquoted uppercase OR / AND stripped; lowercase and quoted preserved.
+        assert_eq!(
+            parse_query_exclusions("foo OR bar AND baz"),
+            ("foo bar baz".into(), Vec::new())
+        );
+        assert_eq!(
+            parse_query_exclusions("read and write or copy"),
+            ("read and write or copy".into(), Vec::new())
+        );
+        assert_eq!(
+            parse_query_exclusions("\"OR\" gate"),
+            ("\"OR\" gate".into(), Vec::new())
+        );
+        assert_eq!(
+            parse_query_exclusions("OR AND"),
+            (String::new(), Vec::new())
+        );
+        // Unclosed negated quote and empty negated quote never panic.
+        assert_eq!(
+            parse_query_exclusions("deploy -\"open phrase"),
+            ("deploy".into(), s(&["open phrase"]))
+        );
+        assert_eq!(
+            parse_query_exclusions("deploy -\"   \""),
+            ("deploy -\"   \"".into(), Vec::new())
+        );
+    }
+
+    #[test]
+    fn item_matches_exclusion_checks_fields_phrases_and_word_boundaries() {
+        let mk = |title: &str, body: &str, refs: &str, tags: &str| {
+            let mut it = Item::bare("m_1", "r", "fact", title, body, "decided");
+            it.refs = refs.into();
+            it.tags = tags.into();
+            it
+        };
+        let s = |v: &[&str]| v.iter().map(|x| (*x).to_string()).collect::<Vec<_>>();
+        // Matches across refs, title, tags, body.
+        assert!(item_matches_exclusion(
+            &mk("t", "b", "staging-1", ""),
+            &s(&["staging"])
+        ));
+        assert!(item_matches_exclusion(
+            &mk("Staging deploy", "b", "", ""),
+            &s(&["staging"])
+        ));
+        assert!(item_matches_exclusion(
+            &mk("t", "b", "", "env, staging"),
+            &s(&["staging"])
+        ));
+        assert!(item_matches_exclusion(
+            &mk("t", "PostgreSQL connection pool tuning", "", ""),
+            &s(&["connection pool"])
+        ));
+        // Word-bounded phrase must not match partial words or non-adjacent words.
+        assert!(!item_matches_exclusion(
+            &mk("t", "reconnection poolparty", "", ""),
+            &s(&["connection pool"])
+        ));
+        assert!(!item_matches_exclusion(
+            &mk("t", "connection worker pool", "", ""),
+            &s(&["connection pool"])
+        ));
+        // Short single term requires exact word match.
+        assert!(!item_matches_exclusion(
+            &mk("t", "db2 only", "", ""),
+            &s(&["db"])
+        ));
+        assert!(item_matches_exclusion(
+            &mk("t", "db only", "", ""),
+            &s(&["db"])
+        ));
+    }
+
+    #[test]
+    fn active_items_rank_above_superseded_even_past_ref_and_phrase_hits() {
+        let ts = "2026-10-25T10:00:00+00:00";
+        let mut old_sup = item(
+            "m_sup",
+            "a",
+            "R6 deploy rule",
+            "R6 deploy rule",
+            "executed",
+            ts,
+        );
+        old_sup.refs = "R6".into();
+        old_sup.status = "superseded".into();
+        old_sup.superseded_by = Some("m_act".into());
+
+        let mut retired = item(
+            "m_ret",
+            "a",
+            "R6 deploy rule",
+            "R6 deploy rule",
+            "executed",
+            ts,
+        );
+        retired.refs = "R6".into();
+        retired.status = "superseded".into();
+
+        let active = item("m_act", "a", "deploy note", "generic body", "derived", ts);
+
+        let b = bias(&DEFAULT_BIAS);
+        let o = ScoreOpts {
+            now_epoch: Some(parse_as_of_epoch(Some(ts)).unwrap()),
+            ..opts(&b)
+        };
+        let scored = score_candidates(
+            &[
+                cand(old_sup, -10.0, None),
+                cand(retired, -10.0, None),
+                cand(active, -0.5, None),
+            ],
+            "R6 deploy rule",
+            &o,
+        )
+        .unwrap();
+        assert_eq!(scored[0].item.id, "m_act");
+        assert_eq!(scored[0].item.status, "active");
+        assert!(scored[1..].iter().all(|s| s.item.status == "superseded"));
+    }
+
+    #[test]
+    fn word_matches_snake_case_and_alias_explain_terms() {
+        let ts = "2026-10-25T10:00:00+00:00";
+        // snake_case query term matches exact, extended snake_case, and space-separated tokens.
+        for body in [
+            "uses foo_bar here",
+            "uses foo_bar_baz here",
+            "uses foo bar here",
+        ] {
+            let it = item("m_1", "a", "note", body, "derived", ts);
+            let b = bias(&["recency"]);
+            let why = score_candidates(&[cand(it, -1.0, None)], "foo_bar", &opts(&b))
+                .unwrap()
+                .remove(0)
+                .why;
+            assert_eq!(why.terms_matched, vec!["foo_bar"], "{body}");
+            assert!(why.terms_missing.is_empty(), "{body}");
+        }
+        // Partial snake_case sub-part missing does not match; all-underscore does not match vacuously.
+        let partial = item("m_p", "a", "note", "uses foo only", "derived", ts);
+        assert!(!word_matches("foo_bar", &haystack_words(&partial)));
+        assert!(!word_matches("___", &haystack_words(&partial)));
+
+        // Alias-aware explain_terms: k8s -> kubernetes, db -> [sqlite, fts5], queue lag -> queue-worker.
+        let aliases: Aliases = vec![
+            (
+                "k8s".into(),
+                crate::py::value::PyValue::Str("kubernetes".into()),
+            ),
+            (
+                "db".into(),
+                crate::py::value::PyValue::List(vec![
+                    crate::py::value::PyValue::Str("sqlite".into()),
+                    crate::py::value::PyValue::Str("fts5".into()),
+                ]),
+            ),
+            (
+                "queue lag".into(),
+                crate::py::value::PyValue::Str("queue-worker".into()),
+            ),
+        ];
+        let b = bias(&["recency"]);
+        let o = ScoreOpts {
+            aliases: Some(&aliases),
+            ..opts(&b)
+        };
+        let k8s_item = item(
+            "m_k",
+            "a",
+            "kubernetes deploy",
+            "sqlite cluster",
+            "derived",
+            ts,
+        );
+        let why = score_candidates(&[cand(k8s_item, -1.0, None)], "k8s db deploy", &o)
+            .unwrap()
+            .remove(0)
+            .why;
+        assert_eq!(why.terms_matched, vec!["k8s", "db", "deploy"]);
+        assert!(why.terms_missing.is_empty());
+
+        // Multi-word alias: "queue" alone does NOT falsely satisfy "lag"; "queue-worker" does.
+        let q_only = item("m_q", "a", "queue tuning", "queue settings", "derived", ts);
+        let why_q = score_candidates(&[cand(q_only, -1.0, None)], "queue lag", &o)
+            .unwrap()
+            .remove(0)
+            .why;
+        assert_eq!(why_q.terms_matched, vec!["queue"]);
+        assert_eq!(why_q.terms_missing, vec!["lag"]);
+
+        let q_worker = item(
+            "m_qw",
+            "a",
+            "queue-worker",
+            "handles retries",
+            "derived",
+            ts,
+        );
+        let why_qw = score_candidates(&[cand(q_worker, -1.0, None)], "queue lag", &o)
+            .unwrap()
+            .remove(0)
+            .why;
+        assert_eq!(why_qw.terms_matched, vec!["queue", "lag"]);
+        assert!(why_qw.terms_missing.is_empty());
     }
 }

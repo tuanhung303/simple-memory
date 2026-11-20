@@ -294,7 +294,9 @@ PY
         "$repo/README.md" \
         "$repo/npm/simple-memory/bin/sm.js" \
         "$repo/npm/simple-memory/lib/platform.js" \
-        "$repo/npm/simple-memory/scripts/postinstall.js"
+        "$repo/npm/simple-memory/lib/update.js" \
+        "$repo/npm/simple-memory/scripts/postinstall.js" \
+        "$repo/npm/simple-memory/scripts/check-update.js"
     do
         if [[ ! -f "$required_file" ]]; then
             echo "stage_npm.sh: missing required file: $required_file" >&2
@@ -328,7 +330,9 @@ EOF
     cp "$repo/npm/simple-memory/bin/sm.js" "$main_dir/bin/sm.js"
     chmod 0755 "$main_dir/bin/sm.js"
     cp "$repo/npm/simple-memory/lib/platform.js" "$main_dir/lib/platform.js"
+    cp "$repo/npm/simple-memory/lib/update.js" "$main_dir/lib/update.js"
     cp "$repo/npm/simple-memory/scripts/postinstall.js" "$main_dir/scripts/postinstall.js"
+    cp "$repo/npm/simple-memory/scripts/check-update.js" "$main_dir/scripts/check-update.js"
     cp "$repo/LICENSE" "$main_dir/LICENSE"
     cp "$repo/README.md" "$main_dir/README.md"
 
@@ -394,7 +398,9 @@ MAIN_REQUIRED = {
     "package/package.json",
     "package/bin/sm.js",
     "package/lib/platform.js",
+    "package/lib/update.js",
     "package/scripts/postinstall.js",
+    "package/scripts/check-update.js",
     "package/LICENSE",
     "package/README.md",
 }

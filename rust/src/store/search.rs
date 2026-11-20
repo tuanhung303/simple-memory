@@ -9,7 +9,8 @@ use crate::core::fold::{fold, has_accents};
 use crate::core::item::{Item, parse_as_of_epoch};
 use crate::core::rank::{
     BIASED_CANDIDATE_LIMIT, Candidate, FTS_CANDIDATE_LIMIT, ScoreOpts, Scored, WEIGHT_BODY,
-    WEIGHT_REFS, WEIGHT_TAGS, WEIGHT_TITLE, bias_widens_pool, score_candidates,
+    WEIGHT_REFS, WEIGHT_TAGS, WEIGHT_TITLE, bias_widens_pool, item_matches_exclusion,
+    parse_query_exclusions, score_candidates,
 };
 use crate::core::refs::{RefsArg, extract_refs, split_refs};
 use crate::core::terms::build_fts_query;
@@ -440,27 +441,33 @@ pub struct SearchOpts<'a> {
     pub scope_biases: &'a [(String, Vec<String>)],
 }
 
-/// (unranked candidates, query refs, the pool cap when an index filled it).
-type Gathered = (Vec<Candidate>, Vec<String>, Option<i64>);
+/// (unranked candidates, query refs, the pool cap when an index filled it, positive query).
+type Gathered = (Vec<Candidate>, Vec<String>, Option<i64>, String);
 
-/// `_gather`: (unranked candidates, query refs, the pool cap when an index filled it, else None).
+/// `_gather`: (unranked candidates, query refs, the pool cap when an index filled it, else None,
+/// and the positive query after stripping exclusions and standalone uppercase boolean noise).
 fn gather(
     conn: &Connection,
     query: &str,
     f: &Filters,
     o: &SearchOpts,
 ) -> Result<Gathered, SmError> {
-    let mut query_refs = extract_refs(Some(query));
-    let q_clean = crate::py::str::strip(query);
-    if !q_clean.is_empty() && !q_clean.contains(' ') && !query_refs.iter().any(|r| r == q_clean) {
+    let (positive_query, excluded) = parse_query_exclusions(query);
+    let q_clean = crate::py::str::strip(&positive_query);
+    if q_clean.is_empty() {
+        return Ok((Vec::new(), Vec::new(), None, positive_query));
+    }
+    let mut query_refs = extract_refs(Some(&positive_query));
+    if !q_clean.contains(' ') && !query_refs.iter().any(|r| r == q_clean) {
         query_refs.push(q_clean.to_string());
     }
     let mut candidates: Vec<Candidate> = Vec::new();
     let mut cap = FTS_CANDIDATE_LIMIT;
+    let mut full = false;
     if o.recent {
-        let fold_q_and = build_fts_query(Some(query), o.aliases, true, "AND")?;
-        let raw_q_and = if has_accents(Some(query)) {
-            build_fts_query(Some(query), o.aliases, false, "AND")?
+        let fold_q_and = build_fts_query(Some(&positive_query), o.aliases, true, "AND")?;
+        let raw_q_and = if has_accents(Some(&positive_query)) {
+            build_fts_query(Some(&positive_query), o.aliases, false, "AND")?
         } else {
             String::new()
         };
@@ -471,16 +478,22 @@ fn gather(
             ..Default::default()
         };
         candidates = search_candidates(conn, &q, f)?;
+        full = candidates.iter().filter(|c| c.fold_bm25.is_some()).count() as i64 >= cap;
+        if !excluded.is_empty() {
+            candidates.retain(|c| !item_matches_exclusion(&c.item, &excluded));
+        }
     }
     if candidates.is_empty() {
-        cap = if (bias_widens_pool(o.bias) || !o.scope_biases.is_empty()) && !o.recent {
+        cap = if (bias_widens_pool(o.bias) || !o.scope_biases.is_empty() || !excluded.is_empty())
+            && !o.recent
+        {
             BIASED_CANDIDATE_LIMIT
         } else {
             FTS_CANDIDATE_LIMIT
         };
-        let fold_q = build_fts_query(Some(query), o.aliases, true, "OR")?;
-        let raw_q = if has_accents(Some(query)) {
-            build_fts_query(Some(query), o.aliases, false, "OR")?
+        let fold_q = build_fts_query(Some(&positive_query), o.aliases, true, "OR")?;
+        let raw_q = if has_accents(Some(&positive_query)) {
+            build_fts_query(Some(&positive_query), o.aliases, false, "OR")?
         } else {
             String::new()
         };
@@ -492,10 +505,13 @@ fn gather(
             by_date: o.recent,
         };
         candidates = search_candidates(conn, &q, f)?;
+        // each accented-index match also matches the folded index, so the folded count decides
+        full = candidates.iter().filter(|c| c.fold_bm25.is_some()).count() as i64 >= cap;
+        if !excluded.is_empty() {
+            candidates.retain(|c| !item_matches_exclusion(&c.item, &excluded));
+        }
     }
-    // each accented-index match also matches the folded index, so the folded count decides
-    let full = candidates.iter().filter(|c| c.fold_bm25.is_some()).count() as i64 >= cap;
-    Ok((candidates, query_refs, full.then_some(cap)))
+    Ok((candidates, query_refs, full.then_some(cap), positive_query))
 }
 
 fn score_opts<'a>(
@@ -512,6 +528,7 @@ fn score_opts<'a>(
         bias: o.bias,
         scope_biases: o.scope_biases,
         explain,
+        aliases: o.aliases,
     }
 }
 
@@ -524,8 +541,12 @@ pub fn search_scored(
     o: &SearchOpts,
     explain: Option<i64>,
 ) -> Result<(Vec<Scored>, Option<i64>), SmError> {
-    let (candidates, query_refs, cap) = gather(conn, query, f, o)?;
-    let scored = score_candidates(&candidates, query, &score_opts(&query_refs, f, o, explain))?;
+    let (candidates, query_refs, cap, positive_query) = gather(conn, query, f, o)?;
+    let scored = score_candidates(
+        &candidates,
+        &positive_query,
+        &score_opts(&query_refs, f, o, explain),
+    )?;
     Ok((scored, cap))
 }
 
@@ -537,11 +558,15 @@ pub fn search_pool(
     f: &Filters,
     o: &SearchOpts,
 ) -> Result<(Vec<Item>, Option<i64>), SmError> {
-    let (candidates, query_refs, cap) = gather(conn, query, f, o)?;
+    let (candidates, query_refs, cap, positive_query) = gather(conn, query, f, o)?;
     if !o.recent && cap.is_none_or(|c| candidates.len() as i64 <= c) {
         return Ok((candidates.into_iter().map(|c| c.item).collect(), cap));
     }
-    let scored = score_candidates(&candidates, query, &score_opts(&query_refs, f, o, Some(0)))?;
+    let scored = score_candidates(
+        &candidates,
+        &positive_query,
+        &score_opts(&query_refs, f, o, Some(0)),
+    )?;
     let items: Vec<Item> = scored.into_iter().map(|s| s.item).collect();
     Ok(match cap {
         Some(c) if c != 0 => (head(items, c), cap),
@@ -644,6 +669,30 @@ pub fn list_items(
         .map_err(sql_err)?;
     let items = rows.collect::<Result<Vec<_>, _>>().map_err(sql_err)?;
     Ok(ListResult { items, total })
+}
+
+/// Counts of items matching `f` in repos other than `exclude_repo`, ordered by count descending
+/// then repo name ascending, capped at `limit`.
+pub fn list_other_repos(
+    conn: &Connection,
+    f: &Filters,
+    exclude_repo: &str,
+    limit: usize,
+) -> Result<Vec<(String, i64)>, SmError> {
+    let (where_i, mut params) = build_item_filters("i", f);
+    params.push(text(exclude_repo));
+    params.push(Sql::Integer(limit as i64));
+    check_params(&params)?;
+    let sql = format!(
+        "SELECT i.repo, COUNT(*) FROM items i WHERE ({where_i}) AND i.repo != ? GROUP BY i.repo ORDER BY 2 DESC, 1 LIMIT ?"
+    );
+    let mut stmt = conn.prepare(&sql).map_err(sql_err)?;
+    let rows = stmt
+        .query_map(rusqlite::params_from_iter(params), |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+        })
+        .map_err(sql_err)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(sql_err)
 }
 
 /// `ids_matching`: the ids among `ids` whose folded text matches fts_query.
@@ -1441,5 +1490,21 @@ mod tests {
         )
         .unwrap();
         assert_eq!(ids(&ret_page.items), ["m_ret"]);
+    }
+
+    #[test]
+    fn recent_with_exclusion_falls_back_to_or_when_and_match_is_excluded() {
+        let c = store();
+        put(&c, "m_and_excl", "r", "alpha beta staging", "x", &[]);
+        put(&c, "m_or_keep", "r", "alpha only", "x", &[]);
+        let b = bias();
+        let o = SearchOpts {
+            recent: true,
+            aliases: None,
+            bias: &b,
+            scope_biases: &[],
+        };
+        let got = search(&c, "alpha beta -staging", &Filters::default(), &o, 5).unwrap();
+        assert_eq!(ids(&got), ["m_or_keep"]);
     }
 }

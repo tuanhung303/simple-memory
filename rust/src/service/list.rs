@@ -8,9 +8,11 @@ use crate::core::rank::match_snippet;
 use crate::core::tags::{retired_label, validate_kind, validate_tag};
 use crate::error::SmError;
 use crate::py;
-use crate::service::query::{JSON_SNIPPET_CHARS, StrList, item_text, item_tokens, split_list};
+use crate::service::query::{
+    JSON_SNIPPET_CHARS, MAX_OTHER_REPOS, StrList, item_text, item_tokens, split_list,
+};
 use crate::store::connect::connect;
-use crate::store::search::{Filters, StatusFilter, list_items};
+use crate::store::search::{Filters, StatusFilter, list_items, list_other_repos};
 
 pub const DEFAULT_LIST_LIMIT: i64 = 20;
 
@@ -63,6 +65,7 @@ pub struct ListPage {
     pub repo: Option<String>,
     pub all_repos: bool,
     pub scopes: Vec<String>,
+    pub other_repos: Vec<(String, i64)>,
 }
 
 /// List items matching `a`, ordered newest `sm_epoch(as_of)` first (`NULL` last), ties by `id DESC`.
@@ -125,6 +128,23 @@ pub fn run_list(a: &ListArgs) -> Result<ListPage, SmError> {
 
     let conn = connect(get_db_path(a.home)?.as_str(), None)?;
     let res = list_items(&conn, &filters, a.limit, a.offset)?;
+    let other_repos = if res.total == 0
+        && !all_repos
+        && in_paths.is_empty()
+        && let Some(cur_repo) = resolved.as_deref()
+    {
+        let other_filters = Filters {
+            repo: None,
+            include_all_repos: true,
+            exact_repo: false,
+            scope: None,
+            extra_scope: None,
+            ..filters
+        };
+        list_other_repos(&conn, &other_filters, cur_repo, MAX_OTHER_REPOS)?
+    } else {
+        Vec::new()
+    };
     Ok(ListPage {
         items: res.items,
         total: res.total,
@@ -134,6 +154,7 @@ pub fn run_list(a: &ListArgs) -> Result<ListPage, SmError> {
         repo: resolved,
         all_repos,
         scopes: in_paths,
+        other_repos,
     })
 }
 

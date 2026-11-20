@@ -203,7 +203,7 @@ fn in_works_with_kind_tag_bias_recent_and_brief() {
     );
     assert_eq!(code, 0);
     assert!(
-        out.starts_with("[m_ini] #1 fact derived 2026-10-25"),
+        out.starts_with("[m_ini] #1 misc fact derived 2026-10-25"),
         "{out}"
     );
 }
@@ -340,17 +340,12 @@ fn footer_commands_carry_in() {
     );
 }
 
-/// `--in` searches every repo, so a `--repo` beside it adds no "other repos" count to the
-/// `more:` footer (review U1 row 4: the case where `--all` and `--in` differ).
+/// `--in` searches every repo, so it adds no "other repos" count to the `more:` footer;
+/// combining `--in` with `--repo` exits 2 rather than silently ignoring `--repo`.
 #[test]
-fn in_with_repo_has_no_other_repos_in_the_footer() {
+fn in_has_no_other_repos_and_rejects_repo_combination() {
     let (_d, home) = fixture();
-    let (code, out, err) = sm(
-        &home,
-        &[
-            "query", "kiwi", "--in", "acme", "--repo", "misc", "--limit", "1",
-        ],
-    );
+    let (code, out, err) = sm(&home, &["query", "kiwi", "--in", "acme", "--limit", "1"]);
     assert_eq!(code, 0, "{err}");
     let more: Vec<&str> = out.lines().filter(|l| l.starts_with("more:")).collect();
     // the 5 active acme items (fixture doc), 1 shown
@@ -359,6 +354,14 @@ fn in_with_repo_has_no_other_repos_in_the_footer() {
         ["more: 4 beyond --limit 1 -> sm query \"kiwi\" --in acme --limit 5"],
         "{out}"
     );
+    let (code, out, err) = sm(
+        &home,
+        &[
+            "query", "kiwi", "--in", "acme", "--repo", "misc", "--limit", "1",
+        ],
+    );
+    assert_eq!(code, 2, "expected exit 2, got out={out:?} err={err:?}");
+    assert!(err.contains("--in") && err.contains("--repo"), "{err}");
 }
 
 #[test]

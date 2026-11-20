@@ -3,9 +3,23 @@
 
 const { spawn } = require("node:child_process");
 const os = require("node:os");
+const path = require("node:path");
 const { resolveBinary } = require("../lib/platform");
+const { maybeNotifyAndRefresh } = require("../lib/update");
+const { version: PACKAGE_VERSION } = require("../package.json");
 
 const FORWARDED_SIGNALS = ["SIGINT", "SIGTERM", "SIGHUP"];
+
+function spawnUpdateCheck(cachePath) {
+  const scriptPath = path.resolve(__dirname, "..", "scripts", "check-update.js");
+  const checker = spawn(process.execPath, [scriptPath, cachePath], {
+    detached: true,
+    stdio: "ignore",
+    env: process.env,
+  });
+  checker.on("error", () => {});
+  checker.unref();
+}
 
 const resolved = resolveBinary();
 if (!resolved.ok) {
@@ -16,7 +30,11 @@ if (!resolved.ok) {
   process.exit(1);
 }
 
-const child = spawn(resolved.path, process.argv.slice(2), { stdio: "inherit" });
+const argv = process.argv.slice(2);
+const child = spawn(resolved.path, argv, {
+  stdio: "inherit",
+  env: { ...process.env, SM_INSTALL_METHOD: "npm" },
+});
 
 const handlers = new Map();
 for (const sig of FORWARDED_SIGNALS) {
@@ -60,5 +78,13 @@ child.on("exit", (code, signal) => {
     const sigNum = os.constants.signals[signal] || 1;
     process.exit(128 + sigNum);
   }
+  maybeNotifyAndRefresh({
+    argv,
+    env: process.env,
+    currentVersion: PACKAGE_VERSION,
+    isStderrTTY: Boolean(process.stderr.isTTY),
+    stderr: process.stderr,
+    spawnRefresh: spawnUpdateCheck,
+  });
   process.exit(code === null ? 1 : code);
 });
