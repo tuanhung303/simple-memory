@@ -59,11 +59,12 @@ pub fn parse_tasklog_file(path: &str) -> Result<Item, SmError> {
     let text = p.read_text(Errors::Strict)?;
     let data = match safe_load(&text) {
         Ok(v) => v,
-        Err(e) if e.is_yaml_error() => {
+        // the loader reads text already in memory, so each of its errors (a YAML error, an
+        // impossible date, a value nested too deep) is a fault of this one file, not of the import
+        Err(e) => {
             let msg = split(&e.message).join(" ");
             return Err(SmError::value(format!("Malformed YAML in {p}: {msg}")));
         }
-        Err(e) => return Err(SmError::from_python(e.class, e.message)),
     };
     let PyValue::Dict(data) = data else {
         return Err(SmError::type_(format!(
@@ -210,8 +211,15 @@ mod tests {
         let parse = |yaml: String| {
             parse_tasklog_file(&write(d.path(), "r/docs/tasklog/a.yaml", yaml.as_bytes()))
         };
-        let parse_msg = "ValueError: Exceeds the limit (4300 digits) for integer string conversion: value has 4301 digits; \
-                         use sys.set_int_max_str_digits() to increase the limit";
+        // the loader's error is malformed YAML for the file
+        let a = std::fs::canonicalize(d.path())
+            .unwrap()
+            .join("r/docs/tasklog/a.yaml");
+        let parse_msg = format!(
+            "ValueError: Malformed YAML in {}: Exceeds the limit (4300 digits) for integer string conversion: value has 4301 digits; \
+             use sys.set_int_max_str_digits() to increase the limit",
+            a.display()
+        );
         let str_msg = "ValueError: Exceeds the limit (4300 digits) for integer string conversion; use sys.set_int_max_str_digits() to increase the limit";
         assert_eq!(
             parse(format!("id: x\ntitle: {}\n", "9".repeat(4301)))
@@ -379,12 +387,16 @@ mod tests {
     #[test]
     fn errors_keep_their_python_class() {
         let d = tempfile::tempdir_in(crate::sources::TEST_TMP).unwrap();
-        let e = parse_tasklog_file(&write(d.path(), "m.yaml", b"id: m\nas_of: 2026-13-01\n"))
-            .unwrap_err();
+        let m = write(d.path(), "m.yaml", b"id: m\nas_of: 2026-13-01\n");
+        let e = parse_tasklog_file(&m).unwrap_err();
+        let m = std::fs::canonicalize(&m).unwrap();
         assert_eq!(
             e.python_text(),
-            "ValueError: month must be in 1..12, not 13",
-            "a datetime ValueError is not wrapped"
+            format!(
+                "ValueError: Malformed YAML in {}: month must be in 1..12, not 13",
+                m.display()
+            ),
+            "a datetime ValueError of the loader is malformed YAML for the file"
         );
         let e = parse_tasklog_file(&write(
             d.path(),

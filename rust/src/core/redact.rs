@@ -182,13 +182,18 @@ static SECRET_PATTERNS: LazyLock<Vec<(&'static str, Matcher)>> = LazyLock::new(|
         ("bearer", word(&format!("Bearer[{s_inner}]+[A-Za-z0-9._~+/=-]{{8,}}"))),
         // `scheme://user:password@`, the user may be empty. A `/` in the password is taken only
         // where the text cannot be `host:port/path`: the user holds no `.`, the password holds no
-        // `:`, and its text before the first `/` is not empty and not all digits
+        // `:`, and its text before the first `/` is not empty and not all digits. No guard before
+        // the scheme: in `DB_postgres://` or `2redis://` the scheme starts after the word char,
+        // and all after `://` is the same from any start in the scheme
         (
             "url_credentials",
-            word(&format!(
-                "[A-Za-z][A-Za-z0-9+.-]*://(?:{u}*:[^{s_inner}/@\"']+@|[^{s_inner}/:@\"'.]*:{u}*[^{s_inner}/:@\"'0-9]{u}*(?:/{u}*)+@)",
-                u = format!("[^{s_inner}/:@\"']"),
-            )),
+            Matcher::Plain(
+                Regex::new(&format!(
+                    "[A-Za-z][A-Za-z0-9+.-]*://(?:{u}*:[^{s_inner}/@\"']+@|[^{s_inner}/:@\"'.]*:{u}*[^{s_inner}/:@\"'0-9]{u}*(?:/{u}*)+@)",
+                    u = format!("[^{s_inner}/:@\"']"),
+                ))
+                .expect("redact pattern compiles"),
+            ),
         ),
         ("azure_sas", word("sig=[A-Za-z0-9%+/=_-]{16,}")),
         // before key_value, whose `Token=` value would run to the end of the URL
@@ -291,9 +296,16 @@ fn kv_value(t: &str, w: usize) -> Option<usize> {
     if digits > 0 && !char_at(t, d_end).is_some_and(is_v) {
         return None;
     }
-    let (end, n) = run(t, w, is_v);
+    let (mut end, n) = run(t, w, is_v);
     if n < 8 {
         return None;
+    }
+    // a marker an earlier pattern left in the value (V holds no `]`): the value goes on past its
+    // `]`, so the marker and the rest of the value go with it
+    let mut from = w;
+    while t.as_bytes().get(end) == Some(&b']') && t[from..end].contains("[REDACTED:") {
+        from = end + 1;
+        end = run(t, from, is_v).0;
     }
     // V holds no quote, so the greedy run is followed by the optional quote or by nothing
     Some(end + usize::from(matches!(t.as_bytes().get(end), Some(b'"' | b'\''))))
@@ -408,6 +420,17 @@ fn key_value_find(t: &str, pos: usize) -> Option<(usize, usize)> {
 /// GCS query-string signing): each span from `Signature`. The URL is the run of non-space chars;
 /// each run is read once, so the cost is linear in the text.
 fn query_signature_spans(re: &Regex, t: &str) -> Vec<(usize, usize)> {
+    signature_spans_with(t, |url, from| {
+        re.find_at(url, from).map(|m| (m.start(), m.end()))
+    })
+}
+
+/// `query_signature_spans` with `find(url, from)`, the first `Signature=value` in `url` at or
+/// after `from`, as its search.
+fn signature_spans_with(
+    t: &str,
+    mut find: impl FnMut(&str, usize) -> Option<(usize, usize)>,
+) -> Vec<(usize, usize)> {
     let mut out = Vec::new();
     let mut i = 0;
     while i < t.len() {
@@ -416,14 +439,14 @@ fn query_signature_spans(re: &Regex, t: &str) -> Vec<(usize, usize)> {
         let url = &t[start..end];
         if url.contains("AWSAccessKeyId=") || url.contains("GoogleAccessId=") {
             let mut from = 0;
-            while let Some(m) = re.find_at(url, from) {
-                if matches!(url[..m.start()].bytes().next_back(), Some(b'?' | b'&')) {
-                    out.push((start + m.start(), start + m.end()));
-                    from = m.end();
-                } else {
-                    // `S` is one byte
-                    from = m.start() + 1;
+            while let Some((ms, me)) = find(url, from) {
+                if matches!(url[..ms].bytes().next_back(), Some(b'?' | b'&')) {
+                    out.push((start + ms, start + me));
                 }
+                // after a refused match too: one that starts inside it, or at its end, needs a
+                // `?` or `&` just before it, and every byte of it is `Signature=` or the value
+                // class, which hold neither
+                from = me;
             }
         }
         i = end;
@@ -861,6 +884,79 @@ mod tests {
         assert!(took < std::time::Duration::from_secs(2), "took {took:?}");
     }
 
+    fn signature_re() -> &'static Regex {
+        SECRET_PATTERNS
+            .iter()
+            .find_map(|(_, m)| match m {
+                Matcher::QuerySignature(re) => Some(re),
+                _ => None,
+            })
+            .expect("a query signature pattern")
+    }
+
+    /// Spans from Python 3.15.1 `(?<=[?&])Signature=[A-Za-z0-9%+/=_-]{16,}` finditer on each run
+    /// (each run holds an access id): after `?`, after `&`, refused after `=` and after `x`, two
+    /// in one run, and one that ends the text.
+    #[test]
+    fn query_signature_spans_after_a_separator_only() {
+        let cases: [(&str, &[(usize, usize)]); 5] = [
+            (
+                "u?Signature=AbCdEf1234567890abcd&AWSAccessKeyId=k",
+                &[(2, 32)],
+            ),
+            (
+                "u?AWSAccessKeyId=k&Signature=AbCdEf1234567890abcd&e=1",
+                &[(19, 49)],
+            ),
+            (
+                "u?AWSAccessKeyId=Signature=AbCdEf1234567890abcd&xSignature=AbCdEf1234567890abcd",
+                &[],
+            ),
+            (
+                "u?AWSAccessKeyId=k&Signature=AAAAAAAAAAAAAAAAAAAA&Signature=BBBBBBBBBBBBBBBBBBBB",
+                &[(19, 49), (50, 80)],
+            ),
+            (
+                "see u?GoogleAccessId=k&Signature=AbCdEf1234567890abcd",
+                &[(23, 53)],
+            ),
+        ];
+        for (t, want) in cases {
+            assert_eq!(query_signature_spans(signature_re(), t), want, "{t}");
+        }
+    }
+
+    /// The bytes the searches read, at least: from each search start to its match end, or to
+    /// the end of the run when nothing matches.
+    fn signature_scan_work(t: &str) -> usize {
+        let re = signature_re();
+        let mut work = 0;
+        signature_spans_with(t, |url, from| {
+            let m = re.find_at(url, from).map(|m| (m.start(), m.end()));
+            work += m.map_or(url.len(), |(_, e)| e) - from;
+            m
+        });
+        work
+    }
+
+    /// One run of `AWSAccessKeyId=Signature=` with no space: every candidate is refused (`=`
+    /// before it) and its greedy value runs to the end of the run. The searches must read each
+    /// byte a bounded number of times, so 4 times the text is under 5 times the work.
+    #[test]
+    fn refused_query_signatures_in_one_run_are_read_once() {
+        let unit = "AWSAccessKeyId=Signature=";
+        let n = unit.repeat(400);
+        let n4 = unit.repeat(1600);
+        assert!(query_signature_spans(signature_re(), &n4).is_empty());
+        let (w, w4) = (signature_scan_work(&n), signature_scan_work(&n4));
+        assert!(
+            w <= 2 * n.len() && w4 < 5 * w,
+            "work {w} at {} bytes, {w4} at {} bytes",
+            n.len(),
+            n4.len()
+        );
+    }
+
     #[test]
     fn s3_and_gcs_signed_url_signatures_and_tokens() {
         let r = |t: &str| redact_text(t, None, None);
@@ -1066,6 +1162,71 @@ mod tests {
                 "{raw}"
             );
         }
+    }
+
+    #[test]
+    fn url_credentials_after_a_word_char() {
+        let cases = [
+            (
+                "DB_postgres://bob:Hunter2-example@db.example.com/app",
+                "DB_[REDACTED:url_credentials]db.example.com/app",
+            ),
+            (
+                "x_redis://:Hunter2-example@cache.example.com",
+                "x_[REDACTED:url_credentials]cache.example.com",
+            ),
+            (
+                "2postgres://bob:Hunter2-example@db.example.com",
+                "2[REDACTED:url_credentials]db.example.com",
+            ),
+            (
+                "url=éredis://:Hunter2-example@cache.example.com",
+                "url=é[REDACTED:url_credentials]cache.example.com",
+            ),
+        ];
+        for (raw, want) in cases {
+            assert_eq!(
+                counted(raw),
+                (want.to_string(), counts(&[("url_credentials", 1)])),
+                "{raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_key_value_holding_url_credentials_after_a_word_char_is_one_marker() {
+        // url_credentials runs first and leaves its marker inside the value; key_value then
+        // takes the value to its end, the marker with it
+        for raw in [
+            "password=x_postgres://bob:Hunter2-example@db.example.com",
+            "secret=x_redis://:Hunter2-example@cache.example.com",
+            "api_key=1postgres://bob:Hunter2-example@db.example.com",
+        ] {
+            assert_eq!(
+                counted(raw),
+                (
+                    "[REDACTED:key_value]".to_string(),
+                    counts(&[("url_credentials", 1), ("key_value", 1)])
+                ),
+                "{raw}"
+            );
+        }
+        let two = "token=x_postgres://bob:Hunter2-example@db.example.com/x_redis://:Hunter2-example@c.example.com";
+        assert_eq!(
+            counted(two),
+            (
+                "[REDACTED:key_value]".to_string(),
+                counts(&[("url_credentials", 2), ("key_value", 1)])
+            )
+        );
+        // a `]` with no marker before it in the value still ends the value
+        assert_eq!(
+            counted("list=[password=Hunter2-example]"),
+            (
+                "list=[[REDACTED:key_value]]".to_string(),
+                counts(&[("key_value", 1)])
+            )
+        );
     }
 
     #[test]

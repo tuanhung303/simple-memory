@@ -81,11 +81,22 @@ fn iterate(target: &PyValue) -> Result<Vec<&PyValue>, SmError> {
 /// `expand_aliases(query, aliases)`. A str target is one expansion; any other target is
 /// iterated and each member goes through `str()`.
 pub fn expand_aliases(query: &str, aliases: Option<&Aliases>) -> Result<Vec<String>, SmError> {
+    Ok(matched_aliases(query, aliases)?
+        .into_iter()
+        .flat_map(|(_, targets)| targets)
+        .collect())
+}
+
+/// Each alias key the query names, in config order: (the stripped key, its expansions).
+fn matched_aliases(
+    query: &str,
+    aliases: Option<&Aliases>,
+) -> Result<Vec<(String, Vec<String>)>, SmError> {
     let Some(aliases) = aliases.filter(|a| !query.is_empty() && !a.is_empty()) else {
         return Ok(Vec::new());
     };
     let q_folded = fold(Some(query));
-    let mut expansions = Vec::new();
+    let mut matched = Vec::new();
     for (key, target) in aliases {
         let key_clean = py::str::strip(key);
         if key_clean.is_empty() {
@@ -94,21 +105,22 @@ pub fn expand_aliases(query: &str, aliases: Option<&Aliases>) -> Result<Vec<Stri
         if search_word_literal(key_clean, query, true)
             || search_word_literal(&fold(Some(key_clean)), &q_folded, true)
         {
-            if let PyValue::Str(s) = target {
-                expansions.push(s.clone());
-                continue;
-            }
-            if let PyValue::Bytes(b) = target {
-                expansions.extend(b.iter().map(u8::to_string));
-                continue;
-            }
-            for x in iterate(target)? {
-                x.str_digits_ok()?;
-                expansions.push(x.py_str());
-            }
+            let expansions = match target {
+                PyValue::Str(s) => vec![s.clone()],
+                PyValue::Bytes(b) => b.iter().map(u8::to_string).collect(),
+                _ => {
+                    let mut out = Vec::new();
+                    for x in iterate(target)? {
+                        x.str_digits_ok()?;
+                        out.push(x.py_str());
+                    }
+                    out
+                }
+            };
+            matched.push((key_clean.to_string(), expansions));
         }
     }
-    Ok(expansions)
+    Ok(matched)
 }
 
 /// `quote_fts_term(word)`: an ASCII word of 4+ letters becomes a prefix term.
@@ -146,34 +158,13 @@ fn upper(s: &str) -> String {
     s.chars().flat_map(char::to_uppercase).collect()
 }
 
-/// `build_fts_query(query, aliases, fold_terms=..., operator=...)`.
-pub fn build_fts_query(
-    query: Option<&str>,
-    aliases: Option<&Aliases>,
-    fold_terms: bool,
-    operator: &str,
-) -> Result<String, SmError> {
-    let Some(query) = query.filter(|q| !q.is_empty()) else {
-        return Ok(String::new());
-    };
-    let is_and = upper(py::str::strip(operator)) == "AND";
-    let extra = if is_and {
-        Vec::new()
-    } else {
-        expand_aliases(query, aliases)?
-    };
-    let full_text = if extra.is_empty() {
-        query.to_string()
-    } else {
-        std::iter::once(query.to_string())
-            .chain(extra)
-            .collect::<Vec<_>>()
-            .join(" ")
-    };
+/// The quoted FTS terms of `text`, first occurrence kept: folded, or with `fold_terms` false
+/// only the lowercased words that differ from their fold.
+fn fts_terms(text: &str, fold_terms: bool) -> Vec<String> {
     let processed = if fold_terms {
-        fold(Some(&full_text))
+        fold(Some(text))
     } else {
-        py::str::lower(&full_text)
+        py::str::lower(text)
     };
     let mut words = word_runs(&processed);
     if !fold_terms {
@@ -187,7 +178,94 @@ pub fn build_fts_query(
             quoted.push(term);
         }
     }
-    Ok(quoted.join(if is_and { " AND " } else { " OR " }))
+    quoted
+}
+
+/// `a`, or `(a AND b ...)` for two or more terms.
+fn and_alternative(terms: &[String]) -> String {
+    match terms {
+        [one] => one.clone(),
+        _ => format!("({})", terms.join(" AND ")),
+    }
+}
+
+/// The AND form of the folded `terms`: each alias key the query names whose terms are all in
+/// `terms` becomes one group `(key OR target 1 OR ...)` at the place of its first term.
+fn and_with_alias_groups(
+    query: &str,
+    aliases: Option<&Aliases>,
+    terms: Vec<String>,
+) -> Result<String, SmError> {
+    // (key terms, group text)
+    let mut groups: Vec<(Vec<String>, String)> = Vec::new();
+    for (key, targets) in matched_aliases(query, aliases)? {
+        let key_terms = fts_terms(&key, true);
+        if !key_terms.iter().all(|t| terms.contains(t)) {
+            continue;
+        }
+        let mut alts = vec![and_alternative(&key_terms)];
+        for target in targets {
+            let alt_terms = fts_terms(&target, true);
+            if alt_terms.is_empty() {
+                continue;
+            }
+            let alt = and_alternative(&alt_terms);
+            if !alts.contains(&alt) {
+                alts.push(alt);
+            }
+        }
+        if alts.len() > 1 {
+            groups.push((key_terms, format!("({})", alts.join(" OR "))));
+        }
+    }
+    let mut parts: Vec<String> = Vec::new();
+    for term in terms {
+        let mut grouped = false;
+        for (key_terms, text) in &groups {
+            if key_terms.contains(&term) {
+                grouped = true;
+                if !parts.contains(text) {
+                    parts.push(text.clone());
+                }
+            }
+        }
+        if !grouped {
+            parts.push(term);
+        }
+    }
+    Ok(parts.join(" AND "))
+}
+
+/// `build_fts_query(query, aliases, fold_terms=..., operator=...)`. The OR form adds every
+/// alias target's words; the folded AND form puts each named alias key in one OR group with its
+/// targets. The accent AND form takes no alias: its rows only add to the folded AND rows.
+pub fn build_fts_query(
+    query: Option<&str>,
+    aliases: Option<&Aliases>,
+    fold_terms: bool,
+    operator: &str,
+) -> Result<String, SmError> {
+    let Some(query) = query.filter(|q| !q.is_empty()) else {
+        return Ok(String::new());
+    };
+    if upper(py::str::strip(operator)) == "AND" {
+        let terms = fts_terms(query, fold_terms);
+        return if fold_terms {
+            and_with_alias_groups(query, aliases, terms)
+        } else {
+            Ok(terms.join(" AND "))
+        };
+    }
+    let extra = expand_aliases(query, aliases)?;
+    let full_text = if extra.is_empty() {
+        query.to_string()
+    } else {
+        std::iter::once(query.to_string())
+            .chain(extra)
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    Ok(fts_terms(&full_text, fold_terms).join(" OR "))
 }
 
 /// A JSON object of aliases in Python's form (`py::json::protocol_value` of each target).
@@ -245,7 +323,11 @@ mod tests {
         );
         assert_eq!(
             build_fts_query(Some("R5 queue lag"), Some(&a), true, "AND").unwrap(),
-            "\"r5\" AND \"queue\"* AND \"lag\""
+            "\"r5\" AND ((\"queue\"* AND \"lag\") OR (\"queue\"* AND \"worker\"*))"
+        );
+        assert_eq!(
+            build_fts_query(Some("R5 lag queue"), Some(&a), true, "AND").unwrap(),
+            "\"r5\" AND \"lag\" AND \"queue\"*"
         );
         assert_eq!(
             build_fts_query(
@@ -267,6 +349,74 @@ mod tests {
         assert_eq!(
             build_fts_query(Some("a b"), None, true, "ａｎｄ").unwrap(),
             "\"a\" OR \"b\""
+        );
+    }
+
+    #[test]
+    fn and_form_puts_each_named_alias_key_in_one_or_group() {
+        let and = |q: &str, json: &str| build_fts_query(Some(q), Some(&al(json)), true, "AND");
+        let k8s = r#"{"k8s": "kubernetes"}"#;
+        assert_eq!(
+            and("k8s deployq", k8s).unwrap(),
+            "(\"k8s\" OR \"kubernetes\"*) AND \"deployq\"*"
+        );
+        assert_eq!(
+            and("teams poll statusq", r#"{"teams poll": "ops-monitor"}"#).unwrap(),
+            "((\"teams\"* AND \"poll\"*) OR (\"ops\" AND \"monitor\"*)) AND \"statusq\"*"
+        );
+        // the group stands where the key's first word stands; a list gives one alternative each
+        assert_eq!(
+            and("lock on DB", r#"{"db": ["sqlite", "fts5", "sqlite"]}"#).unwrap(),
+            "\"lock\"* AND \"on\" AND (\"db\" OR \"sqlite\"* OR \"fts5\")"
+        );
+        // two keys with the same words give one group; a query word already a target stays
+        assert_eq!(
+            and(
+                "K8S kubernetes x",
+                r#"{"k8s": "kubernetes", "K8S": "kubernetes"}"#
+            )
+            .unwrap(),
+            "(\"k8s\" OR \"kubernetes\"*) AND \"kubernetes\"* AND \"x\""
+        );
+        // no alias named, a target equal to the key, an empty target or a key with no word:
+        // no group, the AND form of the query words alone
+        assert_eq!(and("deployq x", k8s).unwrap(), "\"deployq\"* AND \"x\"");
+        assert_eq!(
+            and("k8s x", r#"{"k8s": "K8S"}"#).unwrap(),
+            "\"k8s\" AND \"x\""
+        );
+        assert_eq!(
+            and("k8s x", r#"{"k8s": ["", "++"]}"#).unwrap(),
+            "\"k8s\" AND \"x\""
+        );
+        assert_eq!(
+            and("c ++ d", r#"{"++": "plus"}"#).unwrap(),
+            "\"c\" AND \"d\""
+        );
+        // σ matches ς only under IGNORECASE, so the key's "σ" is no query term: no group, as
+        // every item the query words find must stay found
+        assert_eq!(
+            and("\u{3c2} x", r#"{"σ x": "tgt"}"#).unwrap(),
+            "\"\u{3c2}\" AND \"x\""
+        );
+        // the accent form keeps no alias; the OR form does not change
+        let accent = al(r#"{"k8s": "kubé"}"#);
+        assert_eq!(
+            build_fts_query(Some("café k8s"), Some(&accent), false, "AND").unwrap(),
+            "\"café\""
+        );
+        assert_eq!(
+            build_fts_query(Some("café k8s"), Some(&accent), false, "OR").unwrap(),
+            "\"café\" OR \"kubé\""
+        );
+        assert_eq!(
+            build_fts_query(Some("k8s deployq"), Some(&al(k8s)), true, "OR").unwrap(),
+            "\"k8s\" OR \"deployq\"* OR \"kubernetes\"*"
+        );
+        // a target Python cannot iterate fails as the OR form fails
+        assert_eq!(
+            and("k8s x", r#"{"k8s": 5}"#).unwrap_err().python_text(),
+            "TypeError: 'int' object is not iterable"
         );
     }
 

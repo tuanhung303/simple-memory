@@ -9,7 +9,7 @@
 use crate::py::str::repr as repr_str;
 use crate::py::value::{Date, DateTime, PyValue, days_in_month};
 use regex::Regex;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::sync::LazyLock;
 
@@ -24,7 +24,8 @@ pub struct LoadError {
 }
 
 impl LoadError {
-    /// True for `yaml.YAMLError` subclasses, the errors sm's `except yaml.YAMLError` catches.
+    /// True for `yaml.YAMLError` subclasses; the tests tell them from Python's other classes.
+    #[cfg(test)]
     pub fn is_yaml_error(&self) -> bool {
         matches!(
             self.class,
@@ -2354,6 +2355,25 @@ const MAX_COMPOSE_DEPTH: usize = 492;
 /// difference: no task log or auto-memory file holds an anchor).
 const MAX_VALUE_DEPTH: usize = 1000;
 
+/// How much one document's aliases may copy, in nodes plus scalar bytes. This port copies an
+/// aliased value at each use where Python shares it, so a few hundred bytes of aliases 9 wide
+/// and 7 deep stand for 9^8 strings (gigabytes). Only a copy counts: a value built a second time
+/// by `materialize`, with the bytes of its strings, and a mapping pair a merge key copies from a
+/// mapping it merged before. An alias-free document builds each node once and merges each
+/// mapping once, so it copies nothing. Measured on a release build: a task log just under the
+/// budget (672,588 copied nulls) imports at 111 MB of peak RSS, and the chain of 997 nested
+/// aliases in the tests (about 498,000 copies) still loads.
+const MAX_ALIAS_COPIES: usize = 750_000;
+
+fn too_many_copies() -> Fail {
+    py_err(
+        "ConstructorError",
+        format!(
+            "YAML document expands to too many nodes (its aliases copy more than {MAX_ALIAS_COPIES} nodes and scalar bytes)"
+        ),
+    )
+}
+
 struct Composer {
     p: Parser,
     anchors: HashMap<String, usize>,
@@ -2626,6 +2646,25 @@ struct Ctor<'a> {
     objs: Vec<Obj>,
     built: HashMap<usize, usize>,
     queue: VecDeque<(usize, usize, Fill)>,
+    /// The mappings a merge key has copied pairs from.
+    merged: Vec<bool>,
+    /// The nodes `scalar_text` has read.
+    read: Vec<bool>,
+    /// What the aliases may still copy (`MAX_ALIAS_COPIES`).
+    left: usize,
+}
+
+/// `materialize`'s state: the objects being built above the current one, the objects built
+/// once, and the copies left.
+struct Walk {
+    on_path: Vec<bool>,
+    built: Vec<bool>,
+    left: usize,
+}
+
+fn spend(left: &mut usize, n: usize) -> R<()> {
+    *left = left.checked_sub(n).ok_or_else(too_many_copies)?;
+    Ok(())
 }
 
 fn ctor_err(context_mark: Option<Mark>, problem: String, mark: Mark) -> Fail {
@@ -2635,18 +2674,27 @@ fn ctor_err(context_mark: Option<Mark>, problem: String, mark: Mark) -> Fail {
 
 /// PyYAML `BaseConstructor.construct_document` with `SafeConstructor`'s constructors.
 pub(crate) fn construct_document(nodes: &mut [Node], root: usize) -> R<PyValue> {
+    let merged = vec![false; nodes.len()];
+    let nodes_len = nodes.len();
     let mut c = Ctor {
         nodes,
         objs: Vec::new(),
         built: HashMap::new(),
         queue: VecDeque::new(),
+        merged,
+        read: vec![false; nodes_len],
+        left: MAX_ALIAS_COPIES,
     };
     let top = c.construct_object(root)?;
     while let Some((node, obj, fill)) = c.queue.pop_front() {
         c.fill(node, obj, fill)?;
     }
-    let mut on_path = vec![false; c.objs.len()];
-    c.materialize(top, 0, &mut on_path)
+    let mut walk = Walk {
+        on_path: vec![false; c.objs.len()],
+        built: vec![false; c.objs.len()],
+        left: c.left,
+    };
+    c.materialize(top, 0, false, &mut walk)
 }
 
 impl Ctor<'_> {
@@ -2690,15 +2738,37 @@ impl Ctor<'_> {
     }
 
     /// `SafeConstructor.construct_scalar`: a mapping node stands for the value of its `=` key.
-    fn scalar_text(&self, id: usize) -> R<String> {
-        let node = &self.nodes[id];
-        if let NodeKind::Map(pairs) = &node.kind {
-            for &(k, v) in pairs {
-                if self.nodes[k].tag == VALUE {
-                    return self.scalar_text(v);
-                }
+    /// Python recurses down the `=` keys; a chain that leads back to a mapping on it recurses
+    /// until RecursionError, which no caller catches, so here it is a YAML error at that
+    /// mapping. A longer chain than `MAX_VALUE_DEPTH` (only aliases make one) is RecursionError,
+    /// as for a value. A node that a `=` key reads again is a copy (`spend_read`).
+    fn scalar_text(&mut self, id: usize) -> R<String> {
+        let mut at = id;
+        let mut on_chain: HashSet<usize> = HashSet::from([id]);
+        while let NodeKind::Map(pairs) = &self.nodes[at].kind {
+            let Some(&(_, v)) = pairs.iter().find(|&&(k, _)| self.nodes[k].tag == VALUE) else {
+                break;
+            };
+            if on_chain.contains(&v) {
+                return Err(marked(
+                    "ConstructorError",
+                    None,
+                    None,
+                    "found a value key that leads back to its own mapping".into(),
+                    self.nodes[v].start,
+                ));
             }
+            if on_chain.len() == MAX_VALUE_DEPTH {
+                return Err(py_err(
+                    "RecursionError",
+                    "maximum recursion depth exceeded".into(),
+                ));
+            }
+            on_chain.insert(v);
+            self.spend_read(v)?;
+            at = v;
         }
+        let node = &self.nodes[at];
         match &node.kind {
             NodeKind::Scalar(s) => Ok(s.clone()),
             _ => Err(marked(
@@ -2709,6 +2779,19 @@ impl Ctor<'_> {
                 node.start,
             )),
         }
+    }
+
+    /// A `=` key reads node `id`: a copy of the node and its scalar bytes when a `=` key read it
+    /// before (only an alias lets two keys reach one node).
+    fn spend_read(&mut self, id: usize) -> R<()> {
+        if std::mem::replace(&mut self.read[id], true) {
+            let len = match &self.nodes[id].kind {
+                NodeKind::Scalar(s) => s.len(),
+                _ => 0,
+            };
+            spend(&mut self.left, 1 + len)?;
+        }
+        Ok(())
     }
 
     fn construct_scalar_tag(&mut self, id: usize, tag: &str) -> R<PyValue> {
@@ -2772,6 +2855,7 @@ impl Ctor<'_> {
                 match self.nodes[v].kind.clone() {
                     NodeKind::Map(_) => {
                         self.flatten_mapping(v)?;
+                        self.spend_merge(v)?;
                         if let NodeKind::Map(p) = &self.nodes[v].kind {
                             merge.extend(p.iter().copied());
                         }
@@ -2790,6 +2874,7 @@ impl Ctor<'_> {
                                 ));
                             }
                             self.flatten_mapping(sub)?;
+                            self.spend_merge(sub)?;
                             if let NodeKind::Map(p) = &self.nodes[sub].kind {
                                 submerge.push(p.clone());
                             }
@@ -2821,6 +2906,16 @@ impl Ctor<'_> {
         {
             merge.append(pairs);
             *pairs = merge;
+        }
+        Ok(())
+    }
+
+    /// A merge key copies the pairs of mapping `id`: a copy when `id` was merged before.
+    fn spend_merge(&mut self, id: usize) -> R<()> {
+        if std::mem::replace(&mut self.merged[id], true)
+            && let NodeKind::Map(p) = &self.nodes[id].kind
+        {
+            spend(&mut self.left, p.len())?;
         }
         Ok(())
     }
@@ -2945,10 +3040,21 @@ impl Ctor<'_> {
         Ok(())
     }
 
-    /// The value of object `o` at nesting `depth`; `on_path[o]` marks the objects being built
-    /// above it, so an alias back into one of them is a cycle.
-    fn materialize(&self, o: usize, depth: usize, on_path: &mut [bool]) -> R<PyValue> {
-        if on_path[o] {
+    /// The value of object `o` at nesting `depth`; `w.on_path[o]` marks the objects being built
+    /// above it, so an alias back into one of them is a cycle. Under `copy`, or when `o` was
+    /// built before, each value built is a copy and spends one, and its scalar bytes, from
+    /// `w.left`.
+    fn materialize(&self, o: usize, depth: usize, copy: bool, w: &mut Walk) -> R<PyValue> {
+        let copy = copy || w.built[o];
+        if copy {
+            let bytes = match &self.objs[o] {
+                Obj::Val(PyValue::Str(s) | PyValue::Int(s)) => s.len(),
+                Obj::Val(PyValue::Bytes(b)) => b.len(),
+                _ => 0,
+            };
+            spend(&mut w.left, 1 + bytes)?;
+        }
+        if w.on_path[o] {
             return Ok(PyValue::Cycle(match self.objs[o] {
                 Obj::Dict(_) => "{...}",
                 _ => "[...]",
@@ -2960,20 +3066,21 @@ impl Ctor<'_> {
                 "maximum recursion depth exceeded".into(),
             ));
         }
-        on_path[o] = true;
+        w.on_path[o] = true;
+        w.built[o] = true;
         let d = depth + 1;
         let v = match &self.objs[o] {
             Obj::Val(v) => PyValue::clone(v),
             Obj::List(items) => PyValue::List(
                 items
                     .iter()
-                    .map(|&i| self.materialize(i, d, on_path))
+                    .map(|&i| self.materialize(i, d, copy, w))
                     .collect::<R<_>>()?,
             ),
             Obj::Set(items) => PyValue::Set(
                 items
                     .iter()
-                    .map(|&i| self.materialize(i, d, on_path))
+                    .map(|&i| self.materialize(i, d, copy, w))
                     .collect::<R<_>>()?,
             ),
             Obj::Dict(pairs) => PyValue::Dict(
@@ -2981,8 +3088,8 @@ impl Ctor<'_> {
                     .iter()
                     .map(|&(k, v)| {
                         Ok((
-                            self.materialize(k, d, on_path)?,
-                            self.materialize(v, d, on_path)?,
+                            self.materialize(k, d, copy, w)?,
+                            self.materialize(v, d, copy, w)?,
                         ))
                     })
                     .collect::<R<_>>()?,
@@ -2992,14 +3099,14 @@ impl Ctor<'_> {
                     .iter()
                     .map(|&(k, v)| {
                         Ok(PyValue::Tuple(vec![
-                            self.materialize(k, d, on_path)?,
-                            self.materialize(v, d, on_path)?,
+                            self.materialize(k, d, copy, w)?,
+                            self.materialize(v, d, copy, w)?,
                         ]))
                     })
                     .collect::<R<_>>()?,
             ),
         };
-        on_path[o] = false;
+        w.on_path[o] = false;
         Ok(v)
     }
 }
@@ -3511,6 +3618,242 @@ mod tests {
             assert_eq!(repr(&chain(998)), RECURSION);
             assert_eq!(repr(&chain(100_000)), RECURSION);
         });
+    }
+
+    /// `a` holds 9 strings and `b<i>` holds 9 aliases of the one before, so `b<d>` stands for
+    /// 9^(d+1) strings in a file of a few hundred bytes.
+    fn alias_bomb(d: usize) -> String {
+        let mut t = "id: 20261101-090500-bomb\ntitle: bomb\n".to_string();
+        t.push_str("a: &a [\"x\",\"x\",\"x\",\"x\",\"x\",\"x\",\"x\",\"x\",\"x\"]\n");
+        let mut prev = "a".to_string();
+        for i in 1..=d {
+            t.push_str(&format!(
+                "b{i}: &b{i} [{}]\n",
+                vec![format!("*{prev}"); 9].join(",")
+            ));
+            prev = format!("b{i}");
+        }
+        t.push_str(&format!("results:\n  - *{prev}\n"));
+        t
+    }
+
+    /// `m<i>` merges 9 aliases of `m<i-1>`, so the merge keys copy 3 x 9^d pairs.
+    fn merge_bomb(d: usize) -> String {
+        let mut t = "m0: &m0 {k1: x, k2: x, k3: x}\n".to_string();
+        for i in 1..=d {
+            let refs = vec![format!("*m{}", i - 1); 9].join(",");
+            t.push_str(&format!("m{i}: &m{i} {{<<: [{refs}]}}\n"));
+        }
+        t
+    }
+
+    /// `s` is a 10,000-char string and `c<i>` holds 9 aliases of the one before, so `c<d>`
+    /// stands for 9^d copies of it.
+    fn scalar_bomb(d: usize) -> String {
+        let mut t = format!("s: &c0 \"{}\"\n", "y".repeat(10_000));
+        for i in 1..=d {
+            let refs = vec![format!("*c{}", i - 1); 9].join(",");
+            t.push_str(&format!("c{i}: &c{i} [{refs}]\n"));
+        }
+        t
+    }
+
+    const TOO_MANY: &str = "ConstructorError: YAML document expands to too many nodes (its aliases copy more than 750000 nodes and scalar bytes)";
+
+    /// What the aliases copy, by hand: b<i> is 1 list and 9 copies of b<i-1>, a is 1 list and 9
+    /// one-byte strings (19 nodes and bytes), so the definition of b5 alone copies 1,129,311;
+    /// m6 copies 8 x 3 x 9^5 = 1,417,176 pairs; c2 copies 9 x (1 + 9 x 10,001) = 810,090.
+    #[test]
+    fn alias_expansion_past_the_budget_is_a_yaml_error() {
+        let bomb = alias_bomb(5);
+        assert_eq!(bomb.len(), 319);
+        let e = safe_load(&bomb).unwrap_err();
+        assert_eq!(format!("{}: {}", e.class, e.message), TOO_MANY);
+        assert!(e.is_yaml_error());
+        assert_eq!(repr(&merge_bomb(6)), TOO_MANY);
+        assert_eq!(repr(&scalar_bomb(4)), TOO_MANY);
+    }
+
+    /// The 411-byte file (9^8 strings, gigabytes before the budget) and the 10,000-char string
+    /// fanned out 9 wide over 5 levels (590 MB of copies) stop at the budget.
+    #[test]
+    fn alias_bombs_too_large_to_build_stop_at_the_budget() {
+        let bomb = alias_bomb(7);
+        assert_eq!(bomb.len(), 411);
+        assert_eq!(repr(&bomb), TOO_MANY);
+        assert_eq!(repr(&scalar_bomb(5)), TOO_MANY);
+    }
+
+    /// PyYAML 6.0.3 gives each value. An alias-free document copies nothing, however many nodes
+    /// it builds (800,001 strings) or merge keys copy (920,160 pairs over 480 nested merges).
+    #[test]
+    fn anchors_used_a_few_times_and_alias_free_documents_load_under_the_budget() {
+        assert_eq!(
+            repr("a: &l [1, 2, 3, 4, 5]\nb: *l\nc: *l\n"),
+            "{'a': [1, 2, 3, 4, 5], 'b': [1, 2, 3, 4, 5], 'c': [1, 2, 3, 4, 5]}"
+        );
+        assert_eq!(
+            repr("base: &b {x: 1, y: 2}\nm1: {<<: *b, z: 3}\nm2: {<<: *b}\n"),
+            "{'base': {'x': 1, 'y': 2}, 'm1': {'x': 1, 'y': 2, 'z': 3}, 'm2': {'x': 1, 'y': 2}}"
+        );
+        assert_eq!(
+            repr(&merge_bomb(2)),
+            "{'m0': {'k1': 'x', 'k2': 'x', 'k3': 'x'}, 'm1': {'k1': 'x', 'k2': 'x', 'k3': 'x'}, 'm2': {'k1': 'x', 'k2': 'x', 'k3': 'x'}}"
+        );
+        let PyValue::List(items) = safe_load(&format!("[{}x]", "x,".repeat(800_000))).unwrap()
+        else {
+            panic!("a list")
+        };
+        assert_eq!(items.len(), 800_001);
+        let mut nested = "{a0: 1}".to_string();
+        for j in 1..=480 {
+            let keys: Vec<String> = (0..8).map(|k| format!("a{j}_{k}: 1")).collect();
+            nested = format!("{{<<: {nested}, {}}}", keys.join(", "));
+        }
+        let text = format!("x: {nested}\n");
+        assert_eq!(text.len(), 44_267);
+        let PyValue::Dict(top) = safe_load(&text).unwrap() else {
+            panic!("a mapping")
+        };
+        let PyValue::Dict(x) = &top[0].1 else {
+            panic!("x is a mapping")
+        };
+        let keys: Vec<String> = x.iter().map(|(k, _)| k.py_repr()).collect();
+        assert_eq!(keys.len(), 3841);
+        assert_eq!(
+            (keys[0].as_str(), keys[1].as_str(), keys[3840].as_str()),
+            ("'a0'", "'a1_0'", "'a480_7'")
+        );
+    }
+
+    /// `s` is a string of `n` chars and each of `lines` list items reads it through a `=` value
+    /// key under `tag`, so each item copies it.
+    fn value_key_bomb(tag: &str, text: &str, lines: usize) -> String {
+        format!(
+            "s: &s \"{text}\"\nresults:\n{}",
+            format!("  - {tag} {{=: *s}}\n").repeat(lines)
+        )
+    }
+
+    /// 1,000 reads of a 2,000-char string through `=` copy 1,000 x 2,001 nodes and bytes, past
+    /// the budget, as the same copies through plain aliases are.
+    #[test]
+    fn value_key_copies_of_an_aliased_string_spend_the_budget() {
+        let refused = |text: &str| {
+            let got = repr(text);
+            assert!(got == TOO_MANY, "{}", &got[..got.len().min(120)]);
+        };
+        let y = "y".repeat(2000);
+        refused(&value_key_bomb("!!str", &y, 1000));
+        refused(&value_key_bomb("!!binary", &"QUJD".repeat(500), 1000));
+        refused(&format!(
+            "s: &s \"{y}\"\nresults:\n{}",
+            "  - *s\n".repeat(1000)
+        ));
+    }
+
+    /// PyYAML 6.0.3 gives each value: a few reads through `=` load, and 70,000 `=` keys with no
+    /// alias copy nothing.
+    #[test]
+    fn value_keys_read_a_few_times_or_with_no_alias_load() {
+        assert_eq!(
+            repr(&value_key_bomb("!!str", "abc", 3)),
+            "{'s': 'abc', 'results': ['abc', 'abc', 'abc']}"
+        );
+        assert_eq!(
+            repr(&value_key_bomb("!!binary", "QUJD", 2)),
+            "{'s': 'QUJD', 'results': [b'ABC', b'ABC']}"
+        );
+        let v = "a".repeat(20);
+        let PyValue::Dict(top) = safe_load(&format!(
+            "r:\n{}",
+            format!("- !!str {{=: {v}}}\n").repeat(70_000)
+        ))
+        .unwrap() else {
+            panic!("a mapping")
+        };
+        let PyValue::List(items) = &top[0].1 else {
+            panic!("a list")
+        };
+        assert_eq!(items.len(), 70_000);
+        assert_eq!(items[69_999].py_repr(), format!("'{v}'"));
+    }
+
+    /// A `=` value key whose value leads back to its own mapping, under each scalar tag: PyYAML
+    /// 6.0.3 recurses until RecursionError; here it is a YAML error at the mapping it returns to.
+    #[test]
+    fn a_value_key_that_leads_back_to_its_mapping_is_a_yaml_error() {
+        let back = |at: &str| {
+            format!(
+                "ConstructorError: found a value key that leads back to its own mapping\n  in \"<unicode string>\", line 1, column {at}"
+            )
+        };
+        for (text, col) in [
+            ("v: !!str &a {=: *a}", "4"),
+            ("v: !!int &a {=: *a}", "4"),
+            ("v: !!timestamp &a {=: *a}", "4"),
+            ("v: !!bool &a {=: *a}", "4"),
+            ("v: !!str &a {=: {=: *a}}", "4"),
+            ("v: [x, !!str &a {=: *a}]", "8"),
+        ] {
+            let got = repr(text);
+            assert!(got.starts_with(&back(col)), "{text}: {got}");
+            assert!(safe_load(text).unwrap_err().is_yaml_error());
+        }
+        // a value key that leads to a scalar still gives that scalar
+        assert_eq!(repr("v: !!int &a {=: {=: '7'}}"), "{'v': 7}");
+        // a chain of value keys through aliases, none of them back: PyYAML gives 'x' for each
+        // of 900 and RecursionError for 1001
+        let chain = |n: usize| {
+            let mut t = "a0: !!str &a0 {=: x}\n".to_string();
+            for i in 1..n {
+                t.push_str(&format!("a{i}: !!str &a{i} {{=: *a{}}}\n", i - 1));
+            }
+            t
+        };
+        let PyValue::Dict(top) = safe_load(&chain(900)).unwrap() else {
+            panic!("a mapping")
+        };
+        assert_eq!(
+            (top.len(), top[899].0.py_repr(), top[899].1.py_repr()),
+            (900, "'a899'".to_string(), "'x'".to_string())
+        );
+        assert_eq!(repr(&chain(1001)), RECURSION);
+    }
+
+    /// Other values that hold themselves load as PyYAML 6.0.3 loads them, or fail with its
+    /// error.
+    #[test]
+    fn values_that_hold_themselves_load_as_pyyaml_does() {
+        for (text, want) in [
+            ("v: &a [*a]", "{'v': [[...]]}"),
+            ("v: &a {k: *a}", "{'v': {'k': {...}}}"),
+            ("v: &a {<<: *a, k: 1}", "{'v': {'k': 1}}"),
+            ("v: &a {<<: [*a], k: 1}", "{'v': {'k': 1}}"),
+            (
+                "v: &a {x: {<<: *a}, k: 1}",
+                "{'v': {'x': {'x': {...}, 'k': 1}, 'k': 1}}",
+            ),
+            (
+                "v: &a {<<: {<<: *a, j: 2}, k: 1}",
+                "{'v': {'k': 1, 'j': 2}}",
+            ),
+            ("v: !!omap &a [{k: *a}]", "{'v': [('k', [...])]}"),
+            (
+                "v: &a [{k: *a, j: [*a]}]",
+                "{'v': [{'k': [...], 'j': [[...]]}]}",
+            ),
+        ] {
+            assert_eq!(repr(text), want, "{text}");
+        }
+        for text in ["v: &a {*a: 1}", "v: !!set &a {*a}"] {
+            let e = safe_load(text).unwrap_err();
+            assert_eq!(
+                (e.class, e.message.lines().nth(1)),
+                ("ConstructorError", Some("found unhashable key")),
+                "{text}"
+            );
+        }
     }
 
     /// Python 3.15.1: `v: 1:1:...:1.5` with n parts (`yaml.safe_load(...)['v']`).

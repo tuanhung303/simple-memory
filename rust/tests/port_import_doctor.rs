@@ -2287,3 +2287,249 @@ fn cli_import_and_put_store_redacted_text() {
     );
     assert!(!shown_put.contains("secret plan"), "{shown_put}");
 }
+
+// ---------------------------------------------------------------- alias expansion
+
+/// A task log and an auto-memory front matter whose aliases nest 9 wide and `depth` deep
+/// (`b<i>` holds 9 aliases of `b<i-1>`), each next to a normal file.
+fn alias_bomb_lines(depth: usize) -> String {
+    let mut t = "a: &a [\"x\",\"x\",\"x\",\"x\",\"x\",\"x\",\"x\",\"x\",\"x\"]\n".to_string();
+    let mut prev = "a".to_string();
+    for i in 1..=depth {
+        t.push_str(&format!(
+            "b{i}: &b{i} [{}]\n",
+            vec![format!("*{prev}"); 9].join(",")
+        ));
+        prev = format!("b{i}");
+    }
+    t.push_str(&format!("results:\n  - *{prev}\n"));
+    t
+}
+
+const TOO_MANY: &str = "YAML document expands to too many nodes (its aliases copy more than 750000 nodes and scalar bytes)";
+
+/// `sm <args>` as `common::sm` runs it, killed after `secs`: a run past the limit fails the
+/// test instead of hanging the test run.
+fn sm_within(home: &Path, args: &[&str], secs: u64) -> (i32, String, String) {
+    use std::io::Read;
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_sm"))
+        .args(args)
+        .env("HOME", home.parent().unwrap())
+        .env("SIMPLE_MEMORY_HOME", home)
+        .env_remove("SM_PARITY_NOW")
+        .env_remove("SM_PARITY_SEED")
+        .env_remove("SM_PARITY_TRACE")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn sm");
+    let started = std::time::Instant::now();
+    let status = loop {
+        if let Some(st) = child.try_wait().unwrap() {
+            break st;
+        }
+        if started.elapsed() > std::time::Duration::from_secs(secs) {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("sm {args:?} ran past {secs} s");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    let (mut out, mut err) = (String::new(), String::new());
+    child
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut out)
+        .unwrap();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut err)
+        .unwrap();
+    (status.code().unwrap_or(-1), out, err)
+}
+
+/// A task log and an auto-memory note that hold `yaml`, each next to a normal file, are
+/// refused like any malformed YAML file: a one-line error for the file itself (`Malformed
+/// YAML in <path>: ` then `problem`), a row in `unreadable:` and a failed row in a catch-up,
+/// the normal task log stored; the auto-memory front matter falls back to its known keys line
+/// by line. Each command must end within 20 s.
+fn refused_yaml_and_the_next_file_imported(yaml: &str, problem: &str) {
+    let (_d, tmp) = tmpdir();
+    let home = tmp.join("home");
+    std::fs::create_dir_all(tmp.join(".claude/projects")).unwrap();
+    let repo = tmp.join("gh/r1");
+    std::fs::create_dir_all(&repo).unwrap();
+    common::git(&["init", "-q", repo.to_str().unwrap()]);
+    let day = repo.join("docs/tasklog/2026-11-01");
+    let bad = day.join("090500-bad.yaml");
+    write(
+        &bad,
+        &format!("id: 20261101-090500-bad\ntitle: bad\n{yaml}"),
+    );
+    write(
+        &day.join("090600-good.yaml"),
+        "id: 20261101-090600-good\ntitle: Good one\nstate: done\nas_of: 2026-11-01T09:06:00+00:00\nresults:\n  - normal result line\n",
+    );
+    let am = tmp.join("projects");
+    write(
+        &am.join("p-alpha/s1.jsonl"),
+        &format!("{}\n", json!({"cwd": repo.to_str().unwrap()})),
+    );
+    write(
+        &am.join("p-alpha/memory/bad-note.md"),
+        &format!(
+            "---\nname: bad-note\ndescription: Bad note\ntype: project\n{yaml}---\nbad body\n"
+        ),
+    );
+    write(
+        &am.join("p-alpha/memory/good-note.md"),
+        "---\nname: good-note\ndescription: Good note\ntype: project\n---\nnormal note body\n",
+    );
+    std::fs::create_dir_all(tmp.join("ho")).unwrap();
+    write(
+        &home.join("config.toml"),
+        &format!(
+            "[automemory]\nroot = \"{}\"\n[upkeep]\ntasklog_roots = [\"{}\"]\nhandoff_dirs = [\"{}\"]\n",
+            am.display(),
+            tmp.join("gh").display(),
+            tmp.join("ho").display()
+        ),
+    );
+
+    let (code, _, err) = sm_within(&home, &["import", "tasklog", bad.to_str().unwrap()], 20);
+    let msg = format!("Malformed YAML in {}: {problem}", bad.display());
+    assert_eq!(
+        (code, err.as_str()),
+        (1, format!("error: {msg}\n").as_str())
+    );
+
+    let (code, out, err) = sm_within(&home, &["doctor", "--imports"], 20);
+    assert_eq!((code, err.as_str()), (0, ""));
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(
+        lines[1],
+        "imports: tasklog_files=2 handoff_files=0 not_stored=1 unreadable=1 stored_tasks_without_file=0"
+    );
+    assert!(
+        lines[3].starts_with(&format!("unreadable: {}: Malformed YAML in", bad.display())),
+        "{}",
+        lines[3]
+    );
+
+    let (code, out, err) = sm_within(&home, &["import", "automemory"], 20);
+    assert_eq!((code, err.as_str()), (0, ""));
+    assert_eq!(
+        out.lines().next().unwrap(),
+        "import automemory (applied): files=2 added=2 updated=0 retired=0 unchanged=0 unreadable=0 unmapped=0 yaml_errors=1"
+    );
+
+    let (code, out, err) = sm_within(&home, &["import", "catch-up"], 20);
+    assert_eq!((code, err.as_str()), (0, ""));
+    assert!(
+        !out.contains("Traceback") && !out.contains("error"),
+        "{out}"
+    );
+    let rows = common::column(&home, "SELECT source FROM items ORDER BY source");
+    assert_eq!(
+        rows,
+        [
+            "automemory:p-alpha/bad-note.md",
+            "automemory:p-alpha/good-note.md",
+            "task:20261101-090600-good"
+        ]
+    );
+}
+
+#[test]
+fn alias_bomb_depth_5_is_refused_and_the_next_file_imported() {
+    refused_yaml_and_the_next_file_imported(&alias_bomb_lines(5), TOO_MANY);
+}
+
+#[test]
+fn alias_bomb_depth_7_is_refused_and_the_next_file_imported() {
+    refused_yaml_and_the_next_file_imported(&alias_bomb_lines(7), TOO_MANY);
+}
+
+/// A `=` value key whose value leads back to its own mapping (PyYAML 6.0.3 recurses until
+/// RecursionError, which no caller catches) is a YAML error at that mapping.
+#[test]
+fn a_value_key_that_leads_back_to_its_mapping_is_refused_and_the_next_file_imported() {
+    refused_yaml_and_the_next_file_imported(
+        "v: !!str &a {=: *a}\nresults:\n  - x\n",
+        "found a value key that leads back to its own mapping in \"<unicode string>\", line 3, column 4: v: !!str &a {=: *a} ^",
+    );
+}
+
+/// A value nested past the loader's depth limits ends in RecursionError, which PyYAML raises
+/// too; for one file it is malformed YAML, not the end of every import.
+#[test]
+fn a_value_nested_too_deep_is_refused_and_the_next_file_imported() {
+    let nest = format!(
+        "v: {}{}\nresults:\n  - x\n",
+        "[".repeat(492),
+        "]".repeat(492)
+    );
+    refused_yaml_and_the_next_file_imported(&nest, "maximum recursion depth exceeded");
+    let mut chain = "junk:\n- &a0 [x]\n".to_string();
+    for i in 1..998 {
+        chain.push_str(&format!("- &a{i} [*a{}]\n", i - 1));
+    }
+    chain.push_str("results:\n  - x\n");
+    refused_yaml_and_the_next_file_imported(&chain, "maximum recursion depth exceeded");
+}
+
+/// An impossible date or time is a ValueError of the loader (PyYAML 6.0.3 gives the same text);
+/// for one file it is malformed YAML, not the end of every import.
+#[test]
+fn an_impossible_date_or_time_is_refused_and_the_next_file_imported() {
+    for (value, problem) in [
+        ("2026-13-01", "month must be in 1..12, not 13"),
+        (
+            "2026-02-30",
+            "day 30 must be in range 1..28 for month 2 in year 2026",
+        ),
+        ("2026-11-01T25:00:00", "hour must be in 0..23, not 25"),
+    ] {
+        refused_yaml_and_the_next_file_imported(
+            &format!("when: {value}\nresults:\n  - x\n"),
+            problem,
+        );
+    }
+}
+
+// ---------------------------------------------------------------- URL credentials
+
+/// A scheme right after a letter, a digit or `_` still has its password redacted, through
+/// `sm put` and through a handoff import.
+#[test]
+fn url_credentials_after_a_word_char_are_redacted_by_put_and_handoff_import() {
+    let (_d, tmp) = tmpdir();
+    let home = tmp.join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let raw = "DB_postgres://bob:Hunter2-example@db.example.com/app x_redis://:Hunter2-example@cache.example.com 2postgres://bob:Hunter2-example@db.example.com";
+    let want = "DB_[REDACTED:url_credentials]db.example.com/app x_[REDACTED:url_credentials]cache.example.com 2[REDACTED:url_credentials]db.example.com";
+    let id = common::put(&home, &["--repo", "anvil", "--tag", "derived", raw]);
+    let h = tmp.join("handoffs/creds.md");
+    write(&h, &format!("# Creds\n## Done\n- {raw}\n"));
+    let (code, _, err) = sm(&home, &["import", "handoff", h.to_str().unwrap()]);
+    assert_eq!((code, err.as_str()), (0, ""));
+    let db = open(&home);
+    let put_body: String = db
+        .query_row("SELECT body FROM items WHERE id = ?1", [&id], |r| r.get(0))
+        .unwrap();
+    assert_eq!(put_body, want);
+    let handoff_body: String = db
+        .query_row(
+            "SELECT body FROM items WHERE source LIKE 'handoff:%'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(
+        handoff_body.contains(&format!("- {want}")) && !handoff_body.contains("Hunter2"),
+        "{handoff_body}"
+    );
+}

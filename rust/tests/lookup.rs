@@ -1326,3 +1326,211 @@ fn default_bias_favors_recency_durable_kinds_and_strong_evidence_and_respects_co
         bad.err
     );
 }
+
+/// A store where one-term rows fill the OR pool: 300 short `a` rows, 300 short `b` rows, then
+/// `long` rows (id, body, as_of) whose longer bodies rank them below every short row.
+fn alias_pool_case(aliases: &str, a: &str, b: &str, long: &[(String, String, &str)]) -> Cli {
+    let c = Cli::new();
+    std::fs::write(
+        c.dir.path().join("config.toml"),
+        format!("[keyword_aliases]\n{aliases}\n"),
+    )
+    .unwrap();
+    let conn = connect(&format!("{}/memory.db", c.dir.path().display()), None).unwrap();
+    let mut rows: Vec<(String, String, &str)> = Vec::new();
+    for i in 0..300 {
+        rows.push((
+            format!("m_sa{i:03}"),
+            format!("{a} n{i}x"),
+            "2026-05-01T00:00:00+00:00",
+        ));
+        rows.push((
+            format!("m_sb{i:03}"),
+            format!("{b} w{i}x"),
+            "2026-05-01T00:00:00+00:00",
+        ));
+    }
+    rows.extend(long.iter().cloned());
+    for (id, body, as_of) in &rows {
+        let mut it = Item::bare(id, "a", "fact", "", body, "derived");
+        it.as_of = (*as_of).to_string();
+        put_item(&conn, &it.post_init(), None).unwrap();
+    }
+    c
+}
+
+/// Long bodies: `n` items `<prefix><i>` holding `words` plus 60 filler words.
+fn long_rows(
+    prefix: &str,
+    words: &str,
+    n: usize,
+    as_of: &'static str,
+) -> Vec<(String, String, &'static str)> {
+    let fill: Vec<String> = (0..60).map(|j| format!("fill{j}")).collect();
+    (0..n)
+        .map(|i| {
+            (
+                format!("{prefix}{i}"),
+                format!("{words} {} t{i}x", fill.join(" ")),
+                as_of,
+            )
+        })
+        .collect()
+}
+
+fn found(c: &Cli, query: &str, extra: &[&str], want: &[String]) -> usize {
+    let mut a = vec!["query", "--all", "--limit", "1000", "--format", "json"];
+    a.extend(extra);
+    a.extend(["--", query]);
+    let v = c.ok(&a).json();
+    let ids: Vec<&str> = v["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["id"].as_str().unwrap())
+        .collect();
+    want.iter().filter(|w| ids.contains(&w.as_str())).count()
+}
+
+/// 5 newer items hold the alias target and the other word, 3 older ones hold the alias key.
+fn k8s_case() -> (Cli, Vec<String>) {
+    let mut long = long_rows(
+        "m_tgt",
+        "kubernetes deployq",
+        5,
+        "2026-11-01T00:00:00+00:00",
+    );
+    long.extend(long_rows(
+        "m_key",
+        "k8s deployq",
+        3,
+        "2026-01-01T00:00:00+00:00",
+    ));
+    let want: Vec<String> = (0..5).map(|i| format!("m_tgt{i}")).collect();
+    (
+        alias_pool_case("\"k8s\" = \"kubernetes\"", "deployq", "kubernetes", &long),
+        want,
+    )
+}
+
+#[test]
+fn query_naming_an_alias_keeps_every_item_with_the_target_and_the_other_word() {
+    // the OR pool fills with one-term rows; only the AND rows reach the long target items
+    let (c, want) = k8s_case();
+    assert_eq!(found(&c, "kubernetes deployq", &[], &want), 5);
+    assert_eq!(found(&c, "k8s deployq", &[], &want), 5);
+}
+
+#[test]
+fn recent_query_naming_an_alias_keeps_every_item_with_the_target_and_the_other_word() {
+    // --recent tries the AND form first; the alias key items alone must not end the search
+    let (c, want) = k8s_case();
+    assert_eq!(found(&c, "kubernetes deployq", &["--recent"], &want), 5);
+    assert_eq!(found(&c, "k8s deployq", &["--recent"], &want), 5);
+}
+
+#[test]
+fn multi_word_alias_key_and_target_keep_the_target_items_in_both_and_paths() {
+    let mut long = long_rows(
+        "m_tgt",
+        "ops-monitor statusq",
+        3,
+        "2026-11-01T00:00:00+00:00",
+    );
+    long.extend(long_rows(
+        "m_key",
+        "teams poll statusq",
+        2,
+        "2026-01-01T00:00:00+00:00",
+    ));
+    let c = alias_pool_case(
+        "\"teams poll\" = \"ops-monitor\"",
+        "statusq",
+        "ops-monitor",
+        &long,
+    );
+    let want: Vec<String> = (0..3).map(|i| format!("m_tgt{i}")).collect();
+    assert_eq!(found(&c, "ops-monitor statusq", &[], &want), 3);
+    assert_eq!(found(&c, "teams poll statusq", &[], &want), 3);
+    assert_eq!(found(&c, "teams poll statusq", &["--recent"], &want), 3);
+    // the key items stay: the group holds the key words too
+    let key: Vec<String> = (0..2).map(|i| format!("m_key{i}")).collect();
+    assert_eq!(found(&c, "teams poll statusq", &[], &key), 2);
+}
+
+fn recent_ids(c: &Cli, query: &str) -> Vec<String> {
+    let v = c
+        .ok(&[
+            "query", "--all", "--recent", "--limit", "10", "--format", "json", "--", query,
+        ])
+        .json();
+    v["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["id"].as_str().unwrap().to_string())
+        .collect()
+}
+
+#[test]
+fn recent_every_word_filter_takes_an_alias_target_only_as_a_whole() {
+    // m_part holds one word of the target, or the target's first word as its own word; the
+    // AND group matches none of the three, so --recent shows all three, newest first. Items
+    // that hold the key or the whole target with the other word are the only ones shown.
+    let cases = [
+        (
+            "\"k8s\" = \"kubernetes cluster\"",
+            "k8s deployq",
+            [
+                "cluster deployq notes",
+                "k8s upgrade plan",
+                "deployq runbook",
+            ],
+            ["kubernetes cluster deployq", "k8s deployq"],
+        ),
+        (
+            "\"teams poll\" = \"ops-monitor\"",
+            "teams poll statusq",
+            ["ops statusq", "teams poll setup", "statusq page"],
+            ["ops-monitor statusq", "teams poll statusq"],
+        ),
+    ];
+    for (aliases, query, partial, full) in cases {
+        let mut rows: Vec<(String, String, &str)> = vec![
+            (
+                "m_part".into(),
+                partial[0].into(),
+                "2026-11-03T00:00:00+00:00",
+            ),
+            (
+                "m_key".into(),
+                partial[1].into(),
+                "2026-11-02T00:00:00+00:00",
+            ),
+            (
+                "m_other".into(),
+                partial[2].into(),
+                "2026-11-01T00:00:00+00:00",
+            ),
+        ];
+        // the 600 pad rows hold no query word
+        let c = alias_pool_case(aliases, "padq", "padr", &rows);
+        assert_eq!(
+            recent_ids(&c, query),
+            ["m_part", "m_key", "m_other"],
+            "{aliases}"
+        );
+        rows.push((
+            "m_full0".into(),
+            full[0].into(),
+            "2026-10-20T00:00:00+00:00",
+        ));
+        rows.push((
+            "m_full1".into(),
+            full[1].into(),
+            "2026-10-10T00:00:00+00:00",
+        ));
+        let c = alias_pool_case(aliases, "padq", "padr", &rows);
+        assert_eq!(recent_ids(&c, query), ["m_full0", "m_full1"], "{aliases}");
+    }
+}

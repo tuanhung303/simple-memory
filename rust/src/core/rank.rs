@@ -460,12 +460,56 @@ pub fn is_legacy_unreorganized(item: &Item) -> bool {
     item.id.starts_with("legacy:") || item.source.starts_with("legacy:") || item.tag == "n/a"
 }
 
-fn item_matches_all_query_words(item: &Item, q_words: &[String]) -> bool {
+/// Each alias key the query names whose words are all query words, as the AND form's groups
+/// (`build_fts_query`): (the key's folded words, the folded words of each target).
+type AliasGroup = (Vec<String>, Vec<Vec<String>>);
+
+fn alias_word_groups(
+    query: &str,
+    aliases: Option<&Aliases>,
+    q_words: &[String],
+) -> Result<Vec<AliasGroup>, SmError> {
+    let mut groups = Vec::new();
+    for entry in aliases.into_iter().flatten() {
+        let exps = expand_aliases(query, Some(&vec![entry.clone()]))?;
+        let key_words: Vec<String> = word_runs(&fold(Some(py::str::strip(&entry.0))))
+            .into_iter()
+            .map(String::from)
+            .collect();
+        if !key_words.iter().all(|w| q_words.contains(w)) {
+            continue;
+        }
+        let targets: Vec<Vec<String>> = exps
+            .iter()
+            .map(|e| {
+                word_runs(&fold(Some(e)))
+                    .into_iter()
+                    .map(String::from)
+                    .collect::<Vec<_>>()
+            })
+            .filter(|t| !t.is_empty())
+            .collect();
+        groups.push((key_words, targets));
+    }
+    Ok(groups)
+}
+
+/// Whether `item` holds every query word; for the words an alias group covers, every key word
+/// or every word of one target, each word matched as its FTS term (a prefix for an ASCII word
+/// of 4+ letters).
+fn item_matches_all_query_words(item: &Item, q_words: &[String], groups: &[AliasGroup]) -> bool {
     if q_words.is_empty() {
         return true;
     }
     let haystack = haystack_words(item);
-    q_words.iter().all(|qw| word_matches_strict(qw, &haystack))
+    let holds = |words: &[String]| words.iter().all(|w| word_matches_strict(w, &haystack));
+    q_words
+        .iter()
+        .filter(|qw| !groups.iter().any(|(key, _)| key.contains(qw)))
+        .all(|qw| word_matches_strict(qw, &haystack))
+        && groups
+            .iter()
+            .all(|(key, targets)| holds(key) || targets.iter().any(|t| holds(t)))
 }
 
 /// Whether `item` matches any `[scopes]` matcher (exact parity with SQL `matcher_clauses` + `sm_word`).
@@ -520,9 +564,10 @@ pub fn score_candidates(
     let terms = query_terms(query);
     let alias_map = term_alias_targets(query, opts.aliases)?;
     if opts.recent {
+        let groups = alias_word_groups(query, opts.aliases, &terms)?;
         let all_matched: Vec<&Candidate> = candidates
             .iter()
-            .filter(|c| item_matches_all_query_words(&c.item, &terms))
+            .filter(|c| item_matches_all_query_words(&c.item, &terms, &groups))
             .collect();
         let pool: Vec<&Candidate> = if all_matched.is_empty() {
             candidates.iter().collect()
@@ -1322,6 +1367,148 @@ mod tests {
         .unwrap();
         assert_eq!(ids(&r), ["m_one_newer", "m_both_older"]);
         assert!(score_candidates(&[], "x", &o).unwrap().is_empty());
+
+        // an alias target word stands for the key word it covers; the item with neither goes
+        let aliases: Aliases = vec![(
+            "k8s".into(),
+            crate::py::value::PyValue::Str("kubernetes".into()),
+        )];
+        let o = ScoreOpts {
+            aliases: Some(&aliases),
+            ..o
+        };
+        let target = item(
+            "m_target",
+            "anvil",
+            "",
+            "kubernetes deployq",
+            "decided",
+            "2026-10-25T12:00:00+00:00",
+        );
+        let key = item(
+            "m_key",
+            "anvil",
+            "",
+            "k8s deployq",
+            "decided",
+            "2026-10-20T12:00:00+00:00",
+        );
+        let neither = item(
+            "m_neither",
+            "anvil",
+            "",
+            "deployq alone",
+            "decided",
+            "2026-10-26T12:00:00+00:00",
+        );
+        let r = rank_candidates(
+            &[
+                cand(key, -1.0, None),
+                cand(neither, -1.0, None),
+                cand(target, -1.0, None),
+            ],
+            "k8s deployq",
+            &o,
+        )
+        .unwrap();
+        assert_eq!(ids(&r), ["m_target", "m_key"]);
+    }
+
+    #[test]
+    fn recent_filter_takes_each_alias_target_as_a_whole_with_fts_prefix_rules() {
+        let b = bias(&[]);
+        let recent = |json: &str, query: &str, bodies: &[(&str, &str)]| {
+            let aliases: Aliases = serde_json::from_str::<serde_json::Value>(json)
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .iter()
+                .map(|(k, v)| (k.clone(), crate::py::json::protocol_value(v).unwrap()))
+                .collect();
+            let o = ScoreOpts {
+                recent: true,
+                aliases: Some(&aliases),
+                ..opts(&b)
+            };
+            // newest first in the order given
+            let cands: Vec<Candidate> = bodies
+                .iter()
+                .enumerate()
+                .map(|(i, (id, body))| {
+                    let as_of = epoch_to_as_of(NOW - i as f64 * DAY).unwrap();
+                    cand(item(id, "a", "", body, "derived", &as_of), -1.0, None)
+                })
+                .collect();
+            rank_candidates(&cands, query, &o)
+                .unwrap()
+                .into_iter()
+                .map(|i| i.id)
+                .collect::<Vec<_>>()
+        };
+        let k8s = r#"{"k8s": "kubernetes cluster", "db": ["sqlite", "fts5"]}"#;
+        // one word of a two-word target is no match; 4+ letter ASCII words match as prefixes,
+        // as the FTS terms "kubernetes"* and "cluster"* do
+        assert_eq!(
+            recent(
+                k8s,
+                "k8s deployq",
+                &[
+                    ("m_one_word", "cluster deployq"),
+                    ("m_prefix", "kubernetesx clusters deployqs"),
+                    ("m_key", "k8s deployq"),
+                    ("m_no_other", "kubernetes cluster"),
+                ]
+            ),
+            ["m_prefix", "m_key"]
+        );
+        // each target of a list stands alone; "fts5" is no prefix term, so "fts50" is no match
+        assert_eq!(
+            recent(
+                k8s,
+                "db lock",
+                &[
+                    ("m_fts50", "fts50 lock"),
+                    ("m_sqlite", "sqlitex lock"),
+                    ("m_fts5", "fts5 locked"),
+                ]
+            ),
+            ["m_sqlite", "m_fts5"]
+        );
+        // "ops" has 3 letters, so it matches only as the whole word, as the FTS term "ops"
+        let ops = r#"{"teams poll": "ops-monitor"}"#;
+        assert_eq!(
+            recent(
+                ops,
+                "teams poll statusq",
+                &[
+                    ("m_ops_only", "ops statusq"),
+                    ("m_opsx", "opsx monitor statusq"),
+                    ("m_one_key_word", "teams statusq"),
+                    ("m_target", "ops monitors statusq"),
+                    ("m_key", "teams poll statusq"),
+                ]
+            ),
+            ["m_target", "m_key"]
+        );
+        // an empty target holds no word, so it matches nothing; σ matches ς only under
+        // IGNORECASE, so "σ x" is no group and the query words alone decide
+        let empty = r#"{"k8s": ["kubernetes cluster", ""], "\u03c3 x": "tgt"}"#;
+        assert_eq!(
+            recent(
+                empty,
+                "k8s deployq",
+                &[("m_one_word", "cluster deployq"), ("m_key", "k8s deployq")]
+            ),
+            ["m_key"]
+        );
+        assert_eq!(
+            recent(
+                empty,
+                "\u{3c2} x",
+                &[("m_tgt", "tgt"), ("m_words", "\u{3c2} x")]
+            ),
+            ["m_words"]
+        );
     }
 
     #[test]

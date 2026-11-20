@@ -107,12 +107,12 @@ fn set_key(d: &mut Fields, k: PyValue, v: PyValue) {
     }
 }
 
-/// Frontmatter keys, `metadata:` keys winning; on a YAML error, the known keys
-/// read line by line.
+/// Frontmatter keys, `metadata:` keys winning; on any error of the YAML loader (a YAML error,
+/// an impossible date, a value nested too deep), the known keys read line by line.
 fn fields(front: &str) -> Result<(Fields, bool), SmError> {
     let data = match safe_load(front) {
         Ok(v) => v,
-        Err(e) if e.is_yaml_error() => {
+        Err(_) => {
             let mut found = Fields::new();
             for line in splitlines(front, false) {
                 if let Some(m) = FALLBACK_RE.search(line) {
@@ -127,7 +127,6 @@ fn fields(front: &str) -> Result<(Fields, bool), SmError> {
             }
             return Ok((found, true));
         }
-        Err(e) => return Err(SmError::from_python(e.class, e.message)),
     };
     let PyValue::Dict(data) = data else {
         return Ok((Fields::new(), false));
@@ -624,16 +623,16 @@ mod tests {
             ),
             ("a b c", "7", "assumed", "a b c")
         );
-        let e = parse_memory_file(&write(
+        // a datetime ValueError of the loader takes the line-by-line fallback
+        let mf = parse_memory_file(&write(
             d.path(),
             "p/memory/m.md",
             "---\nmodified: 2026-13-01\n---\nM\n",
         ))
-        .unwrap_err();
+        .unwrap();
         assert_eq!(
-            e.python_text(),
-            "ValueError: month must be in 1..12, not 13",
-            "a datetime ValueError is not a YAMLError"
+            (mf.yaml_error, mf.name.as_str(), mf.body.as_str()),
+            (true, "m", "M")
         );
         let e = parse_memory_file(&write(
             d.path(),
