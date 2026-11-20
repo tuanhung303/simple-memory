@@ -13,6 +13,7 @@ use std::os::unix::fs::MetadataExt;
 #[cfg(test)]
 use serde_json::Value;
 
+use crate::core::item::Item;
 use crate::error::{Base, SmError};
 use crate::py::path::PyPath;
 use crate::py::value::{PyValue, type_name};
@@ -43,6 +44,9 @@ pub(crate) fn mtime(p: &PyPath) -> Result<f64, SmError> {
     let md = std::fs::metadata(&os).map_err(|e| SmError::from_io(&e, Some(&os)))?;
     Ok(md.mtime() as f64 + md.mtime_nsec() as f64 * 1e-9)
 }
+
+/// A task log or handoff file of a scan and the item it gives.
+pub type SourceFile = (PyPath, Item);
 
 /// `sorted(paths)`: Python orders paths by `str(path).split("/")`.
 pub(crate) fn sorted_paths(mut paths: Vec<PyPath>) -> Vec<PyPath> {

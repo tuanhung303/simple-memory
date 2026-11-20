@@ -1280,8 +1280,11 @@ pub fn amend_item(
                 merged_refs.retain(|t| !remove_ref_folded.contains(&fold(Some(t))));
             }
         }
+        // a match in the refs this amend brings in drops what it touches; a ref the item held
+        // stays unless new refs replace the old ones
         let secret = refs_a_match_touches(patch.add_refs.into_iter().chain(patch.replace_refs));
-        merged_refs.retain(|t| !secret.contains(t));
+        let held = patch.replace_refs.is_none();
+        merged_refs.retain(|t| !secret.contains(t) || (held && old_ref_tokens.contains(t)));
         let new_refs = if merged_refs == old_ref_tokens {
             old.refs.clone()
         } else {
@@ -1581,6 +1584,23 @@ mod tests {
 
     fn err_text<T: std::fmt::Debug>(r: Result<T, SmError>) -> String {
         r.unwrap_err().python_text()
+    }
+
+    #[test]
+    fn amend_with_new_refs_drops_what_a_match_touches_in_the_whole_new_list() {
+        // the new refs replace the old ones, so a ref the item held is brought in again
+        let (_d, conn) = store();
+        let old = Item {
+            refs: "TKT-9 docs/x.md".into(),
+            ..it("m_1", "anvil", "rotation note", "derived")
+        };
+        put_item(&conn, &old, None).unwrap();
+        let patch = AmendPatch {
+            replace_refs: Some("Bearer docs/x.md TKT-9"),
+            ..Default::default()
+        };
+        let (new_id, _) = amend_item(&conn, "m_1", &patch).unwrap();
+        assert_eq!(get_item(&conn, &new_id).unwrap().unwrap().refs, "TKT-9");
     }
 
     #[test]

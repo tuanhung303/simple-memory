@@ -11,7 +11,8 @@ use crate::py::path::{Errors, PyPath};
 use crate::py::str::{slice, split};
 use crate::py::value::PyValue;
 use crate::service::import_::{
-    alias_repos, automemory_without_file, cfg_get, cfg_on, cfg2, path_of, plan_automemory, roots_of,
+    automemory_without_file, cfg_get, cfg_on, cfg2, one_file_per_source, path_of, plan_automemory,
+    roots_of,
 };
 use crate::sources::automemory::SOURCE_PREFIX;
 use crate::sources::handoff::parse_handoff_file;
@@ -211,21 +212,11 @@ pub(crate) fn import_lag_by_repo(
         tl_files.extend(tasklog_files(&root)?);
     }
     let tl_files = sorted_unique(tl_files);
+    let mut parsed = Vec::new();
     for f in &tl_files {
-        let item = match parse_tasklog_file(f.as_str()) {
-            Ok(it) => alias_repos(vec![it], &al).remove(0),
-            Err(e) => {
-                lag.unreadable.push(unreadable_row(f, &e));
-                continue;
-            }
-        };
-        seen_tasks.insert((item.repo.clone(), item.source.clone()));
-        // a stored source does not make a task log stored: a hand edit keeps the source and
-        // changes the body, and the import then supersedes the old item. The import stores the
-        // redacted body, so compare that hash, or a body with a redacted part is listed each run.
-        let red = redact_for_store(&item, None);
-        if !is_stored(&item.repo, &item.source, &red) {
-            lag.not_stored.push(f.as_str().to_string());
+        match parse_tasklog_file(f.as_str()) {
+            Ok(it) => parsed.push((f.clone(), it)),
+            Err(e) => lag.unreadable.push(unreadable_row(f, &e)),
         }
     }
     let mut ho_files = Vec::new();
@@ -235,13 +226,20 @@ pub(crate) fn import_lag_by_repo(
     }
     let ho_files = sorted_unique(ho_files);
     for f in &ho_files {
-        let item = match parse_handoff_file(f.as_str(), Some(&repos)) {
-            Ok(it) => alias_repos(vec![it], &al).remove(0),
-            Err(e) => {
-                lag.unreadable.push(unreadable_row(f, &e));
-                continue;
-            }
-        };
+        match parse_handoff_file(f.as_str(), Some(&repos)) {
+            Ok(it) => parsed.push((f.clone(), it)),
+            Err(e) => lag.unreadable.push(unreadable_row(f, &e)),
+        }
+    }
+    // the import takes one file per source, so only that file can be not stored: a copy of the
+    // source elsewhere is never imported and is never listed
+    for (f, item) in one_file_per_source(parsed, &al) {
+        if item.source.starts_with("task:") {
+            seen_tasks.insert((item.repo.clone(), item.source.clone()));
+        }
+        // a stored source does not make a file stored: a hand edit keeps the source and changes
+        // the body, and the import then supersedes the old item. The import stores the redacted
+        // body, so compare that hash, or a body with a redacted part is listed each run.
         if !is_stored(&item.repo, &item.source, &redact_for_store(&item, None)) {
             lag.not_stored.push(f.as_str().to_string());
         }

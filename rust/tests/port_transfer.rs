@@ -261,6 +261,43 @@ fn import_counts_and_names_the_rows_the_redactor_rewrote() {
     );
 }
 
+/// A secret pair in a row's refs that a comma or a line break parts (`password:,value`), once
+/// or twice: the import drops the key word and the value, keeps the plain refs, and no file of
+/// the store holds the value.
+#[test]
+fn import_drops_a_secret_pair_a_separator_parts_in_refs() {
+    let cases = [
+        ("TKT-9,password:,Hunter2-example-Zz9", "TKT-9"),
+        ("TKT-9 password:\nHunter2-example-Zz9", "TKT-9"),
+        (
+            "TKT-9,db,password:,Hunter2-example-Zz9,redis,password:,Hunter2-example-Yy8",
+            "TKT-9 db redis",
+        ),
+        (
+            "TKT-9 db password:\nHunter2-example-Zz9 redis password:\nHunter2-example-Yy8",
+            "TKT-9 db redis",
+        ),
+    ];
+    for (refs, want) in cases {
+        let (_d, tmp) = tmpdir();
+        let home = tmp.join("a");
+        std::fs::create_dir_all(&home).unwrap();
+        let path = write_rows(
+            &tmp.join("in.jsonl"),
+            &[row("m_r", "rotation note", json!({"refs": refs}))],
+        );
+        let (code, _, err) = sm(&home, &["import", "jsonl", path.to_str().unwrap()]);
+        assert_eq!((code, err.as_str()), (0, ""), "{refs}");
+        let stored: String = db(&home)
+            .query_row("SELECT refs FROM items WHERE id = 'm_r'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(stored, want, "{refs}");
+        for secret in ["Hunter2-example-Zz9", "Hunter2-example-Yy8"] {
+            assert!(!common::db_files_hold(&home, secret), "{refs}");
+        }
+    }
+}
+
 /// A secret written with spaces in a row's refs goes with every ref it spans; the plain ref
 /// before it is kept.
 #[test]

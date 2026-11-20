@@ -174,11 +174,12 @@ pub fn split_refs(refs: Option<&RefsArg>) -> Vec<String> {
     out
 }
 
-/// `merge_refs(*sources)`, without the refs a redaction match touches in a source string, or a
-/// list element, that the merged list does not hold as written: one that lost a token to the
-/// dedupe, or whose tokens a comma or more than one space parted (`refs_a_match_touches`). Only
-/// there can a secret lose a part before the check on the stored refs string reads it; any
-/// other string is read by that check as it stands.
+/// `merge_refs(*sources)`: the refs of every source string and list element, each once, in
+/// order. A string the merged list does not hold as written (it lost a token to the dedupe, or
+/// a comma or more than one space parts its tokens) can hide a secret from the check on the
+/// stored refs string. When one does, each such string and the merged list itself are read
+/// (`refs_a_match_touches`), and every ref a match touches is dropped, wherever it stands; so
+/// a key word two pairs share goes, and the value of each pair goes with it.
 pub fn merge_refs(sources: &[Option<RefsArg>]) -> String {
     let mut combined: Vec<String> = Vec::new();
     let mut seen = HashSet::new();
@@ -207,6 +208,8 @@ pub fn merge_refs(sources: &[Option<RefsArg>]) -> String {
         }
     }
     if !cut.is_empty() {
+        let merged = combined.join(" ");
+        cut.push(&merged);
         let secret = refs_a_match_touches(cut);
         combined.retain(|t| !secret.contains(t));
     }
@@ -381,6 +384,53 @@ mod tests {
                 Some(RefsArg::List(vec!["TKT-1".into(), "abc1234".into()])),
             ]),
             "TKT-1 docs/a.md abc1234"
+        );
+    }
+
+    #[test]
+    fn merge_refs_drops_a_pair_whose_key_word_another_string_shares() {
+        // the dedupe takes the second `password:`; the first pair, written as is, goes too
+        let pairs = vec![
+            "db password: Hunter2-example-Zz9".to_string(),
+            "redis password: Hunter2-example-Yy8".to_string(),
+        ];
+        let tokens = vec![
+            "token: Hunter2-example-Ww7".to_string(),
+            "password: Hunter2-example-Zz9 token: Hunter2-example-Yy8".to_string(),
+        ];
+        // only commas part the tokens: each pair is read with one space between key and value
+        let commas = "TKT-9,db,password:,Hunter2-example-Zz9,redis,password:,Hunter2-example-Yy8";
+        // the read of the raw string drops `password= password`; `password= <value>` then
+        // stands only in the merged list
+        let key_words =
+            "password,password: max_tokens=4096\tpassword= password Hunter2-example-Aa1  secret";
+        let mut got = vec![
+            merge_refs(&[Some(RefsArg::List(pairs))]),
+            merge_refs(&[Some(RefsArg::List(tokens))]),
+            merge_refs(&[Some(RefsArg::Str(commas))]),
+            merge_refs(&[Some(RefsArg::Str(key_words))]),
+        ];
+        // a newline, CR LF, VT, U+0085 or U+2003 parts each pair as a comma does
+        for sep in ["\n", "\r\n", "\u{b}", "\u{85}", "\u{2003}"] {
+            let refs = format!(
+                "TKT-9 db password:{sep}Hunter2-example-Zz9 redis password:{sep}Hunter2-example-Yy8"
+            );
+            got.push(merge_refs(&[Some(RefsArg::Str(&refs))]));
+        }
+        let parted = "TKT-9 db redis";
+        assert_eq!(
+            got,
+            [
+                "db redis",
+                "",
+                "TKT-9 db redis",
+                "password: max_tokens=4096 secret",
+                parted,
+                parted,
+                parted,
+                parted,
+                parted
+            ]
         );
     }
 

@@ -10,6 +10,7 @@ use crate::core::item::Item;
 use crate::core::redact::redact_text;
 use crate::error::SmError;
 use crate::py::path::PyPath;
+use crate::py::str::strip;
 use crate::py::value::{PyValue, type_name};
 use crate::sources::automemory::{
     MemoryFile, SOURCE_PREFIX, discover, parse_memory_file, to_item, transcript_cwd,
@@ -18,7 +19,7 @@ use crate::sources::handoff::load_handoffs;
 use crate::sources::legacy::load_legacy;
 use crate::sources::proposal::load_proposals_with_rejects;
 use crate::sources::tasklog::load_tasklogs;
-use crate::sources::truthy;
+use crate::sources::{SourceFile, mtime, truthy};
 use crate::store::connect::{connect, execute_waiting_for_lock};
 use crate::store::items::{put_items_batch, retire_item, sync_source_items};
 
@@ -99,6 +100,77 @@ pub fn alias_repos(mut items: Vec<Item>, repo_aliases: &Aliases) -> Vec<Item> {
     items
 }
 
+/// The as_of a task log or handoff states; none when it came from the file's mtime.
+fn stated_as_of(item: &Item) -> Option<&str> {
+    let from_mtime = item.tags.split(',').any(|t| strip(t) == "as_of:mtime");
+    (!from_mtime).then_some(item.as_of.as_str())
+}
+
+/// The order of two stated as_of values: as instants, or as text when one does not parse.
+fn later_as_of(a: &str, b: &str) -> std::cmp::Ordering {
+    use chrono::DateTime;
+    match (
+        DateTime::parse_from_rfc3339(a),
+        DateTime::parse_from_rfc3339(b),
+    ) {
+        (Ok(x), Ok(y)) => x.cmp(&y),
+        _ => a.cmp(b),
+    }
+}
+
+/// File `a` is the source's file in place of file `b`: the newest stated as_of (a stated one
+/// over none), then the newest mtime, then the first path in sorted order. A file whose mtime
+/// cannot be read (it went away after the parse) is the older one: the import's own read of
+/// that file reports it, and the scan of the other files goes on.
+fn keeps_over(a: &SourceFile, b: &SourceFile) -> bool {
+    use std::cmp::Ordering::{Equal, Greater};
+    let by_as_of = match (stated_as_of(&a.1), stated_as_of(&b.1)) {
+        (Some(x), Some(y)) => later_as_of(x, y),
+        (x, y) => x.is_some().cmp(&y.is_some()),
+    };
+    if by_as_of != Equal {
+        return by_as_of == Greater;
+    }
+    let time = |f: &SourceFile| mtime(&f.0).ok();
+    let by_mtime = match (time(a), time(b)) {
+        (Some(x), Some(y)) => x.total_cmp(&y),
+        (x, y) => x.is_some().cmp(&y.is_some()),
+    };
+    if by_mtime != Equal {
+        return by_mtime == Greater;
+    }
+    a.0.as_str().split('/').lt(b.0.as_str().split('/'))
+}
+
+/// The files of one scan with their repos aliased, one file per source (repo and source): the
+/// file `keeps_over` every other file of its source. The others are copies of that source and
+/// are left out, so the choice rests on the files alone and every scan makes the same one. The
+/// import and doctor both take their files through here.
+pub fn one_file_per_source(files: Vec<SourceFile>, repo_aliases: &Aliases) -> Vec<SourceFile> {
+    let mut kept: Vec<Option<SourceFile>> = Vec::with_capacity(files.len());
+    let mut slot: HashMap<(String, String), usize> = HashMap::new();
+    for (path, mut item) in files {
+        if let Some(r) = repo_aliases.get(&item.repo) {
+            item.repo = r.clone();
+        }
+        let file = (path, item);
+        let key = (file.1.repo.clone(), file.1.source.clone());
+        match slot.get(&key) {
+            Some(&i) => {
+                let held = kept[i].as_ref().expect("a kept file");
+                if keeps_over(&file, held) {
+                    kept[i] = Some(file);
+                }
+            }
+            None => {
+                slot.insert(key, kept.len());
+                kept.push(Some(file));
+            }
+        }
+    }
+    kept.into_iter().flatten().collect()
+}
+
 /// Counts per `str(attr or "")`, most first, then by key.
 pub fn count_by(items: &[Item], attr: &str) -> IndexMap<String, i64> {
     let mut counts: IndexMap<String, i64> = IndexMap::new();
@@ -145,14 +217,21 @@ pub fn run_import(
     let kind = crate::py::str::lower(crate::py::str::strip(source_kind));
     let mut rejected = 0i64;
     let cfg = load_config(home)?;
+    let al = aliases(&cfg);
+    let one_per_source = |files: Vec<SourceFile>| -> Vec<Item> {
+        one_file_per_source(files, &al)
+            .into_iter()
+            .map(|(_, item)| item)
+            .collect()
+    };
     let items = match kind.as_str() {
-        "tasklog" => load_tasklogs(path)?,
-        "handoff" => load_handoffs(path, Some(&repo_roots(&cfg)?))?,
-        "legacy" => load_legacy(path, Some(&repo_roots(&cfg)?))?,
+        "tasklog" => one_per_source(load_tasklogs(path)?),
+        "handoff" => one_per_source(load_handoffs(path, Some(&repo_roots(&cfg)?))?),
+        "legacy" => alias_repos(load_legacy(path, Some(&repo_roots(&cfg)?))?, &al),
         "proposal" => {
             let (items, n) = load_proposals_with_rejects(path)?;
             rejected = n as i64;
-            items
+            alias_repos(items, &al)
         }
         _ => {
             return Err(SmError::value(format!(
@@ -161,7 +240,6 @@ pub fn run_import(
             )));
         }
     };
-    let items = alias_repos(items, &aliases(&cfg));
     let by_repo = count_by(&items, "repo");
     let by_tag = count_by(&items, "tag");
     let should_write = !dry_run && (kind != "proposal" || apply);
@@ -613,6 +691,81 @@ mod tests {
             active(&conn)[2],
             ("Body B".to_string(), "superseded".to_string())
         );
+    }
+
+    fn file(path: &str, repo: &str, source: &str, as_of: &str) -> SourceFile {
+        let mut item = it(repo, "derived");
+        item.source = source.into();
+        item.as_of = as_of.into();
+        (PyPath::new(path), item)
+    }
+
+    fn kept(files: &[SourceFile]) -> Vec<(&str, &str)> {
+        files
+            .iter()
+            .map(|(p, i)| (p.as_str(), i.repo.as_str()))
+            .collect()
+    }
+
+    /// Files of other sources all stay, in their order; an alias makes two repos one source,
+    /// and the later stated as_of is kept, at the place of the first copy.
+    #[test]
+    fn one_file_per_source_keeps_other_sources_and_joins_aliased_repos() {
+        let mut al = Aliases::new();
+        al.insert("a-wt".into(), "a".into());
+        let at = |h: u32| format!("2026-11-01T{h:02}:00:00+00:00");
+        let files = vec![
+            file("/x/1", "a", "task:t1", &at(9)),
+            file("/x/2", "b", "task:t1", &at(9)),
+            file("/x/3", "a", "handoff:t1", &at(9)),
+            file("/x/4", "a-wt", "task:t1", &at(10)),
+        ];
+        let got = one_file_per_source(files, &al);
+        assert_eq!(kept(&got), [("/x/4", "a"), ("/x/2", "b"), ("/x/3", "a")]);
+        assert!(one_file_per_source(Vec::new(), &al).is_empty());
+    }
+
+    /// One stated as_of sends the choice to the file times. A copy whose file time cannot be
+    /// read loses the tie, so a copy that is gone never stops the scan; two such copies fall
+    /// to the path order.
+    #[test]
+    fn one_file_per_source_reads_file_times_only_on_a_tie() {
+        let as_of = "2026-11-01T09:00:00+00:00";
+        let files = vec![
+            file("/nowhere/1", "a", "task:t1", as_of),
+            file("/nowhere/2", "a", "task:t1", "2026-11-01T08:00:00+00:00"),
+        ];
+        let got = one_file_per_source(files, &Aliases::new());
+        assert_eq!(kept(&got), [("/nowhere/1", "a")]);
+        let d = tempfile::tempdir().unwrap();
+        let real = d.path().join("z.yaml");
+        std::fs::write(&real, "id: t1\n").unwrap();
+        let real = real.to_str().unwrap();
+        let gone = file("/nowhere/1", "a", "task:t1", as_of);
+        let here = file(real, "a", "task:t1", as_of);
+        for tie in [vec![gone.clone(), here.clone()], vec![here, gone]] {
+            let got = one_file_per_source(tie, &Aliases::new());
+            assert_eq!(kept(&got), [(real, "a")]);
+        }
+        let both_gone = vec![
+            file("/nowhere/2", "a", "task:t1", as_of),
+            file("/nowhere/1", "a", "task:t1", as_of),
+        ];
+        let got = one_file_per_source(both_gone, &Aliases::new());
+        assert_eq!(kept(&got), [("/nowhere/1", "a")]);
+    }
+
+    /// Two stated as_of values are compared as instants. In a zone with daylight saving time
+    /// the parser gives 05:30 UTC and 06:10 UTC on the night clocks go back as `01:30-04:00`
+    /// and `01:10-05:00`: the later time is the earlier text.
+    #[test]
+    fn one_file_per_source_compares_stated_as_of_as_instants() {
+        let files = vec![
+            file("/nowhere/1", "a", "task:t1", "2026-11-01T01:30:00-04:00"),
+            file("/nowhere/2", "a", "task:t1", "2026-11-01T01:10:00-05:00"),
+        ];
+        let got = one_file_per_source(files, &Aliases::new());
+        assert_eq!(kept(&got), [("/nowhere/2", "a")]);
     }
 
     #[test]

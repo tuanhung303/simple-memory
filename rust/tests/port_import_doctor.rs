@@ -325,6 +325,31 @@ fn tasklog_import_drops_refs_of_a_redacted_secret() {
     assert_eq!(in_fold, 0);
 }
 
+/// Two commits that each write `password: value` share the key word; the stored refs keep
+/// neither value.
+#[test]
+fn tasklog_import_drops_both_values_of_commits_that_share_a_key_word() {
+    let (_d, tmp) = tmpdir();
+    let home = tmp.join("home");
+    let tl = tmp.join("anvil/docs/tasklog/2026-11-01/090000-pairs.yaml");
+    write(
+        &tl,
+        &tl_text(
+            "20261101-090000-aabb0022-pairs-0001",
+            "Rotate pairs",
+            "2026-11-01T09:00:00+00:00",
+            "commits: [\"db password: Hunter2-example-Zz9\", \"redis password: Hunter2-example-Yy8\"]\n",
+            "poller fixed",
+        ),
+    );
+    assert_eq!(import(&home, "tasklog", &tl, false, false).inserted, 1);
+    let refs: String = open(&home)
+        .query_row("SELECT refs FROM items", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(refs, "20261101-090000-aabb0022-pairs-0001 db redis");
+    assert!(!common::db_files_hold_twice_secret(&home));
+}
+
 #[test]
 fn service_tasklog_and_handoff_reimport_and_superseded_by() {
     let (_d, tmp) = tmpdir();
@@ -3007,10 +3032,14 @@ fn a_secret_with_spaces_in_refs_is_dropped_by_put_and_amend() {
 
 /// A secret pair written twice in refs, with the key word or the value repeated, is not stored:
 /// the dedupe of the refs list must not take a pair apart before redaction reads it. Through
-/// `put --refs` and `amend --add-refs`.
+/// `put --refs` and `amend --add-refs`; commas alone may part the pair from its key word.
 #[test]
 fn a_secret_pair_written_twice_in_refs_is_dropped_by_put_and_amend() {
-    for (refs, want) in common::TWICE_REF_SECRETS {
+    let commas = (
+        "TKT-9,db,password:,Hunter2-example-Zz9,redis,password:,Hunter2-example-Yy8",
+        "TKT-9 db redis",
+    );
+    for (refs, want) in common::TWICE_REF_SECRETS.into_iter().chain([commas]) {
         let (_d, tmp) = tmpdir();
         let home = tmp.join("home");
         std::fs::create_dir_all(&home).unwrap();
@@ -3056,36 +3085,57 @@ fn a_secret_pair_written_twice_in_refs_is_dropped_by_put_and_amend() {
     }
 }
 
-/// The stored refs already hold the key word, and `--add-refs` brings `key: value`: the merge
-/// drops the second key word, and the value must go with it. The refs the pair touches go by
-/// value, so the stored key word goes too.
+/// `--add-refs` drops each ref it brings in that a match touches, and keeps every ref the item
+/// held: a value whose key word the stored refs hold goes, and an old ref the added text pairs
+/// with a key word stays. The pair alone then brings in nothing, and the amend says so.
 #[test]
-fn add_refs_with_a_key_word_the_stored_refs_hold_drops_the_value() {
-    let (_d, tmp) = tmpdir();
-    let home = tmp.join("home");
-    std::fs::create_dir_all(&home).unwrap();
-    let old = common::put(
-        &home,
-        &[
-            "--repo",
-            "anvil",
-            "--tag",
-            "derived",
-            "--refs",
-            "password: TKT-2",
-            "rotation note",
-        ],
+fn amend_drops_the_refs_a_match_touches_in_what_it_brings_in() {
+    let cases = [
+        ("password: TKT-2", "password: Hunter2-example-Zz9"),
+        ("TKT-9 docs/x.md", "Bearer docs/x.md"),
+        ("TKT-9 docs/keep.md", "aws_secret_access_key = docs/keep.md"),
+    ];
+    let mut got = Vec::new();
+    for (old_refs, pair) in cases {
+        let mut run = Vec::new();
+        for add in [pair.to_string(), format!("{pair} TKT-3")] {
+            let (_d, tmp) = tmpdir();
+            let home = tmp.join("home");
+            std::fs::create_dir_all(&home).unwrap();
+            let old = common::put(
+                &home,
+                &[
+                    "--repo",
+                    "anvil",
+                    "--tag",
+                    "derived",
+                    "--refs",
+                    old_refs,
+                    "rotation note",
+                ],
+            );
+            let (code, _, err) = sm(&home, &["amend", &old, "--add-refs", &add]);
+            let refs = common::column(&home, "SELECT refs FROM items WHERE status = 'active'");
+            run.push((code, err, refs));
+            assert!(
+                !common::db_files_hold(&home, "Hunter2-example-Zz9"),
+                "{add}"
+            );
+        }
+        got.push(run);
+    }
+    // the pair alone brings in nothing: the amend stores nothing and the item keeps its refs
+    let kept = |refs: &str| (1, "error: No changes to apply\n".to_string(), vec![s(refs)]);
+    let added = |refs: &str| (0, String::new(), vec![s(refs)]);
+    assert_eq!(
+        got,
+        [
+            [kept("password: TKT-2"), added("password: TKT-2 TKT-3")],
+            [kept("TKT-9 docs/x.md"), added("TKT-9 docs/x.md TKT-3")],
+            [
+                kept("TKT-9 docs/keep.md"),
+                added("TKT-9 docs/keep.md TKT-3")
+            ],
+        ]
     );
-    let (code, out, err) = sm(
-        &home,
-        &["amend", &old, "--add-refs", "password: Hunter2-example-Zz9"],
-    );
-    assert_eq!((code, err.as_str()), (0, ""));
-    let stored: String = open(&home)
-        .query_row("SELECT refs FROM items WHERE id = ?1", [out.trim()], |r| {
-            r.get(0)
-        })
-        .unwrap();
-    assert_eq!(stored, "TKT-2");
-    assert!(!common::db_files_hold(&home, "Hunter2-example-Zz9"));
 }

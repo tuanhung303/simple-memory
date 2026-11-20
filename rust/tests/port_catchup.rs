@@ -1662,11 +1662,71 @@ fn catchup_leaves_an_unchanged_handoff_alone_in_every_state() {
     );
 }
 
+/// Fixed file times for the copies of one source: `T0` is older than `T1`.
+const T0: Duration = Duration::from_secs(1_800_000_000);
+const T1: Duration = Duration::from_secs(1_800_003_600);
+
+fn at(t: Duration) -> SystemTime {
+    SystemTime::UNIX_EPOCH + t
+}
+
+/// After each of `n` catch-ups at +00:00: the number of rows of `kind`, the active titles of
+/// `kind` (with the last line of a task body), and the doctor's not_stored count.
+fn copy_runs(home: &Path, kind: &str, n: usize) -> Vec<(usize, String, usize)> {
+    (0..n)
+        .map(|_| {
+            catchup_at(home, "+00:00");
+            copy_state(home, kind)
+        })
+        .collect()
+}
+
+fn copy_state(home: &Path, kind: &str) -> (usize, String, usize) {
+    let rows = column(
+        home,
+        &format!("SELECT id FROM items WHERE kind = '{kind}' ORDER BY rowid"),
+    );
+    let active = column(
+        home,
+        &format!(
+            "SELECT title || ' | ' || replace(body, char(10), ' / ') FROM items \
+             WHERE kind = '{kind}' AND status = 'active' ORDER BY rowid"
+        ),
+    );
+    let lag = doctor_imports(home).lag.unwrap().0;
+    (rows.len(), active.join(" ; "), lag.not_stored.len())
+}
+
+/// The env with these task log roots in its config.
+fn with_tasklog_roots(e: &Env, roots: &[&Path]) {
+    let cfg = std::fs::read_to_string(e.home.join("config.toml")).unwrap();
+    let list: Vec<String> = roots
+        .iter()
+        .map(|d| format!("\"{}\"", d.display()))
+        .collect();
+    write(
+        &e.home.join("config.toml"),
+        &cfg.replace(
+            &format!("tasklog_roots = [\"{}\"]", e.tmp.join("gh").display()),
+            &format!("tasklog_roots = [{}]", list.join(", ")),
+        ),
+    );
+}
+
+/// Write a task log copy and give it the file time `t`.
+fn copy(path: &Path, id: &str, head: &[&str], results: &str, t: Duration) {
+    write(
+        path,
+        &format!("id: {id}\n{}\nresults:\n  - {results}\n", head.join("\n")),
+    );
+    set_mtime(path, at(t));
+}
+
 /// Two handoffs with one file name in two folders that map to one repo, with the same kept
-/// sections and other titles: each catch-up makes the other's row active, and no row is added
-/// after the first run.
+/// sections and other titles: the scan keeps the copy with the newer file time (both state one
+/// `Written:` time), so every catch-up keeps one row, the newer copy's, and doctor lists none.
 #[test]
-fn two_handoffs_with_one_name_and_one_repo_add_no_row_after_the_first_catchup() {
+fn two_handoffs_with_one_name_and_one_repo_keep_the_newer_copy_on_every_catchup() {
     let e = env();
     let one = e.tmp.join("ho1");
     let two = e.tmp.join("ho2");
@@ -1679,6 +1739,9 @@ fn two_handoffs_with_one_name_and_one_repo_add_no_row_after_the_first_catchup() 
         &two.join("dup.md"),
         &format!("# Two\nWritten: 2026-11-01T09:00:00Z\n{cwd}## Done\n- same\n"),
     );
+    // the first folder's copy is the newer one, so a scan that takes the last file loses it
+    set_mtime(&one.join("dup.md"), at(T1));
+    set_mtime(&two.join("dup.md"), at(T0));
     with_handoff_dirs(&e, &[&one, &two]);
     let cfg = std::fs::read_to_string(e.home.join("config.toml")).unwrap();
     write(
@@ -1688,62 +1751,247 @@ fn two_handoffs_with_one_name_and_one_repo_add_no_row_after_the_first_catchup() 
             e.tmp.join("gh").display()
         ),
     );
-    let mut counts = Vec::new();
-    let mut titles = Vec::new();
-    for _ in 0..4 {
-        catchup_at(&e.home, "+00:00");
-        counts.push(handoff_rows(&e.home).len());
-        titles.push(
-            column(
-                &e.home,
-                "SELECT title FROM items WHERE kind = 'handoff' AND status = 'active'",
-            )
-            .join(","),
-        );
-    }
-    assert_eq!(counts, [2, 2, 2, 2]);
-    assert_eq!(titles, ["Two", "One", "Two", "One"]);
+    let one_row = (1, "One | ## Done / - same".to_string(), 0);
+    assert_eq!(copy_runs(&e.home, "handoff", 4), vec![one_row; 4]);
 }
 
-/// Two copies of one task log (one task id, one repo) that differ in their fields only: each
-/// catch-up makes the other copy's row active, and after the second run no row is added.
+/// Two copies of one task log (one task id, one repo) that differ in their fields only: the
+/// scan keeps the copy with the newer file time (both state one as_of), so every catch-up keeps
+/// one row, the newer copy's, and doctor lists none.
 #[test]
-fn two_copies_of_a_task_log_that_differ_in_fields_add_no_row_after_the_second_catchup() {
+fn two_copies_of_a_task_log_that_differ_in_fields_keep_the_newer_copy_on_every_catchup() {
     let e = env();
     let id = "20261101-090000-cafe-k";
     let one = e.repo.join("docs/tasklog/2026-11-01/k.yaml");
     let two = e.tmp.join("gh/r1copy/docs/tasklog/2026-11-01/k.yaml");
+    let head = |t: &'static str| ["repo: r1", t, BASE[1], BASE[2]];
+    copy(&one, id, &head("title: T one"), "same", T0);
+    copy(&two, id, &head("title: T two"), "same", T1);
+    let two_row = (1, "T two | Results: / - same".to_string(), 0);
+    assert_eq!(copy_runs(&e.home, "task", 4), vec![two_row; 4]);
+}
+
+/// Two task log roots, each with `rep/docs/tasklog` holding one task id, with other titles (one
+/// body) or other bodies (one title). The first catch-up stores the newer copy; the next three
+/// add no row, change no row and doctor lists no file.
+#[test]
+fn two_roots_with_one_task_log_keep_one_row_after_the_first_catchup() {
+    for (name, title_b, body_b, want) in [
+        (
+            "titles",
+            "title: T two",
+            "same",
+            "T two | Results: / - same",
+        ),
+        (
+            "bodies",
+            "title: T one",
+            "other",
+            "T one | Results: / - other",
+        ),
+    ] {
+        let e = env();
+        let (r1, r2) = (e.tmp.join("tl1"), e.tmp.join("tl2"));
+        with_tasklog_roots(&e, &[&r1, &r2]);
+        let id = "20261111-000001-e1";
+        let f = "rep/docs/tasklog/2026-11-11/e1.yaml";
+        copy(
+            &r1.join(f),
+            id,
+            &["title: T one", BASE[1], BASE[2]],
+            "same",
+            T0,
+        );
+        copy(&r2.join(f), id, &[title_b, BASE[1], BASE[2]], body_b, T1);
+        let runs = copy_runs(&e.home, "task", 4);
+        assert_eq!(runs, vec![(1, want.to_string(), 0); 4], "{name}");
+    }
+}
+
+/// Which copy a scan keeps: the newest stated as_of, then the newest file time, then the first
+/// path in sorted order; a copy whose as_of comes from its file time states none. Copy `a`
+/// sorts first. Each case: one row of the kept copy after the first catch-up, none added by
+/// the second.
+#[test]
+fn the_copy_a_scan_keeps_has_the_newest_as_of_then_file_time_then_first_path() {
+    let late = "as_of: 2026-11-02T09:00:00+00:00";
+    let cases: [(&str, [&str; 2], [Duration; 2], &str); 5] = [
+        // b states the later as_of and has the older file time
+        ("as_of", [BASE[2], late], [T1, T0], "T b"),
+        // one as_of; b has the newer file time
+        ("file time", [BASE[2], BASE[2]], [T0, T1], "T b"),
+        // one as_of and one file time: the first path
+        ("path", [BASE[2], BASE[2]], [T1, T1], "T a"),
+        // a states no as_of (its as_of is its newer file time); b states one
+        ("stated as_of", ["state: x", BASE[2]], [T1, T0], "T b"),
+        // other offsets: b is later in time (20:00 UTC against 18:00 UTC), earlier as written
+        (
+            "as_of instant",
+            [
+                "as_of: 2026-11-12T01:00:00+07:00",
+                "as_of: 2026-11-11T20:00:00+00:00",
+            ],
+            [T1, T0],
+            "T b",
+        ),
+    ];
+    for (name, as_ofs, times, want) in cases {
+        let e = env();
+        let id = "20261101-090000-cafe-p";
+        let a = e.tmp.join("gh/a/docs/tasklog/2026-11-01/p.yaml");
+        let b = e.tmp.join("gh/b/docs/tasklog/2026-11-01/p.yaml");
+        copy(
+            &a,
+            id,
+            &["repo: r1", "title: T a", as_ofs[0]],
+            "same",
+            times[0],
+        );
+        copy(
+            &b,
+            id,
+            &["repo: r1", "title: T b", as_ofs[1]],
+            "same",
+            times[1],
+        );
+        let runs: Vec<(usize, String)> = copy_runs(&e.home, "task", 2)
+            .into_iter()
+            .map(|(n, active, ns)| {
+                assert_eq!(ns, 0, "{name}");
+                (n, active.split(" | ").next().unwrap().to_string())
+            })
+            .collect();
+        assert_eq!(runs, vec![(1, want.to_string()); 2], "{name}");
+    }
+}
+
+/// After the scan settles on the newer copy: an edit of the older copy that leaves it older
+/// changes nothing; an edit of the kept copy is stored once; an edit that makes the older copy
+/// the newest (a later as_of) is stored once, and then nothing changes.
+#[test]
+fn an_edit_of_a_copy_is_stored_only_when_that_copy_is_the_one_the_scan_keeps() {
+    let e = env();
+    let id = "20261101-090000-cafe-q";
+    let old = e.repo.join("docs/tasklog/2026-11-01/q.yaml");
+    let new = e.tmp.join("gh/r1copy/docs/tasklog/2026-11-01/q.yaml");
+    let head = |t: &'static str, as_of: &'static str| ["repo: r1", t, BASE[1], as_of];
+    copy(&old, id, &head("title: T old", BASE[2]), "same", T0);
+    copy(&new, id, &head("title: T new", BASE[2]), "same", T1);
+    let row = |n: usize, t: &str| (n, format!("{t} | Results: / - same"), 0);
+    assert_eq!(copy_runs(&e.home, "task", 1), vec![row(1, "T new")]);
+    copy(&old, id, &head("title: T old edited", BASE[2]), "same", T0);
+    assert_eq!(copy_runs(&e.home, "task", 2), vec![row(1, "T new"); 2]);
+    copy(&new, id, &head("title: T new edited", BASE[2]), "same", T1);
+    assert_eq!(
+        copy_runs(&e.home, "task", 2),
+        vec![row(2, "T new edited"); 2]
+    );
+    let late = "as_of: 2026-11-03T09:00:00+00:00";
+    copy(&old, id, &head("title: T old edited", late), "same", T0);
+    assert_eq!(
+        copy_runs(&e.home, "task", 3),
+        vec![row(3, "T old edited"); 3]
+    );
+}
+
+/// `sm import handoff <dir>` over a folder that holds two copies of one handoff name (one repo)
+/// stores one item, the copy with the newer file time.
+#[test]
+fn a_handoff_import_of_a_folder_with_two_copies_stores_one_item() {
+    let e = env();
+    let dir = e.tmp.join("handoffs");
+    let (one, two) = (dir.join("ho/h1.md"), dir.join("ho2/h1.md"));
     write(
         &one,
-        &tl_text(id, &["repo: r1", "title: T one", BASE[1], BASE[2]]),
+        "# One\nWritten: 2026-11-01T09:00:00Z\n## Done\n- same\n",
     );
     write(
         &two,
-        &tl_text(id, &["repo: r1", "title: T two", BASE[1], BASE[2]]),
+        "# Two\nWritten: 2026-11-01T09:00:00Z\n## Done\n- same\n",
     );
-    let mut counts = Vec::new();
-    let mut titles = Vec::new();
-    for _ in 0..4 {
-        catchup_at(&e.home, "+00:00");
-        counts.push(task_rows(&e.home).len());
-        titles.push(
-            column(
-                &e.home,
-                "SELECT title FROM items WHERE kind = 'task' AND status = 'active'",
-            )
-            .join(","),
-        );
-    }
-    // run 1 stores both copies in turn; run 2 inserts nothing new, it only switches rows
-    assert_eq!(counts, [2, 2, 2, 2]);
-    assert_eq!(titles, ["T two", "T one", "T two", "T one"]);
+    set_mtime(&one, at(T1));
+    set_mtime(&two, at(T0));
+    let out = sm_utc(&e.home, &["import", "handoff", dir.to_str().unwrap()]);
+    assert_eq!(
+        out.lines().last().unwrap(),
+        "total=1 inserted=1 deduped=0 superseded=0 rejected=0 supersede_missing=0 failed_rows=0"
+    );
     assert_eq!(
         column(
             &e.home,
-            "SELECT count(*) || '' FROM items WHERE kind = 'task' AND status = 'active'"
+            "SELECT title || ' ' || status FROM items WHERE kind = 'handoff'"
         ),
-        ["1"]
+        ["One active"]
     );
+}
+
+/// `sm import tasklog <dir>` and `sm import handoff <dir>` of the older copy's folder store that
+/// copy (it is the only one the import sees); the next catch-up makes the newer copy's row
+/// active again with no new row, and the runs after it change nothing. An import of a folder
+/// that holds both copies stores only the newer one.
+#[test]
+fn a_named_import_of_one_copy_is_undone_once_by_the_next_catchup() {
+    let e = env();
+    let id = "20261101-090000-cafe-n";
+    let older = e.repo.join("docs/tasklog/2026-11-01/n.yaml");
+    let newer = e.tmp.join("gh/r1copy/docs/tasklog/2026-11-01/n.yaml");
+    copy(
+        &newer,
+        id,
+        &["repo: r1", "title: T new", BASE[1], BASE[2]],
+        "same",
+        T1,
+    );
+    sm_utc(
+        &e.home,
+        &["import", "tasklog", e.tmp.join("gh").to_str().unwrap()],
+    );
+    let new_row = (1, "T new | Results: / - same".to_string(), 0);
+    assert_eq!(copy_state(&e.home, "task"), new_row);
+    copy(
+        &older,
+        id,
+        &["repo: r1", "title: T old", BASE[1], BASE[2]],
+        "same",
+        T0,
+    );
+    let both = sm_utc(
+        &e.home,
+        &["import", "tasklog", e.tmp.join("gh").to_str().unwrap()],
+    );
+    assert_eq!(
+        both.lines().last().unwrap(),
+        "total=1 inserted=0 deduped=1 superseded=0 rejected=0 supersede_missing=0 failed_rows=0"
+    );
+    assert_eq!(copy_state(&e.home, "task"), new_row);
+    let dir = e.repo.join("docs/tasklog");
+    sm_utc(&e.home, &["import", "tasklog", dir.to_str().unwrap()]);
+    assert_eq!(
+        copy_state(&e.home, "task"),
+        (2, "T old | Results: / - same".to_string(), 1)
+    );
+    let back = (2, "T new | Results: / - same".to_string(), 0);
+    assert_eq!(copy_runs(&e.home, "task", 3), vec![back; 3]);
+
+    let (h1, h2) = (e.tmp.join("ho1"), e.tmp.join("ho2"));
+    write(
+        &h1.join("d.md"),
+        "# Old\nWritten: 2026-11-01T09:00:00Z\n## Done\n- same\n",
+    );
+    write(
+        &h2.join("d.md"),
+        "# New\nWritten: 2026-11-01T09:00:00Z\n## Done\n- same\n",
+    );
+    set_mtime(&h1.join("d.md"), at(T0));
+    set_mtime(&h2.join("d.md"), at(T1));
+    with_handoff_dirs(&e, &[&h1, &h2]);
+    sm_utc(&e.home, &["import", "handoff", h1.to_str().unwrap()]);
+    assert_eq!(
+        copy_state(&e.home, "handoff"),
+        (1, "Old | ## Done / - same".to_string(), 1)
+    );
+    let new_ho = (2, "New | ## Done / - same".to_string(), 0);
+    assert_eq!(copy_runs(&e.home, "handoff", 3), vec![new_ho; 3]);
 }
 
 /// A row the previous build wrote for `commits: abc1234` (one ref per character, and the same

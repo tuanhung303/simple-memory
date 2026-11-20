@@ -8,7 +8,9 @@ use crate::py::path::{Errors, PyPath};
 use crate::py::str::{lower, split, strip};
 use crate::py::value::PyValue;
 use crate::py::yaml::safe_load;
-use crate::sources::{dict_get as get, file_error, iterate, mtime, sorted_paths, truthy};
+use crate::sources::{
+    SourceFile, dict_get as get, file_error, iterate, mtime, sorted_paths, truthy,
+};
 
 /// `str(data.get(key) or fallback)`.
 fn get_str_or(data: &[(PyValue, PyValue)], key: &str, fallback: &str) -> Result<String, SmError> {
@@ -181,17 +183,20 @@ pub fn parse_tasklog_file(path: &str) -> Result<Item, SmError> {
     .post_init())
 }
 
-/// `load_tasklogs(path)`.
-pub fn load_tasklogs(path: &str) -> Result<Vec<Item>, SmError> {
+/// `load_tasklogs(path)`: each file with its item.
+pub fn load_tasklogs(path: &str) -> Result<Vec<SourceFile>, SmError> {
     let p = PyPath::new(path).expanduser()?.resolve()?;
-    let parse = |f: &str| parse_tasklog_file(f).map_err(|e| file_error(f, e));
+    let parse = |f: PyPath| {
+        let item = parse_tasklog_file(f.as_str()).map_err(|e| file_error(f.as_str(), e))?;
+        Ok((f, item))
+    };
     if p.is_file() {
-        return Ok(vec![parse(p.as_str())?]);
+        return Ok(vec![parse(p)?]);
     }
     if p.is_dir() {
         return sorted_paths(p.rglob("*.yaml")?)
-            .iter()
-            .map(|f| parse(f.as_str()))
+            .into_iter()
+            .map(parse)
             .collect();
     }
     Err(SmError::new(
@@ -268,7 +273,11 @@ mod tests {
         write(d.path(), &format!("{tl}/020304-bcdef123-no-commits-8888.yaml"),
             b"id: 20261025-020304-bcdef123-no-commits-8888\ntitle: Investigation without commits\nstate: done\nrepo: anvil\n\
               as_of: not-an-iso-date\nsuperseded_by: 20261025-010203-abcdef12-sample-task-9999\nresults:\n  - Checked logs\n");
-        let items = load_tasklogs(d.path().join("anvil/docs/tasklog").to_str().unwrap()).unwrap();
+        let items: Vec<Item> = load_tasklogs(d.path().join("anvil/docs/tasklog").to_str().unwrap())
+            .unwrap()
+            .into_iter()
+            .map(|(_, it)| it)
+            .collect();
         assert_eq!(items.len(), 2);
         let it = &items[0];
         assert_eq!(

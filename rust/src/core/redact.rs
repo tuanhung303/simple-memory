@@ -647,14 +647,29 @@ fn refs_redaction_touches(refs: &str) -> HashSet<&str> {
         .collect()
 }
 
-/// The refs that a match over each raw refs string, as its writer gave it, covers or touches. A
-/// write path drops them by value from the refs it builds: its split dedupes, and a dedupe can
-/// take the key word of a second `key: value` pair from its value.
+/// The refs that a match covers or touches in each raw refs string, read as its writer gave it
+/// and, when that differs, with its refs joined by one space, so a pair that only a comma or
+/// another separator parts (`password:,value`) is read as a pair. A write path drops them by
+/// value from the refs it builds: its split dedupes, and a dedupe can take the key word of a
+/// second `key: value` pair from its value.
 pub fn refs_a_match_touches<'a>(raws: impl IntoIterator<Item = &'a str>) -> HashSet<String> {
-    raws.into_iter()
-        .flat_map(refs_redaction_touches)
-        .map(String::from)
-        .collect()
+    let mut touched = HashSet::new();
+    for raw in raws {
+        touched.extend(refs_redaction_touches(raw).into_iter().map(String::from));
+        let spaced = REF_TOKEN_RE
+            .find_iter(raw)
+            .map(|m| m.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        if spaced != raw {
+            touched.extend(
+                refs_redaction_touches(&spaced)
+                    .into_iter()
+                    .map(String::from),
+            );
+        }
+    }
+    touched
 }
 
 /// A run of chars `split_refs` keeps as one ref: it splits on `\s` and `,`.
@@ -684,7 +699,9 @@ pub fn redact_for_store(item: &Item, mut counts: Option<&mut Counts>) -> Item {
             .collect();
     }
     let all_refs = split_refs(Some(&RefsArg::Str(&item.refs)));
-    let touched = refs_redaction_touches(&item.refs);
+    // read as written and single-spaced, as the write paths read: a pair that a comma or a
+    // line break parts (`password:,value`) is still a pair
+    let touched = refs_a_match_touches([item.refs.as_str()]);
     let kept: Vec<&String> = all_refs
         .iter()
         .filter(|r| {
