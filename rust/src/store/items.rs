@@ -9,7 +9,7 @@ use crate::core::fold::fold;
 use crate::core::item::{
     Item, check_stored_as_of, compute_content_hash, new_item_id, now_iso, validate_as_of,
 };
-use crate::core::redact::{redact_for_store, redact_text};
+use crate::core::redact::{redact_for_store, redact_text, refs_a_match_touches};
 use crate::core::refs::{RefsArg, extract_refs, item_refs, split_refs};
 use crate::core::tags::{
     LEGACY_NA_TAG, RETIRED_TAG_PREFIX, append_tag, has_retired_tag, strip_retired_tags,
@@ -509,6 +509,117 @@ fn hidden_by_another_repo(
     .is_some())
 }
 
+/// The fields of a stored task log or handoff row the import compares with the file's item.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct FileRow {
+    pub title: String,
+    pub tags: String,
+    pub tag: String,
+    pub evidence: String,
+    pub as_of: String,
+    pub refs: String,
+}
+
+/// The same time: one instant, or one wall-clock time, since a date alone or a time with no
+/// offset is read in the local zone of the run (`validate_as_of`).
+fn same_as_of(stored: &str, file: &str) -> bool {
+    use chrono::DateTime;
+    match (
+        DateTime::parse_from_rfc3339(stored),
+        DateTime::parse_from_rfc3339(file),
+    ) {
+        (Ok(a), Ok(b)) => a == b || a.naive_local() == b.naive_local(),
+        _ => stored == file,
+    }
+}
+
+/// The stored row of a task log or handoff holds what the file's (redacted) item gives: the
+/// same title, tag and set of tags; the same evidence when it is a task log's commit list
+/// (`executed`; a `derived` item's evidence is the file path, which moves with the repo); the
+/// same as_of unless it came from the file's mtime; and every ref the file states (a task log's
+/// task id, commits, continues, superseded_by), since a later step (`fill_refs`) may add refs. Refs from the title and body
+/// are left out: those fields are compared themselves, and a newer ref extractor must not make
+/// a new version of every file.
+pub fn file_row_holds(row: &FileRow, item: &Item) -> bool {
+    let tokens = |t: &str| -> HashSet<String> {
+        t.split(',')
+            .map(strip)
+            .filter(|t| !t.is_empty())
+            .map(String::from)
+            .collect()
+    };
+    let file_tags = tokens(&item.tags);
+    let stored_refs: HashSet<String> = split_refs(Some(&RefsArg::Str(&row.refs)))
+        .into_iter()
+        .collect();
+    let text_refs: HashSet<String> = extract_refs(Some(&format!("{}\n{}", item.title, item.body)))
+        .into_iter()
+        .collect();
+    row.title == item.title
+        && tokens(&row.tags) == file_tags
+        && row.tag == item.tag
+        && (item.tag != "executed" || row.evidence == item.evidence)
+        && (file_tags.contains("as_of:mtime") || same_as_of(&row.as_of, &item.as_of))
+        && split_refs(Some(&RefsArg::Str(&item.refs)))
+            .iter()
+            .all(|r| text_refs.contains(r) || stored_refs.contains(r))
+}
+
+fn file_row(conn: &Connection, id: &str) -> Result<FileRow, SmError> {
+    bind_text(id)?;
+    Ok(conn.query_row(
+        "SELECT title, tags, tag, evidence, as_of, refs FROM items WHERE id = ?",
+        [id],
+        |r| {
+            Ok(FileRow {
+                title: r.get(0)?,
+                tags: r.get(1)?,
+                tag: r.get(2)?,
+                evidence: r.get(3)?,
+                as_of: r.get(4)?,
+                refs: r.get(5)?,
+            })
+        },
+    )?)
+}
+
+/// A task log or handoff item whose stored row `id` does not hold its fields.
+fn file_row_differs(conn: &Connection, id: &str, item: &Item) -> Result<bool, SmError> {
+    Ok(file_backed(&item.source) && !file_row_holds(&file_row(conn, id)?, item))
+}
+
+/// The newest row of the file's repo, source and body that holds the file's fields: an
+/// earlier version to make active again in place of a new one. Called when no active row of
+/// that body holds them, so each row it reads is superseded.
+fn holding_row(conn: &Connection, item: &Item) -> Result<Option<String>, SmError> {
+    bind_all(&[&item.repo, &item.source, &item.content_hash])?;
+    let mut stmt = conn.prepare(
+        "SELECT id FROM items WHERE repo = ? AND source = ? AND content_hash = ? \
+         ORDER BY rowid DESC",
+    )?;
+    let ids = stmt
+        .query_map([&item.repo, &item.source, &item.content_hash], |r| {
+            r.get::<_, String>(0)
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for id in ids {
+        if !file_row_differs(conn, &id, item)? {
+            return Ok(Some(id));
+        }
+    }
+    Ok(None)
+}
+
+/// Supersede the active row `old` by `by` before `by` takes its `items_dedupe` slot (the amend
+/// order: `by` may not be stored yet).
+fn supersede_first(conn: &Connection, old: &str, by: &str) -> Result<i64, SmError> {
+    bind_all(&[old, by])?;
+    Ok(conn.execute(
+        "UPDATE items SET status = 'superseded', superseded_by = ? WHERE id = ? AND status = 'active'",
+        params![by, old],
+    )? as i64)
+}
+
 /// One row of put_items_batch inside its savepoint: (inserted, deduped, superseded, missing, target).
 fn batch_row(
     conn: &Connection,
@@ -518,8 +629,18 @@ fn batch_row(
     validate_item(item)?;
     let (mut ins, mut dup, mut sup, mut missing) = (0, 0, 0, 0);
     let mut existing = active_by_hash(conn, &item.repo, &item.content_hash, &item.source, None)?;
+    // a task log or handoff whose title, tags, tag, evidence, as_of or refs changed with its
+    // body kept is a changed file: its active row is replaced like the row of a changed body
+    let mut stale: Option<String> = None;
+    if let Some(id) = &existing
+        && file_row_differs(conn, id, item)?
+    {
+        stale = existing.take();
+    }
     let mut restore_id: Option<String> = None;
-    if existing.is_none() && file_backed(&item.source) {
+    if stale.is_some() {
+        restore_id = holding_row(conn, item)?;
+    } else if existing.is_none() && file_backed(&item.source) {
         bind_all(&[&item.repo, &item.source, &item.content_hash])?;
         let prior: Option<(String, Option<String>, String)> = conn
             .query_row(
@@ -534,7 +655,7 @@ fn batch_row(
                 if has_retired_tag(&tags) {
                     existing = Some(id);
                 } else {
-                    restore_id = Some(id);
+                    restore_id = holding_row(conn, item)?;
                 }
             }
             // Restore an earlier body when the file's own source still has an active version
@@ -547,22 +668,27 @@ fn batch_row(
                 {
                     existing = Some(id);
                 } else {
-                    restore_id = Some(id);
+                    restore_id = holding_row(conn, item)?;
                 }
             }
             None => {}
         }
     }
+    let others = |conn: &Connection, keep: &str| -> Result<Vec<String>, SmError> {
+        Ok(active_ids_of_source(conn, &item.source, Some(&item.repo))?
+            .into_iter()
+            .filter(|id| id != keep && Some(id) != stale.as_ref())
+            .collect())
+    };
     let target_id;
     if let Some(id) = existing {
         target_id = id;
         dup = 1;
     } else if let Some(rid) = restore_id {
-        let old_same_source: Vec<String> =
-            active_ids_of_source(conn, &item.source, Some(&item.repo))?
-                .into_iter()
-                .filter(|id| id != &rid)
-                .collect();
+        let old_same_source = others(conn, &rid)?;
+        if let Some(s) = &stale {
+            sup += supersede_first(conn, s, &rid)?;
+        }
         conn.execute(
             "UPDATE items SET status = 'active', superseded_by = NULL WHERE id = ?",
             [&rid],
@@ -579,10 +705,13 @@ fn batch_row(
             dup = 1;
         } else {
             let old_same_source = if file_backed(&item.source) {
-                active_ids_of_source(conn, &item.source, Some(&item.repo))?
+                others(conn, &item.id)?
             } else {
                 Vec::new()
             };
+            if let Some(s) = &stale {
+                sup += supersede_first(conn, s, &item.id)?;
+            }
             insert_item(conn, item, "active", None)?;
             target_id = item.id.clone();
             ins = 1;
@@ -1151,6 +1280,8 @@ pub fn amend_item(
                 merged_refs.retain(|t| !remove_ref_folded.contains(&fold(Some(t))));
             }
         }
+        let secret = refs_a_match_touches(patch.add_refs.into_iter().chain(patch.replace_refs));
+        merged_refs.retain(|t| !secret.contains(t));
         let new_refs = if merged_refs == old_ref_tokens {
             old.refs.clone()
         } else {

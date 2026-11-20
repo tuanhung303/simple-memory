@@ -876,34 +876,926 @@ fn catchup_reimports_a_stored_task_log_whose_body_changed_and_supersedes_the_old
     );
 }
 
+/// `sm import catch-up --quiet` at a UTC offset: the counts of its imports part.
+fn catchup_at(home: &Path, offset: &str) -> Value {
+    let (code, _, err) = common::sm_env(
+        home,
+        &["import", "catch-up", "--quiet"],
+        &[("SM_UTC_OFFSET", offset)],
+    );
+    assert_eq!(code, 0, "{err}");
+    log_rows(home).pop().unwrap()["parts"]["imports"]["counts"].clone()
+}
+
+/// Every row of the store but the auto-memory notes: id, status, superseded_by.
+fn all_rows(home: &Path) -> Vec<(String, String, Option<String>)> {
+    let conn = open(home);
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, status, superseded_by FROM items \
+             WHERE substr(source, 1, 11) != 'automemory:' ORDER BY rowid",
+        )
+        .unwrap();
+    stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+}
+
+/// A task log imported once and not edited gets no new version from catch-up runs, whatever
+/// else changed around it: its mtime, the run's UTC offset, its repo dir, a second root that
+/// reaches it, refs a later step added, a redaction at the write, a retire or an amend by hand.
 #[test]
-fn catchup_leaves_an_unchanged_retitled_or_redacted_task_log_alone() {
+fn catchup_leaves_an_unchanged_task_log_alone_in_every_state() {
     let e = env();
-    let plain = tasklog(
-        &e.repo.join("docs/tasklog/2026-11-01/090000-baba-u.yaml"),
-        "20261101-090000-baba-u",
-    );
-    // the store keeps the redacted body, so the file's own body hash is never stored
-    let secret = e.repo.join("docs/tasklog/2026-11-01/090000-baba-r.yaml");
+    let day = e.repo.join("docs/tasklog/2026-11-01");
+    let file = |name: &str, text: String| {
+        let p = day.join(format!("{name}.yaml"));
+        write(&p, &text);
+        p
+    };
+    let id = |n: &str| format!("20261101-090000-cafe-{n}");
+    let akia = format!("AKIA{}", "Q".repeat(16));
+    let files = [
+        file(
+            "a",
+            tl_text(
+                &id("a"),
+                &[
+                    BASE[0],
+                    "state: done, blocked",
+                    BASE[2],
+                    "commits: [c0ffee1, abc1234]",
+                ],
+            ),
+        ),
+        // no commits: the evidence is the file path
+        file("b", tl_text(&id("b"), &BASE)),
+        // no as_of: the parser takes the file's mtime and tags it as_of:mtime
+        file("c", tl_text(&id("c"), &[BASE[0], BASE[1]])),
+        // a date alone and a time with no offset are read in the run's local zone
+        file(
+            "d",
+            tl_text(&id("d"), &[BASE[0], BASE[1], "as_of: 2026-11-01"]),
+        ),
+        file(
+            "e",
+            tl_text(&id("e"), &[BASE[0], BASE[1], "as_of: 2026-11-01T09:00:00"]),
+        ),
+        // the store keeps a redacted title, tags, refs and body
+        file(
+            "f",
+            format!(
+                "id: {}\ntitle: key {akia}\nstate: done, {akia}\ncontinues: {akia}\nas_of: 2026-11-01T09:00:00+00:00\nresults:\n  - plan <private>made-up note</private> done\n",
+                id("f")
+            ),
+        ),
+        // refs a later step added; a retire by hand; an amend by hand
+        file("g", tl_text(&id("g"), &BASE)),
+        file("h", tl_text(&id("h"), &BASE)),
+        file("i", tl_text(&id("i"), &BASE)),
+        // a ref the body gives that the stored row lacks (an older ref extractor)
+        file(
+            "j",
+            format!(
+                "id: {}\ntitle: T one\nas_of: 2026-11-01T09:00:00+00:00\nresults:\n  - fixed docs/x/y.md\n",
+                id("j")
+            ),
+        ),
+    ];
+    // a task log under another folder, with its repo in the file, whose dir later moves
+    let moved_from = e.tmp.join("gh/m1/docs/tasklog/2026-11-01/m.yaml");
     write(
-        &secret,
-        "id: 20261101-090000-baba-r\ntitle: R\nas_of: 2026-11-01T09:00:00+00:00\nresults:\n  - plan <private>made-up note</private> done\n",
+        &moved_from,
+        &tl_text(&id("m"), &["repo: r1", BASE[0], BASE[1], BASE[2]]),
     );
-    import_tasklog(&e, &plain);
-    import_tasklog(&e, &secret);
-    // a title edit keeps the body: the import dedupes it, so catch-up must not try it each run
-    let text = std::fs::read_to_string(&plain).unwrap();
-    write(&plain, &text.replacen("title: T", "title: Retitled", 1));
-    let before = task_rows(&e.home);
-    assert_eq!(before.len(), 2);
-    for _ in 0..2 {
-        let row = catchup(&e);
-        assert_eq!(
-            row["parts"]["imports"]["counts"],
-            json!({"not_stored": 0, "inserted": 0, "failed_rows": 0})
-        );
-        assert_eq!(task_rows(&e.home), before);
+    // a second root that reaches the same files
+    let cfg = std::fs::read_to_string(e.home.join("config.toml")).unwrap();
+    let gh = e.tmp.join("gh");
+    write(
+        &e.home.join("config.toml"),
+        &cfg.replace(
+            &format!("tasklog_roots = [\"{}\"]", gh.display()),
+            &format!(
+                "tasklog_roots = [\"{}\", \"{}\"]",
+                gh.display(),
+                e.tmp.display()
+            ),
+        ),
+    );
+    for f in files.iter().chain([&moved_from]) {
+        sm_utc(&e.home, &["import", "tasklog", f.to_str().unwrap()]);
     }
+    let item_of = |n: &str| {
+        column(
+            &e.home,
+            &format!(
+                "SELECT id FROM items WHERE source = 'task:{}' AND status = 'active'",
+                id(n)
+            ),
+        )
+        .remove(0)
+    };
+    let conn = open(&e.home);
+    conn.execute(
+        &format!(
+            "UPDATE items SET refs = refs || ' made-up-extra' WHERE id = '{}'",
+            item_of("g")
+        ),
+        [],
+    )
+    .unwrap();
+    drop(conn);
+    assert_eq!(
+        column(
+            &e.home,
+            &format!("SELECT refs FROM items WHERE id = '{}'", item_of("j"))
+        ),
+        [format!("{} docs/x/y.md", id("j"))]
+    );
+    let conn = open(&e.home);
+    conn.execute(
+        &format!(
+            "UPDATE items SET refs = '{}' WHERE id = '{}'",
+            id("j"),
+            item_of("j")
+        ),
+        [],
+    )
+    .unwrap();
+    drop(conn);
+    let retired = item_of("h");
+    sm_utc(&e.home, &["retire", &retired, "--reason", "done-by-hand"]);
+    let amended_from = item_of("i");
+    let amended = sm_utc(&e.home, &["amend", &amended_from, "--title", "I amended"]);
+    let amended = amended.split_whitespace().last().unwrap().to_string();
+    let clean = json!({"not_stored": 0, "inserted": 0, "failed_rows": 0});
+    assert_eq!(catchup_at(&e.home, "+00:00"), clean);
+    let before = all_rows(&e.home);
+    assert_eq!(
+        before.iter().filter(|r| r.1 == "active").count(),
+        // seed, a..g, i's amended row, j, m
+        11
+    );
+    // an mtime change, a moved repo dir, two other offsets
+    let later = SystemTime::now() + Duration::from_secs(3600);
+    for f in &files {
+        set_mtime(f, later);
+    }
+    let moved_to = e.tmp.join("gh/m2");
+    std::fs::rename(e.tmp.join("gh/m1"), &moved_to).unwrap();
+    for offset in ["-05:00", "+07:00", "+00:00"] {
+        assert_eq!(catchup_at(&e.home, offset), clean, "at {offset}");
+        assert_eq!(all_rows(&e.home), before, "at {offset}");
+    }
+    assert_eq!(
+        doctor_imports(&e.home).lag.unwrap().0.not_stored,
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        column(
+            &e.home,
+            &format!("SELECT status FROM items WHERE id = '{retired}'")
+        ),
+        ["superseded"]
+    );
+    assert_eq!(
+        column(
+            &e.home,
+            &format!("SELECT title FROM items WHERE id = '{amended}' AND status = 'active'")
+        ),
+        ["I amended"]
+    );
+    // the amend replaced the file's own row: an edit of the file after it is not imported
+    // (today's rule for a task log with no active row of its source)
+    write(
+        &files[8],
+        &tl_text(&id("i"), &["title: I edited", BASE[1], BASE[2]]),
+    );
+    assert_eq!(catchup_at(&e.home, "+00:00"), clean);
+    assert_eq!(all_rows(&e.home), before);
+}
+
+/// The binary at a fixed offset (stored as_of values then end in `+00:00`): exit 0, stdout.
+fn sm_utc(home: &Path, args: &[&str]) -> String {
+    let (code, out, err) = common::sm_env(home, args, &[("SM_UTC_OFFSET", "+00:00")]);
+    assert_eq!(code, 0, "sm {args:?} failed: {err}");
+    out
+}
+
+/// The `imports:` line of `sm doctor --imports`.
+fn doctor_line(home: &Path) -> String {
+    let out = sm_utc(home, &["doctor", "--imports"]);
+    out.lines()
+        .find(|l| l.starts_with("imports: "))
+        .expect("an imports line")
+        .to_string()
+}
+
+fn lag_line(not_stored: usize) -> String {
+    format!(
+        "imports: tasklog_files=1 handoff_files=0 not_stored={not_stored} unreadable=0 stored_tasks_without_file=0"
+    )
+}
+
+/// The active task row: title, tags, as_of, tag, refs, evidence.
+fn active_task(home: &Path) -> Vec<[String; 6]> {
+    let conn = open(home);
+    let mut stmt = conn
+        .prepare(
+            "SELECT title, tags, as_of, tag, refs, evidence FROM items \
+             WHERE kind = 'task' AND status = 'active' ORDER BY rowid",
+        )
+        .unwrap();
+    stmt.query_map([], |r| {
+        Ok([
+            r.get(0)?,
+            r.get(1)?,
+            r.get(2)?,
+            r.get(3)?,
+            r.get(4)?,
+            r.get(5)?,
+        ])
+    })
+    .unwrap()
+    .collect::<Result<_, _>>()
+    .unwrap()
+}
+
+/// A task log with the results text every case keeps, and the header lines a case sets.
+fn tl_text(id: &str, head: &[&str]) -> String {
+    format!(
+        "id: {id}\n{}\nresults:\n  - poller fixed and tested\n",
+        head.join("\n")
+    )
+}
+
+const BASE: [&str; 3] = [
+    "title: T one",
+    "state: in_progress",
+    "as_of: 2026-11-01T09:00:00+00:00",
+];
+
+/// One edit that keeps the results text: the header before and after, then the active row the
+/// store must hold after the import (`{f}` is the file path, `{id}` the task id).
+struct Edit {
+    name: &'static str,
+    before: Vec<&'static str>,
+    after: Vec<&'static str>,
+    row: [&'static str; 6],
+}
+
+fn edits() -> Vec<Edit> {
+    let base = BASE.to_vec();
+    let with = |extra: &'static str| {
+        let mut v = BASE.to_vec();
+        v.push(extra);
+        v
+    };
+    vec![
+        Edit {
+            name: "title",
+            before: base.clone(),
+            after: vec![BASE[1], BASE[2], "title: T renamed"],
+            row: [
+                "T renamed",
+                "in_progress",
+                "2026-11-01T09:00:00+00:00",
+                "derived",
+                "{id}",
+                "{f}",
+            ],
+        },
+        Edit {
+            name: "state",
+            before: base.clone(),
+            after: vec![BASE[0], "state: done", BASE[2]],
+            row: [
+                "T one",
+                "done",
+                "2026-11-01T09:00:00+00:00",
+                "derived",
+                "{id}",
+                "{f}",
+            ],
+        },
+        Edit {
+            name: "as_of",
+            before: base.clone(),
+            after: vec![BASE[0], BASE[1], "as_of: 2026-11-02T09:30:00+00:00"],
+            row: [
+                "T one",
+                "in_progress",
+                "2026-11-02T09:30:00+00:00",
+                "derived",
+                "{id}",
+                "{f}",
+            ],
+        },
+        Edit {
+            name: "add commits",
+            before: base.clone(),
+            after: with("commits: [c0ffee1]"),
+            row: [
+                "T one",
+                "in_progress",
+                "2026-11-01T09:00:00+00:00",
+                "executed",
+                "{id} c0ffee1",
+                "c0ffee1",
+            ],
+        },
+        Edit {
+            name: "change commits",
+            before: with("commits: [aaaa111]"),
+            after: with("commits: [bbbb222]"),
+            row: [
+                "T one",
+                "in_progress",
+                "2026-11-01T09:00:00+00:00",
+                "executed",
+                "{id} bbbb222",
+                "bbbb222",
+            ],
+        },
+        Edit {
+            name: "drop one of two commits",
+            before: with("commits: [aaaa111, bbbb222]"),
+            after: with("commits: [aaaa111]"),
+            row: [
+                "T one",
+                "in_progress",
+                "2026-11-01T09:00:00+00:00",
+                "executed",
+                "{id} aaaa111",
+                "aaaa111",
+            ],
+        },
+        Edit {
+            name: "drop every commit",
+            before: with("commits: [aaaa111]"),
+            after: base.clone(),
+            row: [
+                "T one",
+                "in_progress",
+                "2026-11-01T09:00:00+00:00",
+                "derived",
+                "{id}",
+                "{f}",
+            ],
+        },
+        Edit {
+            name: "add continues",
+            before: base.clone(),
+            after: with("continues: 20261031-080000-cafe-p"),
+            row: [
+                "T one",
+                "in_progress",
+                "2026-11-01T09:00:00+00:00",
+                "derived",
+                "{id} 20261031-080000-cafe-p",
+                "{f}",
+            ],
+        },
+        Edit {
+            name: "all at once",
+            before: base,
+            after: vec![
+                "title: T renamed",
+                "state: done",
+                "as_of: 2026-11-02T09:30:00+00:00",
+                "commits: [c0ffee1]",
+            ],
+            row: [
+                "T renamed",
+                "done",
+                "2026-11-02T09:30:00+00:00",
+                "executed",
+                "{id} c0ffee1",
+                "c0ffee1",
+            ],
+        },
+    ]
+}
+
+/// Each edit of a stored task log that keeps its results text, imported again by
+/// `sm import tasklog <dir>` and by `sm import catch-up`: doctor lists the file, the import
+/// stores a new version that replaces the old item, and the next catch-up changes nothing.
+#[test]
+fn a_task_log_edited_outside_its_results_is_stored_again_by_import_and_catchup() {
+    let mut failures: Vec<String> = Vec::new();
+    for route in ["import tasklog", "catch-up"] {
+        for edit in edits() {
+            let e = env();
+            let id = "20261101-090000-cafe-m";
+            let dir = e.repo.join("docs/tasklog");
+            let f = dir.join("2026-11-01/090000-cafe-m.yaml");
+            write(&f, &tl_text(id, &edit.before));
+            sm_utc(&e.home, &["import", "tasklog", dir.to_str().unwrap()]);
+            let [(old, _, _)] = <[_; 1]>::try_from(task_rows(&e.home)).unwrap();
+            write(&f, &tl_text(id, &edit.after));
+            let case = format!("{route} / {}", edit.name);
+            let mut check = |what: &str, got: String, want: String| {
+                if got != want {
+                    failures.push(format!("{case}: {what}: got {got:?}, want {want:?}"));
+                }
+            };
+            check("doctor before", doctor_line(&e.home), lag_line(1));
+            if route == "import tasklog" {
+                let out = sm_utc(&e.home, &["import", "tasklog", dir.to_str().unwrap()]);
+                check(
+                    "import counts",
+                    out.lines().last().unwrap_or("").to_string(),
+                    "total=1 inserted=1 deduped=0 superseded=1 rejected=0 supersede_missing=0 failed_rows=0".into(),
+                );
+            } else {
+                let (code, _, err) = common::sm_env(
+                    &e.home,
+                    &["import", "catch-up", "--quiet"],
+                    &[("SM_UTC_OFFSET", "+00:00")],
+                );
+                assert_eq!(code, 0, "{err}");
+                let row = log_rows(&e.home).pop().unwrap();
+                check(
+                    "catch-up counts",
+                    row["parts"]["imports"]["counts"].to_string(),
+                    json!({"not_stored": 1, "inserted": 1, "failed_rows": 0}).to_string(),
+                );
+            }
+            let want: Vec<String> = edit
+                .row
+                .iter()
+                .map(|v| v.replace("{id}", id).replace("{f}", f.to_str().unwrap()))
+                .collect();
+            let got: Vec<Vec<String>> = active_task(&e.home)
+                .into_iter()
+                .map(|r| r.to_vec())
+                .collect();
+            check(
+                "active rows",
+                format!("{got:?}"),
+                format!("{:?}", vec![want]),
+            );
+            let rows = task_rows(&e.home);
+            let new = rows.last().map(|r| r.0.clone()).unwrap_or_default();
+            check(
+                "task rows",
+                format!("{rows:?}"),
+                format!(
+                    "{:?}",
+                    vec![
+                        (old.clone(), "superseded".to_string(), Some(new.clone())),
+                        (new.clone(), "active".to_string(), None)
+                    ]
+                ),
+            );
+            check("doctor after", doctor_line(&e.home), lag_line(0));
+            let again = catchup(&e);
+            check(
+                "next catch-up",
+                again["parts"]["imports"]["counts"].to_string(),
+                json!({"not_stored": 0, "inserted": 0, "failed_rows": 0}).to_string(),
+            );
+            check(
+                "rows after the next catch-up",
+                format!("{:?}", task_rows(&e.home)),
+                format!("{rows:?}"),
+            );
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// Body A with title 1, then body B, then body A with title 2: one import makes one item active
+/// and it shows title 2; the row of A with title 1 is not woken.
+#[test]
+fn a_reverted_body_with_new_fields_is_stored_with_the_new_fields() {
+    let e = env();
+    let id = "20261101-090000-cafe-r";
+    let dir = e.repo.join("docs/tasklog");
+    let f = dir.join("2026-11-01/r.yaml");
+    let a1 = tl_text(id, &BASE);
+    write(&f, &a1);
+    sm_utc(&e.home, &["import", "tasklog", dir.to_str().unwrap()]);
+    write(&f, &format!("{a1}  - and a second line\n"));
+    sm_utc(&e.home, &["import", "tasklog", dir.to_str().unwrap()]);
+    let [(a_1, _, _), (b, _, _)] = <[_; 2]>::try_from(task_rows(&e.home)).unwrap();
+    write(&f, &tl_text(id, &["title: T two", BASE[1], BASE[2]]));
+    assert_eq!(doctor_line(&e.home), lag_line(1));
+    let out = sm_utc(&e.home, &["import", "tasklog", dir.to_str().unwrap()]);
+    assert_eq!(
+        out.lines().last().unwrap(),
+        "total=1 inserted=1 deduped=0 superseded=1 rejected=0 supersede_missing=0 failed_rows=0"
+    );
+    let rows = task_rows(&e.home);
+    let a_2 = rows[2].0.clone();
+    assert_eq!(
+        rows,
+        vec![
+            (a_1, "superseded".into(), Some(b.clone())),
+            (b, "superseded".into(), Some(a_2.clone())),
+            (a_2, "active".into(), None),
+        ]
+    );
+    assert_eq!(
+        column(
+            &e.home,
+            "SELECT title FROM items WHERE kind = 'task' AND status = 'active'"
+        ),
+        ["T two"]
+    );
+    assert_eq!(doctor_line(&e.home), lag_line(0));
+    assert_eq!(
+        catchup_at(&e.home, "+00:00"),
+        json!({"not_stored": 0, "inserted": 0, "failed_rows": 0})
+    );
+    assert_eq!(task_rows(&e.home), rows);
+}
+
+/// Fields 2, then fields 1, then body B, then fields 2 again: the first row, which holds
+/// fields 2, is made active again; no fourth row is stored.
+#[test]
+fn a_revert_to_earlier_fields_makes_the_row_that_holds_them_active() {
+    let e = env();
+    let id = "20261101-090000-cafe-w";
+    let dir = e.repo.join("docs/tasklog");
+    let f = dir.join("2026-11-01/w.yaml");
+    let two = tl_text(id, &["title: T two", BASE[1], BASE[2]]);
+    let import = |text: &str| {
+        write(&f, text);
+        sm_utc(&e.home, &["import", "tasklog", dir.to_str().unwrap()]);
+    };
+    import(&two);
+    import(&tl_text(id, &BASE));
+    import(&format!("{two}  - and a second line\n"));
+    let ids: Vec<String> = task_rows(&e.home).into_iter().map(|r| r.0).collect();
+    assert_eq!(ids.len(), 3);
+    import(&two);
+    assert_eq!(
+        task_rows(&e.home),
+        vec![
+            (ids[0].clone(), "active".into(), None),
+            (ids[1].clone(), "superseded".into(), Some(ids[2].clone())),
+            (ids[2].clone(), "superseded".into(), Some(ids[0].clone())),
+        ]
+    );
+}
+
+/// The env with these handoff folders in its config.
+fn with_handoff_dirs(e: &Env, dirs: &[&Path]) {
+    let cfg = std::fs::read_to_string(e.home.join("config.toml")).unwrap();
+    let list: Vec<String> = dirs
+        .iter()
+        .map(|d| format!("\"{}\"", d.display()))
+        .collect();
+    write(
+        &e.home.join("config.toml"),
+        &cfg.replace(
+            "handoff_dirs = []",
+            &format!("handoff_dirs = [{}]", list.join(", ")),
+        ),
+    );
+}
+
+/// The active handoff rows: title, tags, as_of.
+fn active_handoffs(home: &Path) -> Vec<[String; 3]> {
+    let conn = open(home);
+    let mut stmt = conn
+        .prepare(
+            "SELECT title, tags, as_of FROM items \
+             WHERE kind = 'handoff' AND status = 'active' ORDER BY rowid",
+        )
+        .unwrap();
+    stmt.query_map([], |r| Ok([r.get(0)?, r.get(1)?, r.get(2)?]))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+}
+
+/// A handoff edited in its `#` title or its `Written:` line with the same kept sections, imported
+/// again by `sm import handoff <dir>` and by `sm import catch-up`: doctor lists it, the import
+/// stores a new version that replaces the old item, and the next catch-up changes nothing.
+#[test]
+fn a_handoff_edited_outside_its_kept_sections_is_stored_again_by_import_and_catchup() {
+    let before = "# H1\nWritten: 2026-11-01T09:00:00Z\n## Done\n- handed over\n";
+    let edits = [
+        (
+            "title",
+            "# H1 renamed\nWritten: 2026-11-01T09:00:00Z\n## Done\n- handed over\n",
+            ["H1 renamed", "handoff", "2026-11-01T09:00:00+00:00"],
+        ),
+        (
+            "Written",
+            "# H1\nWritten: 2026-11-02T10:30:00Z\n## Done\n- handed over\n",
+            ["H1", "handoff", "2026-11-02T10:30:00+00:00"],
+        ),
+    ];
+    let lag = |n: usize| {
+        format!(
+            "imports: tasklog_files=0 handoff_files=1 not_stored={n} unreadable=0 stored_tasks_without_file=0"
+        )
+    };
+    let mut failures: Vec<String> = Vec::new();
+    for route in ["import handoff", "catch-up"] {
+        for (name, after, row) in &edits {
+            let e = env();
+            let hdir = e.tmp.join("handoffs");
+            let h = hdir.join("h1.md");
+            write(&h, before);
+            with_handoff_dirs(&e, &[&hdir]);
+            sm_utc(&e.home, &["import", "handoff", hdir.to_str().unwrap()]);
+            let [(old, _, _)] = <[_; 1]>::try_from(handoff_rows(&e.home)).unwrap();
+            write(&h, after);
+            let case = format!("{route} / {name}");
+            let mut check = |what: &str, got: String, want: String| {
+                if got != want {
+                    failures.push(format!("{case}: {what}: got {got:?}, want {want:?}"));
+                }
+            };
+            check("doctor before", doctor_line(&e.home), lag(1));
+            if route == "import handoff" {
+                let out = sm_utc(&e.home, &["import", "handoff", hdir.to_str().unwrap()]);
+                check(
+                    "import counts",
+                    out.lines().last().unwrap_or("").to_string(),
+                    "total=1 inserted=1 deduped=0 superseded=1 rejected=0 supersede_missing=0 failed_rows=0".into(),
+                );
+            } else {
+                check(
+                    "catch-up counts",
+                    catchup_at(&e.home, "+00:00").to_string(),
+                    json!({"not_stored": 1, "inserted": 1, "failed_rows": 0}).to_string(),
+                );
+            }
+            let want: Vec<String> = row.iter().map(|v| v.to_string()).collect();
+            let got: Vec<Vec<String>> = active_handoffs(&e.home)
+                .into_iter()
+                .map(|r| r.to_vec())
+                .collect();
+            check(
+                "active rows",
+                format!("{got:?}"),
+                format!("{:?}", vec![want]),
+            );
+            let rows = handoff_rows(&e.home);
+            let new = rows.last().map(|r| r.0.clone()).unwrap_or_default();
+            check(
+                "handoff rows",
+                format!("{rows:?}"),
+                format!(
+                    "{:?}",
+                    vec![
+                        (old.clone(), "superseded".to_string(), Some(new.clone())),
+                        (new.clone(), "active".to_string(), None)
+                    ]
+                ),
+            );
+            check("doctor after", doctor_line(&e.home), lag(0));
+            check(
+                "next catch-up",
+                catchup_at(&e.home, "+07:00").to_string(),
+                json!({"not_stored": 0, "inserted": 0, "failed_rows": 0}).to_string(),
+            );
+            check(
+                "rows after the next catch-up",
+                format!("{:?}", handoff_rows(&e.home)),
+                format!("{rows:?}"),
+            );
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// A handoff imported once and not edited gets no new version from catch-up runs: an mtime
+/// change (with and without a `Written:` date), the run's UTC offset, a moved handoff folder,
+/// a `CWD:` line or none, a retire or an amend by hand.
+#[test]
+fn catchup_leaves_an_unchanged_handoff_alone_in_every_state() {
+    let e = env();
+    let hdir = e.tmp.join("handoffs");
+    let cwd = format!("CWD: {}\n", e.repo.display());
+    let doc = |title: &str, written: &str, extra: &str, done: &str| {
+        format!("# {title}\n{written}{extra}## Done\n- {done}\n")
+    };
+    let files = [
+        ("a", doc("A", "Written: 2026-11-01T09:00:00Z\n", "", "a")),
+        // a Written: line the parser cannot read: the as_of is the file's mtime
+        ("b", doc("B", "Written: soon\n", "", "b")),
+        ("c", doc("C", "", "", "c")),
+        // a date alone and a time with no offset
+        ("d", doc("D", "Written: 2026-11-01\n", "", "d")),
+        ("e", doc("E", "Written: 2026-11-01 09:00\n", "", "e")),
+        // a CWD the repos map resolves
+        ("f", doc("F", "Written: 2026-11-01T09:00:00Z\n", &cwd, "f")),
+        // a retire and an amend by hand
+        ("g", doc("G", "Written: 2026-11-01T09:00:00Z\n", "", "g")),
+        ("h", doc("H", "Written: 2026-11-01T09:00:00Z\n", "", "h")),
+    ];
+    for (name, text) in &files {
+        write(&hdir.join(format!("{name}.md")), text);
+    }
+    with_handoff_dirs(&e, &[&hdir]);
+    let cfg = std::fs::read_to_string(e.home.join("config.toml")).unwrap();
+    write(
+        &e.home.join("config.toml"),
+        &format!(
+            "{cfg}[repos]\nroots = [\"{}\"]\n",
+            e.tmp.join("gh").display()
+        ),
+    );
+    sm_utc(&e.home, &["import", "handoff", hdir.to_str().unwrap()]);
+    let item_of = |n: &str| {
+        column(
+            &e.home,
+            &format!("SELECT id FROM items WHERE source = 'handoff:{n}.md' AND status = 'active'"),
+        )
+        .remove(0)
+    };
+    assert_eq!(
+        column(
+            &e.home,
+            &format!("SELECT repo FROM items WHERE id = '{}'", item_of("f"))
+        ),
+        ["r1"]
+    );
+    let retired = item_of("g");
+    sm_utc(&e.home, &["retire", &retired, "--reason", "done-by-hand"]);
+    let amended = sm_utc(&e.home, &["amend", &item_of("h"), "--title", "H amended"]);
+    let amended = amended.split_whitespace().last().unwrap().to_string();
+    let clean = json!({"not_stored": 0, "inserted": 0, "failed_rows": 0});
+    assert_eq!(catchup_at(&e.home, "+00:00"), clean);
+    let before = all_rows(&e.home);
+    // seed, a..f, h's amended row
+    assert_eq!(before.iter().filter(|r| r.1 == "active").count(), 8);
+    let later = SystemTime::now() + Duration::from_secs(3600);
+    for (name, _) in &files {
+        set_mtime(&hdir.join(format!("{name}.md")), later);
+    }
+    // the handoff folder moves, and the config follows it
+    let moved = e.tmp.join("handoffs-moved");
+    std::fs::rename(&hdir, &moved).unwrap();
+    let cfg = std::fs::read_to_string(e.home.join("config.toml")).unwrap();
+    write(
+        &e.home.join("config.toml"),
+        &cfg.replace(
+            &format!("\"{}\"]", hdir.display()),
+            &format!("\"{}\"]", moved.display()),
+        ),
+    );
+    for offset in ["-05:00", "+07:00", "+00:00"] {
+        assert_eq!(catchup_at(&e.home, offset), clean, "at {offset}");
+        assert_eq!(all_rows(&e.home), before, "at {offset}");
+    }
+    assert_eq!(
+        column(
+            &e.home,
+            &format!("SELECT status FROM items WHERE id = '{retired}'")
+        ),
+        ["superseded"]
+    );
+    assert_eq!(
+        column(
+            &e.home,
+            &format!("SELECT title FROM items WHERE id = '{amended}' AND status = 'active'")
+        ),
+        ["H amended"]
+    );
+}
+
+/// Two handoffs with one file name in two folders that map to one repo, with the same kept
+/// sections and other titles: each catch-up makes the other's row active, and no row is added
+/// after the first run.
+#[test]
+fn two_handoffs_with_one_name_and_one_repo_add_no_row_after_the_first_catchup() {
+    let e = env();
+    let one = e.tmp.join("ho1");
+    let two = e.tmp.join("ho2");
+    let cwd = format!("CWD: {}\n", e.repo.display());
+    write(
+        &one.join("dup.md"),
+        &format!("# One\nWritten: 2026-11-01T09:00:00Z\n{cwd}## Done\n- same\n"),
+    );
+    write(
+        &two.join("dup.md"),
+        &format!("# Two\nWritten: 2026-11-01T09:00:00Z\n{cwd}## Done\n- same\n"),
+    );
+    with_handoff_dirs(&e, &[&one, &two]);
+    let cfg = std::fs::read_to_string(e.home.join("config.toml")).unwrap();
+    write(
+        &e.home.join("config.toml"),
+        &format!(
+            "{cfg}[repos]\nroots = [\"{}\"]\n",
+            e.tmp.join("gh").display()
+        ),
+    );
+    let mut counts = Vec::new();
+    let mut titles = Vec::new();
+    for _ in 0..4 {
+        catchup_at(&e.home, "+00:00");
+        counts.push(handoff_rows(&e.home).len());
+        titles.push(
+            column(
+                &e.home,
+                "SELECT title FROM items WHERE kind = 'handoff' AND status = 'active'",
+            )
+            .join(","),
+        );
+    }
+    assert_eq!(counts, [2, 2, 2, 2]);
+    assert_eq!(titles, ["Two", "One", "Two", "One"]);
+}
+
+/// Two copies of one task log (one task id, one repo) that differ in their fields only: each
+/// catch-up makes the other copy's row active, and after the second run no row is added.
+#[test]
+fn two_copies_of_a_task_log_that_differ_in_fields_add_no_row_after_the_second_catchup() {
+    let e = env();
+    let id = "20261101-090000-cafe-k";
+    let one = e.repo.join("docs/tasklog/2026-11-01/k.yaml");
+    let two = e.tmp.join("gh/r1copy/docs/tasklog/2026-11-01/k.yaml");
+    write(
+        &one,
+        &tl_text(id, &["repo: r1", "title: T one", BASE[1], BASE[2]]),
+    );
+    write(
+        &two,
+        &tl_text(id, &["repo: r1", "title: T two", BASE[1], BASE[2]]),
+    );
+    let mut counts = Vec::new();
+    let mut titles = Vec::new();
+    for _ in 0..4 {
+        catchup_at(&e.home, "+00:00");
+        counts.push(task_rows(&e.home).len());
+        titles.push(
+            column(
+                &e.home,
+                "SELECT title FROM items WHERE kind = 'task' AND status = 'active'",
+            )
+            .join(","),
+        );
+    }
+    // run 1 stores both copies in turn; run 2 inserts nothing new, it only switches rows
+    assert_eq!(counts, [2, 2, 2, 2]);
+    assert_eq!(titles, ["T two", "T one", "T two", "T one"]);
+    assert_eq!(
+        column(
+            &e.home,
+            "SELECT count(*) || '' FROM items WHERE kind = 'task' AND status = 'active'"
+        ),
+        ["1"]
+    );
+}
+
+/// A row the previous build wrote for `commits: abc1234` (one ref per character, and the same
+/// characters as evidence) is replaced by one catch-up with a row that holds the commit id.
+#[test]
+fn a_task_row_with_one_ref_per_commit_character_is_replaced_once() {
+    let e = env();
+    let id = "20261101-090000-cafe-u";
+    let dir = e.repo.join("docs/tasklog");
+    let f = dir.join("2026-11-01/u.yaml");
+    write(
+        &f,
+        &tl_text(id, &[BASE[0], BASE[1], BASE[2], "commits: abc1234"]),
+    );
+    sm_utc(&e.home, &["import", "tasklog", dir.to_str().unwrap()]);
+    let [(old, _, _)] = <[_; 1]>::try_from(task_rows(&e.home)).unwrap();
+    // the refs and evidence the previous build stored for this file
+    let conn = open(&e.home);
+    conn.execute(
+        &format!(
+            "UPDATE items SET refs = '{id} a b c 1 2 3 4', evidence = 'a, b, c, 1, 2, 3, 4' \
+             WHERE id = '{old}'"
+        ),
+        [],
+    )
+    .unwrap();
+    drop(conn);
+    assert_eq!(
+        catchup_at(&e.home, "+00:00"),
+        json!({"not_stored": 1, "inserted": 1, "failed_rows": 0})
+    );
+    let rows = task_rows(&e.home);
+    let new = rows[1].0.clone();
+    assert_eq!(
+        rows,
+        vec![
+            (old, "superseded".into(), Some(new.clone())),
+            (new, "active".into(), None)
+        ]
+    );
+    assert_eq!(
+        column(
+            &e.home,
+            "SELECT refs FROM items WHERE kind = 'task' AND status = 'active'"
+        ),
+        [format!("{id} abc1234")]
+    );
+    assert_eq!(
+        catchup_at(&e.home, "+00:00"),
+        json!({"not_stored": 0, "inserted": 0, "failed_rows": 0})
+    );
+    assert_eq!(task_rows(&e.home).len(), 2);
 }
 
 #[test]

@@ -2041,3 +2041,75 @@ fn put_drops_a_secret_with_spaces_in_refs() {
     assert_eq!(payload(&out[1])["items"][0]["refs"], json!(["TKT-9"]));
     assert!(!common::db_files_hold(&fx.home(), "Hunter2-example-Zz9"));
 }
+
+/// `memory_put` and `memory_amend` take the same path as `sm put` and `sm amend`: a secret pair
+/// written twice in refs is not stored.
+#[test]
+fn put_and_amend_drop_a_secret_pair_written_twice_in_refs() {
+    for (refs, want) in common::TWICE_REF_SECRETS {
+        let fx = Fx::new();
+        let repo = fx.repo_dir();
+        let (out, _) = fx.conv(
+            vec![
+                init(),
+                initialized(),
+                call(
+                    1,
+                    "memory_put",
+                    json!({"text": "Rotation note one", "tag": "decided", "refs": refs}),
+                ),
+                call(
+                    2,
+                    "memory_put",
+                    json!({"text": "Queue drain note two", "tag": "decided", "refs": "TKT-1"}),
+                ),
+            ],
+            &repo,
+        );
+        let (put, old) = (payload(&out[1]), payload(&out[2]));
+        let (out, _) = fx.conv(
+            vec![
+                init(),
+                call(
+                    1,
+                    "memory_amend",
+                    json!({"id": old["id"], "add_refs": refs}),
+                ),
+            ],
+            &repo,
+        );
+        let added = payload(&out[1]);
+        let (out, _) = fx.conv(
+            vec![
+                init(),
+                call(1, "memory_amend", json!({"id": added["id"], "refs": refs})),
+            ],
+            &repo,
+        );
+        let replaced = payload(&out[1]);
+        let (out, _) = fx.conv(
+            vec![
+                init(),
+                call(
+                    1,
+                    "memory_show",
+                    json!({"ids": [put["id"], added["id"], replaced["id"]]}),
+                ),
+            ],
+            &repo,
+        );
+        let shown: Vec<Value> = payload(&out[1])["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["refs"].clone())
+            .collect();
+        let words = |s: &str| json!(s.split(' ').collect::<Vec<_>>());
+        assert_eq!(
+            shown,
+            vec![words(want), words(&format!("TKT-1 {want}")), words(want)],
+            "{refs}"
+        );
+        assert!(!common::db_files_hold_twice_secret(&fx.home()), "{refs}");
+    }
+}

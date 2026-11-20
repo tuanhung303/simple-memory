@@ -223,6 +223,24 @@ fn service_import_proposal_idempotent_and_supersedes() {
     );
 }
 
+/// An item no file backs dedupes by its body alone: a proposal whose body the repo already
+/// holds under another title is that item, not a new version of it.
+#[test]
+fn a_proposal_with_a_stored_body_and_another_title_is_deduped() {
+    let (_d, tmp) = tmpdir();
+    let id_old = put(&tmp, "One shared proposal body", "decided", "anvil");
+    let prop_file = tmp.join("proposals.jsonl");
+    let row = json!({
+        "repo": "anvil", "kind": "decision", "title": "Another title",
+        "body": "One shared proposal body", "tag": "verified", "evidence": "run 1",
+        "as_of": "2026-10-25T12:00:00+00:00", "source": "prop:1",
+    });
+    write(&prop_file, &format!("{row}\n"));
+    let r = import(&tmp, "proposal", &prop_file, false, true);
+    assert_eq!((r.inserted, r.deduped, r.superseded), (0, 1, 0));
+    assert_eq!(run_show(&id_old, tmp.to_str()).unwrap().status, "active");
+}
+
 #[test]
 fn service_put_validations_and_query_limit() {
     let (_d, tmp) = tmpdir();
@@ -2985,4 +3003,89 @@ fn a_secret_with_spaces_in_refs_is_dropped_by_put_and_amend() {
         drop(db);
         assert!(!common::db_files_hold(&home, secret), "{refs}");
     }
+}
+
+/// A secret pair written twice in refs, with the key word or the value repeated, is not stored:
+/// the dedupe of the refs list must not take a pair apart before redaction reads it. Through
+/// `put --refs` and `amend --add-refs`.
+#[test]
+fn a_secret_pair_written_twice_in_refs_is_dropped_by_put_and_amend() {
+    for (refs, want) in common::TWICE_REF_SECRETS {
+        let (_d, tmp) = tmpdir();
+        let home = tmp.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let put = common::put(
+            &home,
+            &[
+                "--repo",
+                "anvil",
+                "--tag",
+                "derived",
+                "--refs",
+                refs,
+                "rotation note one",
+            ],
+        );
+        let old = common::put(
+            &home,
+            &[
+                "--repo",
+                "anvil",
+                "--tag",
+                "derived",
+                "--refs",
+                "TKT-1",
+                "rotation note two",
+            ],
+        );
+        let (code, out, err) = sm(&home, &["amend", &old, "--add-refs", refs]);
+        assert_eq!((code, err.as_str()), (0, ""), "{refs}");
+        let added = out.trim().to_string();
+        let db = open(&home);
+        let refs_of = |id: &str| -> String {
+            db.query_row("SELECT refs FROM items WHERE id = ?1", [id], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(
+            (refs_of(&put), refs_of(&added)),
+            (want.to_string(), format!("TKT-1 {want}")),
+            "{refs}"
+        );
+        drop(db);
+        assert!(!common::db_files_hold_twice_secret(&home), "{refs}");
+    }
+}
+
+/// The stored refs already hold the key word, and `--add-refs` brings `key: value`: the merge
+/// drops the second key word, and the value must go with it. The refs the pair touches go by
+/// value, so the stored key word goes too.
+#[test]
+fn add_refs_with_a_key_word_the_stored_refs_hold_drops_the_value() {
+    let (_d, tmp) = tmpdir();
+    let home = tmp.join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let old = common::put(
+        &home,
+        &[
+            "--repo",
+            "anvil",
+            "--tag",
+            "derived",
+            "--refs",
+            "password: TKT-2",
+            "rotation note",
+        ],
+    );
+    let (code, out, err) = sm(
+        &home,
+        &["amend", &old, "--add-refs", "password: Hunter2-example-Zz9"],
+    );
+    assert_eq!((code, err.as_str()), (0, ""));
+    let stored: String = open(&home)
+        .query_row("SELECT refs FROM items WHERE id = ?1", [out.trim()], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(stored, "TKT-2");
+    assert!(!common::db_files_hold(&home, "Hunter2-example-Zz9"));
 }

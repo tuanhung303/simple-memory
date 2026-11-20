@@ -502,11 +502,24 @@ fn catchup_does_not_resurrect_manually_retired_tasklog_handoff_or_automemory() {
         lag_fp.not_stored,
         vec![tl_file.to_str().unwrap().to_string()]
     );
-    // Re-importing restores it because it has no real retired:<reason> tag (file-deleted semantics).
+    // Re-importing stores it because it has no real retired:<reason> tag (file-deleted
+    // semantics); the row's tags no longer equal the file's, so a new version is stored in place
+    // of the old row.
     let tl_restore =
         run_import("tasklog", tl_file.to_str().unwrap(), false, false, Some(h)).unwrap();
     assert_eq!(tl_restore.inserted, 1);
-    assert_eq!(get_item(&conn, &tl_id).unwrap().unwrap().status, "active");
+    assert_eq!(
+        get_item(&conn, &tl_id).unwrap().unwrap().status,
+        "superseded"
+    );
+    let active_tl: String = conn
+        .query_row(
+            "SELECT tags FROM items WHERE source LIKE 'task:%' AND status = 'active'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(active_tl, "as_of:mtime");
 
     // 6) Editing a manually retired automemory file DOES re-import the new version!
     write_automemory(&am_root, "p-alpha", "note_one", "Edited automemory body v2");

@@ -6,6 +6,7 @@ use std::sync::LazyLock;
 
 use regex::Regex;
 
+use crate::core::redact::refs_a_match_touches;
 use crate::error::SmError;
 use crate::py::path::PyPath;
 use crate::py::str::{
@@ -173,16 +174,41 @@ pub fn split_refs(refs: Option<&RefsArg>) -> Vec<String> {
     out
 }
 
-/// `merge_refs(*sources)`.
+/// `merge_refs(*sources)`, without the refs a redaction match touches in a source string, or a
+/// list element, that the merged list does not hold as written: one that lost a token to the
+/// dedupe, or whose tokens a comma or more than one space parted (`refs_a_match_touches`). Only
+/// there can a secret lose a part before the check on the stored refs string reads it; any
+/// other string is read by that check as it stands.
 pub fn merge_refs(sources: &[Option<RefsArg>]) -> String {
     let mut combined: Vec<String> = Vec::new();
     let mut seen = HashSet::new();
-    for src in sources {
-        for tok in split_refs(src.as_ref()) {
-            if seen.insert(tok.clone()) {
-                combined.push(tok);
+    let mut cut: Vec<&str> = Vec::new();
+    for src in sources.iter().flatten() {
+        let raws: Vec<&str> = match src {
+            RefsArg::Str(s) => vec![*s],
+            RefsArg::List(v) => v.iter().map(String::as_str).collect(),
+        };
+        for raw in raws {
+            let toks: Vec<&str> = REF_SPLIT_RE
+                .split(strip(raw))
+                .filter(|t| !t.is_empty())
+                .collect();
+            let mut lost = false;
+            for tok in &toks {
+                if seen.insert(tok.to_string()) {
+                    combined.push(tok.to_string());
+                } else {
+                    lost = true;
+                }
+            }
+            if toks.len() > 1 && (lost || toks.join(" ") != strip(raw)) {
+                cut.push(raw);
             }
         }
+    }
+    if !cut.is_empty() {
+        let secret = refs_a_match_touches(cut);
+        combined.retain(|t| !secret.contains(t));
     }
     combined.join(" ")
 }
@@ -321,6 +347,42 @@ pub fn source_session_key(source: Option<&str>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn merge_refs_drops_a_secret_pair_each_source_writes_before_the_dedupe() {
+        // every importer and `sm put` build refs here; the dedupe once dropped the second
+        // `password:`, so its value no longer had a key next to it
+        let twice = "TKT-9 db password: Hunter2-example-Zz9 redis password: Hunter2-example-Yy8";
+        assert_eq!(merge_refs(&[Some(RefsArg::Str(twice))]), "TKT-9 db redis");
+        // a value the pair holds goes wherever it stands in the merged list
+        assert_eq!(
+            merge_refs(&[
+                Some(RefsArg::List(vec![
+                    "Hunter2-example-Zz9".into(),
+                    "abc1234".into()
+                ])),
+                Some(RefsArg::Str("TKT-9 password: Hunter2-example-Zz9")),
+            ]),
+            "abc1234 TKT-9"
+        );
+        // a list element is one source: a pair inside it goes, the other elements stay
+        let commits = vec![
+            "abc1234".to_string(),
+            "password: Hunter2-example-Zz9 password: Hunter2-example-Yy8".to_string(),
+        ];
+        assert_eq!(merge_refs(&[Some(RefsArg::List(commits))]), "abc1234");
+        // a comma splits a string too: a secret that holds one is read before the split
+        let comma = "TKT-1, https://user:pa,ss@host.example.com/x";
+        assert_eq!(merge_refs(&[Some(RefsArg::Str(comma))]), "TKT-1");
+        // plain repeated refs merge as before
+        assert_eq!(
+            merge_refs(&[
+                Some(RefsArg::Str("TKT-1 docs/a.md TKT-1")),
+                Some(RefsArg::List(vec!["TKT-1".into(), "abc1234".into()])),
+            ]),
+            "TKT-1 docs/a.md abc1234"
+        );
+    }
 
     fn code_root(names: &[&str]) -> RepoRoots {
         RepoRoots {

@@ -86,6 +86,28 @@ pub const SPACED_REF_SECRETS: [(&str, &str); 3] = [
     ),
 ];
 
+/// Refs that write a secret pair twice, the refs stored for them, and what an amend case needs:
+/// (refs given, refs stored). The secrets are `Hunter2-example-Zz9` and `Hunter2-example-Yy8`.
+pub const TWICE_REF_SECRETS: [(&str, &str); 3] = [
+    (
+        "TKT-9 db password: Hunter2-example-Zz9 redis password: Hunter2-example-Yy8",
+        "TKT-9 db redis",
+    ),
+    (
+        "Hunter2-example-Zz9 TKT-9 password: Hunter2-example-Zz9",
+        "TKT-9",
+    ),
+    (
+        "password: Hunter2-example-Zz9 password: Hunter2-example-Yy8 TKT-9",
+        "TKT-9",
+    ),
+];
+
+/// Does the store hold either secret of `TWICE_REF_SECRETS`?
+pub fn db_files_hold_twice_secret(home: &Path) -> bool {
+    db_files_hold(home, "Hunter2-example-Zz9") || db_files_hold(home, "Hunter2-example-Yy8")
+}
+
 /// One text column per row.
 pub fn column(home: &Path, sql: &str) -> Vec<String> {
     let conn = open(home);

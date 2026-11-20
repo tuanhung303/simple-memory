@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use indexmap::IndexMap;
 use rusqlite::Connection;
@@ -19,7 +19,9 @@ use crate::sources::iterate;
 use crate::sources::sorted_paths;
 use crate::sources::tasklog::{infer_tasklog_repo, parse_tasklog_file};
 use crate::store::connect::connect;
-use crate::store::items::{CheckResult, check_and_rebuild, file_items_are_current, fill_refs};
+use crate::store::items::{
+    CheckResult, FileRow, check_and_rebuild, file_items_are_current, file_row_holds, fill_refs,
+};
 
 const TASKLOG_GLOBS: [&str; 3] = ["*/docs/tasklog", "*/*/docs/tasklog", "*/*/*/docs/tasklog"];
 
@@ -141,13 +143,16 @@ pub(crate) fn import_lag_by_repo(
     // dedupes, never a row of another file or a manual or amended row.
     // A row another repo's item of the same source replaced (the rule before one item per repo)
     // is not stored either: the import restores it.
+    // An active task log or handoff row counts only when it also holds the file's title, tags,
+    // as_of, evidence and refs (`file_row_holds`), as the import keeps only such a row.
     let stored = "i.status = 'active' OR i.superseded_by IS NOT NULL OR i.tags LIKE '%retired:%'";
     let mut stmt = conn.prepare(&format!(
         "SELECT i.repo, i.source, i.status, i.superseded_by, i.tags, i.content_hash, \
-         ifnull(b.source = i.source AND b.repo != i.repo, 0) FROM items i \
+         ifnull(b.source = i.source AND b.repo != i.repo, 0), i.title, i.tag, i.evidence, \
+         i.as_of, i.refs FROM items i \
          LEFT JOIN items b ON b.id = i.superseded_by WHERE {stored}"
     ))?;
-    let mut active_hashes: HashSet<(String, String, String)> = HashSet::new();
+    let mut active_hashes: HashMap<(String, String, String), FileRow> = HashMap::new();
     let mut active_sources: HashSet<(String, String)> = HashSet::new();
     let mut stored_hashes: HashSet<(String, String, String)> = HashSet::new();
     {
@@ -162,7 +167,15 @@ pub(crate) fn import_lag_by_repo(
             let hidden: bool = r.get(6)?;
             let key = (repo.clone(), source.clone(), hash);
             if status == "active" {
-                active_hashes.insert(key.clone());
+                let row = FileRow {
+                    title: r.get(7)?,
+                    tags: tags.clone(),
+                    tag: r.get(8)?,
+                    evidence: r.get(9)?,
+                    as_of: r.get(10)?,
+                    refs: r.get(11)?,
+                };
+                active_hashes.insert(key.clone(), row);
                 active_sources.insert((repo, source));
             }
             if status == "active" || (superseded_by.is_some() && !hidden) || has_retired_tag(&tags)
@@ -171,10 +184,16 @@ pub(crate) fn import_lag_by_repo(
             }
         }
     }
-    let is_stored = |repo: &str, source: &str, hash: &str| {
-        let key = (repo.to_string(), source.to_string(), hash.to_string());
+    let is_stored = |repo: &str, source: &str, red: &crate::core::item::Item| {
+        let key = (
+            repo.to_string(),
+            source.to_string(),
+            red.content_hash.clone(),
+        );
         if active_sources.contains(&(repo.to_string(), source.to_string())) {
-            active_hashes.contains(&key)
+            active_hashes
+                .get(&key)
+                .is_some_and(|row| file_row_holds(row, red))
         } else {
             stored_hashes.contains(&key)
         }
@@ -204,8 +223,8 @@ pub(crate) fn import_lag_by_repo(
         // a stored source does not make a task log stored: a hand edit keeps the source and
         // changes the body, and the import then supersedes the old item. The import stores the
         // redacted body, so compare that hash, or a body with a redacted part is listed each run.
-        let stored_hash = redact_for_store(&item, None).content_hash;
-        if !is_stored(&item.repo, &item.source, &stored_hash) {
+        let red = redact_for_store(&item, None);
+        if !is_stored(&item.repo, &item.source, &red) {
             lag.not_stored.push(f.as_str().to_string());
         }
     }
@@ -223,8 +242,7 @@ pub(crate) fn import_lag_by_repo(
                 continue;
             }
         };
-        let stored_hash = redact_for_store(&item, None).content_hash;
-        if !is_stored(&item.repo, &item.source, &stored_hash) {
+        if !is_stored(&item.repo, &item.source, &redact_for_store(&item, None)) {
             lag.not_stored.push(f.as_str().to_string());
         }
     }

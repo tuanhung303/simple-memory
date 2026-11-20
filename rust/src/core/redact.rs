@@ -11,6 +11,7 @@
 //!   deterministic once the spans are fixed (see `key_value_find`), and a scan is linear where
 //!   Python's search is quadratic on a long run of key chars.
 
+use std::collections::HashSet;
 use std::sync::LazyLock;
 
 use indexmap::IndexMap;
@@ -187,13 +188,15 @@ static SECRET_PATTERNS: LazyLock<Vec<(&'static str, Matcher)>> = LazyLock::new(|
         // the scheme: in `DB_postgres://` or `2redis://` the scheme starts after the word char,
         // and all after `://` is the same from any start in the scheme. The marker of a pattern
         // above (or of a private block) stands for a token, so in the user and the password it
-        // counts as one char that is no `:`, `.` or digit. Every class here leaves out `@`, so a
-        // match still ends at the first `@` after `://`
+        // counts as one char that is no `:`, `.` or digit. A token is never a host, so after a
+        // user that holds a marker all up to `@` is the password, whatever it starts with or
+        // holds. Every class here leaves out `@`, so a match still ends at the first `@` after
+        // `://`
         (
             "url_credentials",
             Matcher::Plain(
                 Regex::new(&format!(
-                    "[A-Za-z][A-Za-z0-9+.-]*://(?:{u}*:[^{s_inner}/@\"']+@|(?:[^{s_inner}/:@\"'.]|{token_mark})*:{u}*(?:[^{s_inner}/:@\"'0-9]|{token_mark}){u}*(?:/{u}*)+@)",
+                    "[A-Za-z][A-Za-z0-9+.-]*://(?:{u}*:[^{s_inner}/@\"']+@|(?:[^{s_inner}/:@\"'.]|{token_mark})*:{u}*(?:[^{s_inner}/:@\"'0-9]|{token_mark}){u}*(?:/{u}*)+@|{u}*{token_mark}{u}*:[^{s_inner}@\"']+@)",
                     u = format!("(?:[^{s_inner}/:@\"']|{token_mark})"),
                 ))
                 .expect("redact pattern compiles"),
@@ -635,12 +638,22 @@ fn redacted_bytes(text: &str) -> Vec<bool> {
 
 /// The refs in `refs` that a match of `redact_text` over the whole string covers or touches, so
 /// a secret written with spaces in it (`password: value`) goes with each ref it spans.
-fn refs_redaction_touches(refs: &str) -> std::collections::HashSet<&str> {
+fn refs_redaction_touches(refs: &str) -> HashSet<&str> {
     let hit = redacted_bytes(refs);
     REF_TOKEN_RE
         .find_iter(refs)
         .filter(|m| hit[m.range()].contains(&true))
         .map(|m| m.as_str())
+        .collect()
+}
+
+/// The refs that a match over each raw refs string, as its writer gave it, covers or touches. A
+/// write path drops them by value from the refs it builds: its split dedupes, and a dedupe can
+/// take the key word of a second `key: value` pair from its value.
+pub fn refs_a_match_touches<'a>(raws: impl IntoIterator<Item = &'a str>) -> HashSet<String> {
+    raws.into_iter()
+        .flat_map(refs_redaction_touches)
+        .map(String::from)
         .collect()
 }
 
@@ -658,12 +671,11 @@ pub fn redact_for_store(item: &Item, mut counts: Option<&mut Counts>) -> Item {
     let evidence = redact_text(&item.evidence, counts.as_deref_mut(), Some(&mut removed));
     let tags = redact_text(&item.tags, counts.as_deref_mut(), None);
     let source = redact_text(&item.source, counts, None);
-    let mut redacted_refs = std::collections::HashSet::new();
+    let mut redacted_refs = HashSet::new();
     if title != item.title || body != item.body || evidence != item.evidence {
-        let in_kept: std::collections::HashSet<String> =
-            extract_refs(Some(&format!("{title}\n{body}\n{evidence}")))
-                .into_iter()
-                .collect();
+        let in_kept: HashSet<String> = extract_refs(Some(&format!("{title}\n{body}\n{evidence}")))
+            .into_iter()
+            .collect();
         let raw_text = format!("{}\n{}\n{}", item.title, item.body, item.evidence);
         redacted_refs = extract_refs(Some(&raw_text))
             .into_iter()
@@ -1345,6 +1357,22 @@ mod tests {
     #[test]
     fn url_credentials_whose_user_or_password_is_a_token_an_earlier_pattern_replaced() {
         // the token's marker holds `:`, which once made the URL rule miss a `/` password
+        // two more passwords, put together from the parts of the documented example key: one
+        // starts with `/`, one has only a digit before its first `/`
+        let example = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
+        let slash_first = format!(
+            "s3a://AKIAIOSFODNN7EXAMPLE:{}{}@my-bucket/data",
+            &example[13..],
+            &example[..13]
+        );
+        let digit_first = format!(
+            "s3a://AKIAIOSFODNN7EXAMPLE:3/E{}{}{}@my-bucket/data",
+            &example[..13],
+            &example[14..21],
+            &example[22..39]
+        );
+        assert!(slash_first.contains(":/K7MDENG/") && digit_first.contains(":3/EwJalr"));
+        assert_eq!((slash_first.len(), digit_first.len()), (82, 82));
         let cases = [
             (
                 "s3a://AKIAIOSFODNN7EXAMPLE:wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY@my-bucket/data",
@@ -1371,6 +1399,28 @@ mod tests {
                 "[REDACTED:url_credentials]h.example.com/p",
                 "aws_key",
             ),
+            // after a token user, the text up to `@` is the password whatever it starts with or
+            // holds: a leading `/`, only digits before the first `/`, a `:` and a `/`
+            (
+                slash_first.as_str(),
+                "[REDACTED:url_credentials]my-bucket/data",
+                "aws_key",
+            ),
+            (
+                digit_first.as_str(),
+                "[REDACTED:url_credentials]my-bucket/data",
+                "aws_key",
+            ),
+            (
+                "s3a://AKIAIOSFODNN7EXAMPLE:wJalrXUtnFEMI:K7MDENG/bPxRfiCYEXAMPLEKEY@my-bucket/data",
+                "[REDACTED:url_credentials]my-bucket/data",
+                "aws_key",
+            ),
+            (
+                "git clone https://ghp_EXAMPLEexampleEXAMPLEexampleEXAMPLE01:/Hunter2-example@git.example.com/o/r",
+                "git clone [REDACTED:url_credentials]git.example.com/o/r",
+                "github_token",
+            ),
         ];
         for (raw, want, kind) in cases {
             assert_eq!(
@@ -1382,12 +1432,13 @@ mod tests {
                 "{raw}"
             );
         }
-        // a marker in the authority is never a host: a digit port after it stays as it is
+        // a marker in the authority is never a host, so digits after its `:` are no port but the
+        // password
         assert_eq!(
             counted("https://AKIAIOSFODNN7EXAMPLE:8080/a@b"),
             (
-                "https://[REDACTED:aws_key]:8080/a@b".to_string(),
-                counts(&[("aws_key", 1)])
+                "[REDACTED:url_credentials]b".to_string(),
+                counts(&[("aws_key", 1), ("url_credentials", 1)])
             )
         );
     }
@@ -1533,9 +1584,17 @@ mod tests {
             "secret: Hunter2-example9-{t}-Zz",
             "secret: Hunter2-example9-{t}",
         ];
+        // a password that reads as `host:port/path` after a plain user: it is caught only after
+        // a token user, so only for the patterns that run before url_credentials (no `name=`)
+        let token_user_shapes = [
+            "s3a://{t}:/Hunter2-example@h.example.com/p",
+            "s3a://{t}:3/Hunter2-example@h.example.com/p",
+            "s3a://{t}:Hunter2-example:x/y@h.example.com/p",
+        ];
         let mut leaks = Vec::new();
         for (token, core) in TOKENS_BEFORE_URL_AND_KEY_VALUE {
-            for shape in shapes {
+            let user_shapes = token_user_shapes.iter().filter(|_| !token.contains('='));
+            for shape in shapes.iter().chain(user_shapes) {
                 // a URL inside a URL's user or password part is no credential URL shape, and a
                 // bare colon value stops at `:` and `/` (`kv_bare`)
                 if token.contains("://") && (shape.contains("://") || shape.contains(": ")) {
@@ -1623,6 +1682,60 @@ mod tests {
         let got = redact_text(&format!("{run}@h"), None, None);
         let want = format!("{}[REDACTED:url_credentials]h", "x://a:b/".repeat(149_999));
         assert!(got == want, "long run ends: {:?}", &got[got.len() - 40..]);
+        // a token user with a long password of many `/` and no `@` is one linear scan too
+        let pw = "/a".repeat(150_000);
+        let got = redact_text(&format!("s3a://AKIAIOSFODNN7EXAMPLE:{pw}"), None, None);
+        assert!(
+            got == format!("s3a://[REDACTED:aws_key]:{pw}"),
+            "no @: {:?}",
+            &got[..40]
+        );
+        let got = redact_text(&format!("s3a://AKIAIOSFODNN7EXAMPLE:{pw}@h"), None, None);
+        assert!(got == "[REDACTED:url_credentials]h", "@h: {:?}", &got[..40]);
+    }
+
+    #[test]
+    fn a_token_user_takes_the_password_only_up_to_an_at_in_the_authority() {
+        let unchanged = [
+            "https://example.com:8080/a@b",
+            "ssh://git@host.example.com:22/path",
+            "https://user@host/p",
+            "scp://host:/path/to/file and mail me@example.com",
+        ];
+        for raw in unchanged {
+            assert_eq!(counted(raw), (raw.to_string(), Counts::new()), "{raw}");
+        }
+        // the token is replaced, the rest stays: no `@` before the whitespace, or the token is
+        // in the path or the query, not the user part
+        let cases = [
+            (
+                "see s3://AKIAIOSFODNN7EXAMPLE:/prefix/ for details",
+                "see s3://[REDACTED:aws_key]:/prefix/ for details",
+            ),
+            (
+                "see s3://AKIAIOSFODNN7EXAMPLE:/prefix/ or mail me@example.com",
+                "see s3://[REDACTED:aws_key]:/prefix/ or mail me@example.com",
+            ),
+            (
+                "https://host.example.com/AKIAIOSFODNN7EXAMPLE:/x@y",
+                "https://host.example.com/[REDACTED:aws_key]:/x@y",
+            ),
+            (
+                "https://host.example.com:8080/k/AKIAIOSFODNN7EXAMPLE:3/x@y",
+                "https://host.example.com:8080/k/[REDACTED:aws_key]:3/x@y",
+            ),
+            (
+                "https://host.example.com/p?k=AKIAIOSFODNN7EXAMPLE:/x@y",
+                "https://host.example.com/p?k=[REDACTED:aws_key]:/x@y",
+            ),
+        ];
+        for (raw, want) in cases {
+            assert_eq!(
+                counted(raw),
+                (want.to_string(), counts(&[("aws_key", 1)])),
+                "{raw}"
+            );
+        }
     }
 
     #[test]
