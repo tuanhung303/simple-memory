@@ -1382,6 +1382,297 @@ fn service_import_stores_a_file_whose_body_a_manual_item_holds() {
     assert_eq!(not_stored(), 0);
 }
 
+/// A store with task log root `gh` (repo r1), no auto-memory files and an empty transcript
+/// root for the catch-up's sessions part; (home, task log dir).
+fn amend_store(tmp: &Path) -> (PathBuf, PathBuf) {
+    let home = tmp.join("home");
+    let root = tmp.join("gh");
+    let dir = root.join("r1/docs/tasklog/2026-11-01");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::create_dir_all(tmp.join(".claude/projects")).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+    write(
+        &home.join("config.toml"),
+        &format!(
+            "[automemory]\nroot = \"{}\"\n[upkeep]\ntasklog_roots = [\"{}\"]\nhandoff_dirs = []\n",
+            empty_dir(tmp).display(),
+            root.display()
+        ),
+    );
+    (home, dir)
+}
+
+/// A task log in `dir` whose stored body is "Results:\n- {result}".
+fn amend_tasklog(dir: &Path, name: &str, id: &str, result: &str) -> PathBuf {
+    let p = dir.join(format!("{name}.yaml"));
+    write(
+        &p,
+        &format!("id: {id}\ntitle: T {name}\nresults:\n  - {result}\n"),
+    );
+    p
+}
+
+/// `sm amend <args>`, which must work (stderr may hold a near-duplicate notice); the new id.
+fn amend_ok(home: &Path, args: &[&str]) -> String {
+    let mut a = vec!["amend"];
+    a.extend_from_slice(args);
+    let (code, out, err) = sm(home, &a);
+    assert_eq!(code, 0, "amend {args:?}: {err}");
+    assert!(!err.contains("error") && !err.contains("UNIQUE"), "{err}");
+    out.trim().to_string()
+}
+
+/// A title-only, a tag-only and a refs-only amend of `id`, each of which must work; the last id.
+fn amend_each_field(home: &Path, id: &str) -> String {
+    let mut id = id.to_string();
+    for args in [
+        ["--title", "Renamed by amend"],
+        ["--add-tags", "amend-tag"],
+        ["--add-refs", "TKT-909"],
+    ] {
+        id = amend_ok(home, &[&id, args[0], args[1]]);
+    }
+    let row = &common::column(
+        home,
+        &format!("SELECT title || '|' || tags || '|' || refs FROM items WHERE id = '{id}'"),
+    )[0];
+    assert!(row.starts_with("Renamed by amend|"), "{row}");
+    assert!(
+        row.contains("amend-tag") && row.contains("TKT-909"),
+        "{row}"
+    );
+    id
+}
+
+/// Two catch-ups that store, supersede and retire nothing.
+fn catchup_changes_nothing(home: &Path) {
+    let rows = "SELECT id || ' ' || status || ' ' || coalesce(superseded_by, '-') FROM items \
+                ORDER BY rowid";
+    let before = common::column(home, rows);
+    for _ in 0..2 {
+        let (code, _, err) = sm(home, &["import", "catch-up", "--quiet"]);
+        let log = std::fs::read_to_string(home.join("catchup.log")).unwrap();
+        let row: serde_json::Value = serde_json::from_str(log.lines().last().unwrap()).unwrap();
+        assert_eq!((code, err.as_str()), (0, ""), "{row}");
+        assert_eq!(
+            row["parts"]["imports"]["counts"],
+            json!({"not_stored": 0, "inserted": 0, "failed_rows": 0}),
+            "{row}"
+        );
+        assert_eq!(common::column(home, rows), before);
+    }
+}
+
+const ACTIVE_SOURCE_TITLE: &str =
+    "SELECT source || ' ' || title FROM items WHERE status = 'active' ORDER BY source, title";
+
+/// Route A: a manual item, then a task log with its body (both active); the manual item still
+/// takes a title, tag or refs amend, and a second manual item still cannot take its body.
+#[test]
+fn service_amend_of_a_manual_item_whose_body_a_file_item_holds() {
+    let (_d, tmp) = tmpdir();
+    let (home, dir) = amend_store(&tmp);
+    let manual = put(&home, "Results:\n- tests pass", "assumed", "r1");
+    let p = amend_tasklog(&dir, "a", "20261101-090000-aaaa", "tests pass");
+    let res = import(&home, "tasklog", &p, false, false);
+    assert_eq!((res.inserted, res.deduped), (1, 0));
+    let last = amend_each_field(&home, &manual);
+    assert_eq!(
+        common::column(&home, ACTIVE_SOURCE_TITLE),
+        [" Renamed by amend", "task:20261101-090000-aaaa T a"]
+    );
+    // the manual dedupe still holds, and the error names the manual item, not the file's
+    let other = put(&home, "other notes", "assumed", "r1");
+    let (code, _, err) = sm(
+        &home,
+        &["amend", &other, "--body", "Results:\n- tests pass"],
+    );
+    assert_eq!(code, 1);
+    assert!(
+        err.contains(&format!(
+            "Repo 'r1' already has an active item with the same body ({last}); use sm supersede {other} {last}"
+        )),
+        "{err}"
+    );
+    assert!(!err.contains("UNIQUE"), "{err}");
+    catchup_changes_nothing(&home);
+}
+
+/// Route B: a store from 0.6.0, whose amend gave a task log item the source '', next to the
+/// item the file now has; the 0.6.0 row still takes a title, tag or refs amend.
+#[test]
+fn service_amend_of_a_row_amended_by_0_6_0_next_to_its_file_item() {
+    let (_d, tmp) = tmpdir();
+    let (home, dir) = amend_store(&tmp);
+    amend_tasklog(&dir, "a", "20261101-090000-aaaa", "tests pass");
+    import(&home, "tasklog", &dir, false, false);
+    let task = common::column(&home, "SELECT id FROM items WHERE status = 'active'")[0].clone();
+    common::open(&home)
+        .execute(
+            "INSERT INTO items (id, repo, kind, title, body, refs, tags, source, tag, evidence, \
+             as_of, status, superseded_by, content_hash) \
+             SELECT 'm_amended_by_060', repo, kind, 'Amended in 0.6.0', body, refs, tags, '', tag, \
+             evidence, as_of, 'active', NULL, content_hash FROM items WHERE id = ?1",
+            [&task],
+        )
+        .unwrap();
+    amend_each_field(&home, "m_amended_by_060");
+    assert_eq!(
+        common::column(&home, ACTIVE_SOURCE_TITLE),
+        [" Renamed by amend", "task:20261101-090000-aaaa T a"]
+    );
+    catchup_changes_nothing(&home);
+}
+
+/// Route C: a file item amended to a manual item's body leaves the manual item free to amend; a
+/// manual item amended to a file item's body leaves the file item stored.
+#[test]
+fn service_amend_next_to_an_item_of_another_slot_with_its_body() {
+    let (_d, tmp) = tmpdir();
+    let (home, dir) = amend_store(&tmp);
+    amend_tasklog(&dir, "a", "20261101-090000-aaaa", "tests pass");
+    amend_tasklog(&dir, "b", "20261101-100000-bbbb", "billing shipped");
+    import(&home, "tasklog", &dir, false, false);
+    let file_a = common::column(
+        &home,
+        "SELECT id FROM items WHERE source = 'task:20261101-090000-aaaa'",
+    )[0]
+    .clone();
+    let manual = put(&home, "deploy steps for TKT-101", "assumed", "r1");
+    let amended_a = amend_ok(&home, &[&file_a, "--body", "deploy steps for TKT-101"]);
+    amend_each_field(&home, &manual);
+    amend_ok(&home, &[&amended_a, "--add-tags", "y"]);
+    // the other way: a manual item amended to the body file b's item holds; b's item stays
+    let notes = put(&home, "draft notes", "assumed", "r1");
+    amend_ok(&home, &[&notes, "--body", "Results:\n- billing shipped"]);
+    assert_eq!(
+        common::column(&home, ACTIVE_SOURCE_TITLE),
+        [
+            " Renamed by amend",
+            // the default title follows the new body's first line
+            " Results:",
+            "amended:task:20261101-090000-aaaa T a",
+            "task:20261101-100000-bbbb T b"
+        ]
+    );
+    catchup_changes_nothing(&home);
+}
+
+/// Every row's id, repo, source, status and successor, in insert order.
+const ALL_ROWS: &str = "SELECT id || ' ' || repo || ' [' || source || '] ' || status || ' ' || \
+                        coalesce(superseded_by, '-') FROM items ORDER BY rowid";
+
+/// A refused amend: exit 1, the supersede hint that names `holder`, no raw index error, and no
+/// row stored, superseded or changed.
+fn assert_amend_refused(home: &Path, args: &[&str], repo: &str, old: &str, holder: &str) {
+    let before = common::column(home, ALL_ROWS);
+    let mut a = vec!["amend"];
+    a.extend_from_slice(args);
+    let (code, out, err) = sm(home, &a);
+    assert_eq!(code, 1, "{args:?}: {out} {err}");
+    assert!(
+        err.contains(&format!(
+            "Repo '{repo}' already has an active item with the same body ({holder}); use sm supersede {old} {holder}"
+        )),
+        "{err}"
+    );
+    assert!(
+        !out.contains("UNIQUE") && !err.contains("UNIQUE"),
+        "{out} {err}"
+    );
+    assert_eq!(common::column(home, ALL_ROWS), before);
+}
+
+/// The id of the one active item of `repo` with `source`.
+fn active_id(home: &Path, repo: &str, source: &str) -> String {
+    common::column(
+        home,
+        &format!(
+            "SELECT id FROM items WHERE status = 'active' AND repo = '{repo}' AND source = '{source}'"
+        ),
+    )[0]
+    .clone()
+}
+
+/// An amended file item holds the slot amended:<source> of its repo. After the file changes, the
+/// importer stores the new text as a row of the file's own source; amending that row to the
+/// amended row's body would take the held slot, so it is refused with the supersede hint.
+#[test]
+fn service_amend_into_a_taken_amended_slot_is_refused() {
+    let (_d, tmp) = tmpdir();
+    let (home, dir) = amend_store(&tmp);
+    let p = amend_tasklog(&dir, "a", "20261101-090000-aaaa", "tests pass");
+    import(&home, "tasklog", &p, false, false);
+    let file_id = active_id(&home, "r1", "task:20261101-090000-aaaa");
+    let amended = amend_ok(&home, &[&file_id, "--title", "Renamed by amend"]);
+    amend_tasklog(&dir, "a", "20261101-090000-aaaa", "tests pass again");
+    assert_eq!(import(&home, "tasklog", &p, false, false).inserted, 1);
+    let newer = active_id(&home, "r1", "task:20261101-090000-aaaa");
+    assert_amend_refused(
+        &home,
+        &[&newer, "--body", "Results:\n- tests pass"],
+        "r1",
+        &newer,
+        &amended,
+    );
+    // the same row still takes an amend that leaves the held body alone
+    amend_ok(&home, &[&newer, "--add-tags", "y"]);
+    assert_eq!(
+        common::column(&home, ACTIVE_SOURCE_TITLE),
+        [
+            "amended:task:20261101-090000-aaaa Renamed by amend",
+            "amended:task:20261101-090000-aaaa T a"
+        ]
+    );
+    catchup_changes_nothing(&home);
+}
+
+/// `amend --repo` moves a file item to another repo, where its new slot amended:<source> is
+/// either free (the amend works and the importer then stores nothing) or held by an item of
+/// that repo with the same body (refused with the supersede hint).
+#[test]
+fn service_amend_to_another_repo_follows_the_slot_of_the_new_repo() {
+    let (_d, tmp) = tmpdir();
+    let (home, dir_r1) = amend_store(&tmp);
+    let dir_r2 = tmp.join("gh/r2/docs/tasklog/2026-11-01");
+    std::fs::create_dir_all(&dir_r2).unwrap();
+    amend_tasklog(&dir_r1, "a", "20261101-090000-aaaa", "tests pass");
+    amend_tasklog(&dir_r1, "b", "20261101-100000-bbbb", "billing shipped");
+    amend_tasklog(&dir_r2, "b", "20261101-100000-bbbb", "billing shipped");
+    import(&home, "tasklog", &dir_r1, false, false);
+    import(&home, "tasklog", &dir_r2, false, false);
+    let b = "task:20261101-100000-bbbb";
+
+    // slot free in r2: the amend works, the row is in r2, and the file's repo r1 is not refilled
+    let moved = amend_ok(
+        &home,
+        &[
+            &active_id(&home, "r1", "task:20261101-090000-aaaa"),
+            "--repo",
+            "r2",
+        ],
+    );
+    assert_eq!(
+        common::column(
+            &home,
+            &format!(
+                "SELECT repo || ' [' || source || '] ' || status FROM items WHERE id = '{moved}'"
+            )
+        ),
+        ["r2 [amended:task:20261101-090000-aaaa] active"]
+    );
+    catchup_changes_nothing(&home);
+
+    // slot held in r2: r2's own copy of file b was amended, so it holds amended:<b>
+    let held = amend_ok(
+        &home,
+        &[&active_id(&home, "r2", b), "--title", "Renamed by amend"],
+    );
+    let r1_b = active_id(&home, "r1", b);
+    assert_amend_refused(&home, &[&r1_b, "--repo", "r2"], "r2", &r1_b, &held);
+    assert_eq!(active_id(&home, "r1", b), r1_b);
+}
+
 #[test]
 fn service_import_stores_a_file_whose_body_an_amended_item_holds() {
     let (_d, tmp) = tmpdir();

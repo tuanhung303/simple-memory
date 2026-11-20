@@ -180,7 +180,16 @@ static SECRET_PATTERNS: LazyLock<Vec<(&'static str, Matcher)>> = LazyLock::new(|
             )),
         ),
         ("bearer", word(&format!("Bearer[{s_inner}]+[A-Za-z0-9._~+/=-]{{8,}}"))),
-        ("url_credentials", word(&format!("[A-Za-z][A-Za-z0-9+.-]*://[^{s_inner}/:@\"']+:[^{s_inner}/@\"']+@"))),
+        // `scheme://user:password@`, the user may be empty. A `/` in the password is taken only
+        // where the text cannot be `host:port/path`: the user holds no `.`, the password holds no
+        // `:`, and its text before the first `/` is not empty and not all digits
+        (
+            "url_credentials",
+            word(&format!(
+                "[A-Za-z][A-Za-z0-9+.-]*://(?:{u}*:[^{s_inner}/@\"']+@|[^{s_inner}/:@\"'.]*:{u}*[^{s_inner}/:@\"'0-9]{u}*(?:/{u}*)+@)",
+                u = format!("[^{s_inner}/:@\"']"),
+            )),
+        ),
         ("azure_sas", word("sig=[A-Za-z0-9%+/=_-]{16,}")),
         // before key_value, whose `Token=` value would run to the end of the URL
         (
@@ -1020,6 +1029,81 @@ mod tests {
             redact_text("tokens=claude-haiku-4-5", None, None),
             "[REDACTED:key_value]"
         );
+    }
+
+    #[test]
+    fn url_credentials_with_an_empty_user_or_a_slash_in_the_password() {
+        let cases = [
+            (
+                "REDIS_URL=redis://:Rd5Pw4Qz3Xc2@cache.example.invalid:6379/0",
+                "REDIS_URL=[REDACTED:url_credentials]cache.example.invalid:6379/0",
+            ),
+            (
+                "amqp://:Gu3stPw@mq.example.invalid:5672/",
+                "[REDACTED:url_credentials]mq.example.invalid:5672/",
+            ),
+            (
+                "postgres://app:Hunter2/pass@db.example.invalid:5432/app",
+                "[REDACTED:url_credentials]db.example.invalid:5432/app",
+            ),
+            (
+                "mongodb+srv://user:p/w@cluster0.example.invalid/db",
+                "[REDACTED:url_credentials]cluster0.example.invalid/db",
+            ),
+            (
+                "redis://:pa/ss//w0rd@cache.example.invalid",
+                "[REDACTED:url_credentials]cache.example.invalid",
+            ),
+            (
+                "postgres://app:Pg7Normal@db.example.invalid:5432/app",
+                "[REDACTED:url_credentials]db.example.invalid:5432/app",
+            ),
+        ];
+        for (raw, want) in cases {
+            assert_eq!(
+                counted(raw),
+                (want.to_string(), counts(&[("url_credentials", 1)])),
+                "{raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn url_credentials_leave_ports_paths_and_emails_in_urls() {
+        // a `/` ends the authority, so each of these is a host, a port and a path
+        let text = "https://cdn.example.com:443/img/logo@2x.png\n\
+                    http://localhost:3000/@scope/pkg\n\
+                    http://example.com:8080/users/bob@example.com/profile\n\
+                    ssh://github.com:org/repo.git@v1.2\n\
+                    https://example.com/a:b/c@d\n\
+                    see https://example.com:8080/docs,mailto:bob@example.com\n\
+                    https://example.com/contact;bob@example.com\n\
+                    http://intranet:8080/team/bob@corp\n\
+                    http://localhost:/x@y\n\
+                    http://[::1]:8080/@scope/pkg\n\
+                    http://[fe80::1]/x@y\n\
+                    file://C:/Users/bob@corp/notes.txt\n\
+                    docker://registry:5000/team/img@sha256:abc123\n\
+                    https://bob@example.com:8443/a/b@c\n\
+                    git+ssh://git@github.com:org/repo.git\n\
+                    mailto:bob@example.com\n";
+        assert_eq!(counted(text), (text.to_string(), Counts::new()));
+        // Known limit, listed in the README: on a host without a dot, `word:word/path@suffix`
+        // is read as a user and a password with a `/`, so an scp-style path in an ssh:// URL is
+        // replaced as if it were a credential. The same text on a host with a dot stays (above).
+        assert_eq!(
+            counted("ssh://host:org/repo.git@v1.2"),
+            (
+                "[REDACTED:url_credentials]v1.2".to_string(),
+                counts(&[("url_credentials", 1)])
+            )
+        );
+        // a long run of authority-like fragments stays one linear scan
+        let run = "x://a:b/".repeat(150_000);
+        assert_eq!(redact_text(&run, None, None), run);
+        let got = redact_text(&format!("{run}@h"), None, None);
+        let want = format!("{}[REDACTED:url_credentials]h", "x://a:b/".repeat(149_999));
+        assert!(got == want, "long run ends: {:?}", &got[got.len() - 40..]);
     }
 
     #[test]

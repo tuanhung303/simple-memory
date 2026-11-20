@@ -1259,14 +1259,10 @@ pub fn amend_item(
             return Err(SmError::value("No changes to apply"));
         }
 
-        // dedupe by the old item's source, so an amend of one file's item does not collide with
-        // another file's; the new row's index slot (its amended:<source>, or '') must also be free
+        // refused only when another active item holds the new row's index slot (its
+        // amended:<source>, or ''); an item of another slot with this body is a distinct item
         let (repo, hash) = (&new_item.repo, &new_item.content_hash);
-        let other = match active_by_hash(conn, repo, hash, &old.source, Some(old_id))? {
-            Some(id) => Some(id),
-            None => active_in_slot(conn, repo, hash, &new_item.source, Some(old_id))?,
-        };
-        if let Some(other) = other {
+        if let Some(other) = active_in_slot(conn, repo, hash, &new_item.source, Some(old_id))? {
             return Err(SmError::value(format!(
                 "Repo '{}' already has an active item with the same body ({other}); use sm supersede {old_id} {other}",
                 new_item.repo

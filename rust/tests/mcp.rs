@@ -1650,6 +1650,59 @@ fn memory_list_matches_cli_validates_guards_and_logs_usage() {
     assert_eq!(rows[0]["flags"]["status"], "active");
 }
 
+/// A manual item whose body a task log item also holds still takes a title or tag amend.
+#[test]
+fn memory_amend_of_an_item_whose_body_a_file_item_holds() {
+    let fx = Fx::new();
+    let repo = fx.repo_dir();
+    let (out, _) = fx.conv(
+        vec![
+            init(),
+            call(
+                1,
+                "memory_put",
+                json!({"text": "Queue timeout is 30 seconds", "tag": "assumed"}),
+            ),
+        ],
+        &repo,
+    );
+    let manual = payload(&out[1])["id"].as_str().unwrap().to_string();
+    simple_memory::store::connect::connect(fx.home().join("memory.db").to_str().unwrap(), None)
+        .unwrap()
+        .execute(
+            "INSERT INTO items (id, repo, kind, title, body, refs, tags, source, tag, evidence, \
+             as_of, status, superseded_by, content_hash) \
+             SELECT 'm_file', repo, kind, title, body, refs, tags, 'task:20261101-090000-aaaa', \
+             tag, evidence, as_of, 'active', NULL, content_hash FROM items WHERE id = ?1",
+            [&manual],
+        )
+        .unwrap();
+    let (out, _) = fx.conv(
+        vec![
+            init(),
+            call(
+                1,
+                "memory_amend",
+                json!({"id": manual, "title": "Queue timeout"}),
+            ),
+        ],
+        &repo,
+    );
+    assert_ne!(out[1]["result"]["isError"], true, "{}", out[1]);
+    let renamed = payload(&out[1])["id"].as_str().unwrap().to_string();
+    let (out, _) = fx.conv(
+        vec![
+            init(),
+            call(1, "memory_amend", json!({"id": renamed, "add_tags": "ops"})),
+        ],
+        &repo,
+    );
+    assert_ne!(out[1]["result"]["isError"], true, "{}", out[1]);
+    let tagged = payload(&out[1]);
+    assert_eq!(tagged["old_id"], renamed);
+    assert_eq!(tagged["body_changed"], false);
+}
+
 #[test]
 fn memory_amend_and_memory_retire_round_trip_and_validate_guards() {
     let fx = Fx::new();

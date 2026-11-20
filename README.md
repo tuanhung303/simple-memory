@@ -281,6 +281,7 @@ Environment variables:
 
 - **Local by default**: Everything stays in your local `memory.db`. Model calls run only when Claude Haiku is invoked through your local `claude -p` for `[prompt_hook]` query distillation or `[capture]` session cards (disable either in `config.toml`).
 - **Automatic write redaction**: `put_item` and `put_items_batch` strip `<private>...</private>` blocks and replace known secret shapes (private keys, cloud access keys, API tokens such as `sk-`/token prefixes, JWTs, bearer tokens, signed URL query parameters, URL credentials, and `password=`-style assignments) with `[REDACTED:<kind>]` before SQLite insert.
+- **Redaction limits**: Redaction is pattern-based and best effort; a credential URL is caught in the `user:password@` form, including an empty user (`redis://:password@host`) and a `/` in the password after a user without a dot. It is not caught when the user holds a dot and the password a `/`, when the password starts with `/` or has only digits before its first `/`, when the password holds both `:` and `/` or a quote, or when a bare token stands alone as the user part with no known token shape; text of the form `scheme://word:word/path@suffix` on a host without a dot (such as an scp-style path inside an `ssh://` URL) is replaced as if it were a credential.
 - **Known limits**: Search is lexical/prefix-based with configurable `[keyword_aliases]` rather than semantic embeddings; multi-machine sync is manual (copy `memory.db` or files under `backups/`).
 
 </details>
