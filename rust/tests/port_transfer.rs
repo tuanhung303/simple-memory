@@ -260,3 +260,25 @@ fn import_counts_and_names_the_rows_the_redactor_rewrote() {
         (3, vec!["m_body".to_string(), "m_title".to_string()])
     );
 }
+
+/// A secret written with spaces in a row's refs goes with every ref it spans; the plain ref
+/// before it is kept.
+#[test]
+fn import_drops_a_secret_with_spaces_in_refs() {
+    for (refs, secret) in common::SPACED_REF_SECRETS {
+        let (_d, tmp) = tmpdir();
+        let home = tmp.join("a");
+        std::fs::create_dir_all(&home).unwrap();
+        let path = write_rows(
+            &tmp.join("in.jsonl"),
+            &[row("m_r", "rotation note", json!({"refs": refs}))],
+        );
+        let (code, _, err) = sm(&home, &["import", "jsonl", path.to_str().unwrap()]);
+        assert_eq!((code, err.as_str()), (0, ""), "{refs}");
+        let stored: String = db(&home)
+            .query_row("SELECT refs FROM items WHERE id = 'm_r'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(stored, "TKT-9", "{refs}");
+        assert!(!common::db_files_hold(&home, secret), "{refs}");
+    }
+}

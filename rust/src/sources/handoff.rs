@@ -2,14 +2,14 @@ use std::sync::LazyLock;
 
 use regex::Regex;
 
-use crate::core::item::{Item, epoch_to_as_of, new_item_id, validate_as_of};
+use crate::core::item::{Item, check_stored_as_of, epoch_to_as_of, new_item_id, validate_as_of};
 use crate::core::refs::{RefsArg, RepoRoots, extract_refs, merge_refs};
 use crate::core::tags::append_tag;
 use crate::error::{Base, SmError};
 use crate::py::path::{Errors, PyPath};
 use crate::py::str::ci_literal;
 use crate::py::str::{RE_S, lower, splitlines, strip, translate};
-use crate::sources::{mtime, sorted_paths};
+use crate::sources::{file_error, mtime, sorted_paths};
 
 static HEADING_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(&translate(r"^(#{2,3})\s+(.+?)\s*$")).expect("heading pattern"));
@@ -121,6 +121,7 @@ pub fn parse_handoff_file(path: &str, repos: Option<&RepoRoots>) -> Result<Item,
         }
         Err(e) => return Err(e),
     };
+    check_stored_as_of(&as_of)?;
 
     let repo = infer_repo_for_handoff(&p, &cwd_raw, known_repos);
     let refs = merge_refs(&[Some(RefsArg::List(extract_refs(Some(&format!(
@@ -144,18 +145,16 @@ pub fn load_handoffs(path: &str, repos: Option<&RepoRoots>) -> Result<Vec<Item>,
     let p = PyPath::new(path).expanduser()?.resolve()?;
     let default = RepoRoots::default();
     let known_repos = repos.unwrap_or(&default);
+    let parse = |f: &str| parse_handoff_file(f, Some(known_repos)).map_err(|e| file_error(f, e));
     if p.is_file() {
-        return Ok(vec![parse_handoff_file(p.as_str(), Some(known_repos))?]);
+        return Ok(vec![parse(p.as_str())?]);
     }
     if p.is_dir() {
         let files: Vec<PyPath> = sorted_paths(p.rglob("*.md")?)
             .into_iter()
             .filter(|f| f.as_str().ends_with(".md"))
             .collect();
-        return files
-            .iter()
-            .map(|f| parse_handoff_file(f.as_str(), Some(known_repos)))
-            .collect();
+        return files.iter().map(|f| parse(f.as_str())).collect();
     }
     Err(SmError::new(
         Base::Os,

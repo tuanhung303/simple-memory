@@ -303,6 +303,14 @@ pub fn validate_as_of(
     Ok(local_iso_text(local, local_off))
 }
 
+/// The as_of check the store runs on each item it writes. `validate_as_of` reads a date-only or
+/// naive value in local time, so east of UTC it can give a time in year 1 whose UTC time is in
+/// year 0, which this check refuses (OverflowError); a file parser runs it so the file is
+/// refused, not the write of every file.
+pub fn check_stored_as_of(as_of: &str) -> Result<(), SmError> {
+    validate_as_of(Some(as_of), false, false).map(|_| ())
+}
+
 /// `parse_as_of_epoch_opt(value)`: `Ok(None)` for empty or unparseable values; preserves `0.0`
 /// (`1970-01-01T00:00:00Z`) and negative pre-1970 epochs; `OverflowError` passes through.
 pub fn parse_as_of_epoch_opt(value: Option<&str>) -> Result<Option<f64>, SmError> {

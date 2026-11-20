@@ -64,6 +64,28 @@ pub fn open(home: &Path) -> Connection {
         .expect("connect")
 }
 
+/// Does the store's database file or its write-ahead log hold `needle` anywhere?
+pub fn db_files_hold(home: &Path, needle: &str) -> bool {
+    ["memory.db", "memory.db-wal"].iter().any(|f| {
+        std::fs::read(home.join(f))
+            .is_ok_and(|b| b.windows(needle.len()).any(|w| w == needle.as_bytes()))
+    })
+}
+
+/// A secret written with spaces in a refs value (key, value and the plain ref before them) and
+/// the part of each that must not be stored.
+pub const SPACED_REF_SECRETS: [(&str, &str); 3] = [
+    (
+        "TKT-9 aws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+        "wJalrXUtnFEMI",
+    ),
+    ("TKT-9 password: Hunter2-example-Zz9", "Hunter2-example-Zz9"),
+    (
+        "TKT-9 Bearer Hunter2-example-token-0001",
+        "Hunter2-example-token-0001",
+    ),
+];
+
 /// One text column per row.
 pub fn column(home: &Path, sql: &str) -> Vec<String> {
     let conn = open(home);

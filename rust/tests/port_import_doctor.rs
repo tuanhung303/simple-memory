@@ -2311,6 +2311,15 @@ const TOO_MANY: &str = "YAML document expands to too many nodes (its aliases cop
 /// `sm <args>` as `common::sm` runs it, killed after `secs`: a run past the limit fails the
 /// test instead of hanging the test run.
 fn sm_within(home: &Path, args: &[&str], secs: u64) -> (i32, String, String) {
+    sm_within_env(home, args, secs, &[])
+}
+
+fn sm_within_env(
+    home: &Path,
+    args: &[&str],
+    secs: u64,
+    env: &[(&str, &str)],
+) -> (i32, String, String) {
     use std::io::Read;
     let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_sm"))
         .args(args)
@@ -2319,6 +2328,7 @@ fn sm_within(home: &Path, args: &[&str], secs: u64) -> (i32, String, String) {
         .env_remove("SM_PARITY_NOW")
         .env_remove("SM_PARITY_SEED")
         .env_remove("SM_PARITY_TRACE")
+        .envs(env.iter().copied())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
@@ -2500,6 +2510,371 @@ fn an_impossible_date_or_time_is_refused_and_the_next_file_imported() {
     }
 }
 
+// ---------------------------------------------------------------- one file's value errors
+
+/// A local zone east of UTC: 0001-01-01 00:00 local is in year 0 in UTC.
+const EAST_OF_UTC: [(&str, &str); 2] = [("SM_UTC_OFFSET", "+07:00"), ("TZ", "Asia/Bangkok")];
+
+struct OddFiles {
+    _d: tempfile::TempDir,
+    home: PathBuf,
+    day: PathBuf,
+    odd_task: String,
+    odd_note: String,
+}
+
+/// A git repo whose task log folder holds `odd.yaml` (with `task_extra`) next to a normal task
+/// log, and a project folder whose memory holds `odd-note.md` (with `note_extra` in its front
+/// matter) next to a normal note.
+fn odd_files(task_extra: &str, note_extra: &str) -> OddFiles {
+    let (d, tmp) = tmpdir();
+    let home = tmp.join("home");
+    std::fs::create_dir_all(tmp.join(".claude/projects")).unwrap();
+    let repo = tmp.join("gh/r1");
+    std::fs::create_dir_all(&repo).unwrap();
+    common::git(&["init", "-q", repo.to_str().unwrap()]);
+    let day = repo.join("docs/tasklog/2026-11-01");
+    let odd_task = day.join("090500-odd.yaml");
+    write(
+        &odd_task,
+        &format!("id: 20261101-090500-odd\ntitle: odd\n{task_extra}results:\n  - x\n"),
+    );
+    write(
+        &day.join("090600-good.yaml"),
+        "id: 20261101-090600-good\ntitle: Good one\nstate: done\nas_of: 2026-11-01T09:06:00+00:00\nresults:\n  - normal result line\n",
+    );
+    let am = tmp.join("projects");
+    write(
+        &am.join("p-alpha/s1.jsonl"),
+        &format!("{}\n", json!({"cwd": repo.to_str().unwrap()})),
+    );
+    let odd_note = am.join("p-alpha/memory/odd-note.md");
+    write(
+        &odd_note,
+        &format!("---\nname: odd-note\ndescription: Odd note\n{note_extra}---\nodd body\n"),
+    );
+    write(
+        &am.join("p-alpha/memory/good-note.md"),
+        "---\nname: good-note\ndescription: Good note\ntype: project\n---\nnormal note body\n",
+    );
+    std::fs::create_dir_all(tmp.join("ho")).unwrap();
+    write(
+        &home.join("config.toml"),
+        &format!(
+            "[automemory]\nroot = \"{}\"\n[upkeep]\ntasklog_roots = [\"{}\"]\nhandoff_dirs = [\"{}\"]\n",
+            am.display(),
+            tmp.join("gh").display(),
+            tmp.join("ho").display()
+        ),
+    );
+    OddFiles {
+        _d: d,
+        home,
+        day,
+        odd_task: odd_task.to_str().unwrap().to_string(),
+        odd_note: odd_note.to_str().unwrap().to_string(),
+    }
+}
+
+/// `sm <args>` in a zone east of UTC, killed after 20 s.
+fn sm_east(f: &OddFiles, args: &[&str]) -> (i32, String, String) {
+    sm_within_env(&f.home, args, 20, &EAST_OF_UTC)
+}
+
+fn sources(f: &OddFiles) -> Vec<String> {
+    common::column(&f.home, "SELECT source FROM items ORDER BY source")
+}
+
+fn no_traceback(out: &str, err: &str) {
+    assert!(
+        !out.contains("Traceback") && !err.contains("Traceback"),
+        "{out}\n{err}"
+    );
+}
+
+/// A task log whose as_of is in year 0 in UTC (OverflowError after the YAML load): `sm import
+/// tasklog <dir>` names the file and stores nothing; doctor lists it as unreadable; a catch-up
+/// counts it as a failed row and stores every other file.
+fn task_log_in_year_zero_utc_is_named_and_the_rest_imported(as_of: &str) {
+    let f = odd_files(&format!("as_of: {as_of}\n"), "");
+    let (code, out, err) = sm_east(&f, &["doctor", "--imports"]);
+    assert_eq!((code, err.as_str()), (0, ""), "{out}");
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(
+        lines[1],
+        "imports: tasklog_files=2 handoff_files=0 not_stored=1 unreadable=1 stored_tasks_without_file=0"
+    );
+    let row = format!("unreadable: {}: date value out of range", f.odd_task);
+    assert!(lines.contains(&row.as_str()), "{out}");
+
+    let (code, out, err) = sm_east(&f, &["import", "tasklog", f.day.to_str().unwrap()]);
+    assert_eq!(
+        (code, out.as_str(), err.as_str()),
+        (
+            1,
+            "",
+            format!(
+                "error: {}: OverflowError: date value out of range\n",
+                f.odd_task
+            )
+            .as_str()
+        )
+    );
+    assert_eq!(sources(&f), Vec::<String>::new());
+
+    let (code, out, err) = sm_east(&f, &["import", "catch-up"]);
+    assert_eq!((code, err.as_str()), (0, ""), "{out}");
+    no_traceback(&out, &err);
+    assert!(
+        out.lines()
+            .any(|l| l == "imports: ok not_stored=1 inserted=1 failed_rows=1"),
+        "{out}"
+    );
+    assert_eq!(
+        sources(&f),
+        [
+            "automemory:p-alpha/good-note.md",
+            "automemory:p-alpha/odd-note.md",
+            "task:20261101-090600-good"
+        ]
+    );
+}
+
+#[test]
+fn a_task_log_dated_year_one_in_local_time_is_named_and_the_rest_imported() {
+    task_log_in_year_zero_utc_is_named_and_the_rest_imported("0001-01-01");
+}
+
+#[test]
+fn a_task_log_dated_year_one_east_of_utc_is_named_and_the_rest_imported() {
+    task_log_in_year_zero_utc_is_named_and_the_rest_imported("0001-01-01T00:00:00+10:00");
+}
+
+/// A note whose front matter loads but whose field conversion raises (a date in year 0 in UTC,
+/// an int too long for str()): doctor and `sm import automemory` count it as unreadable and
+/// name it; the normal note is stored; a catch-up stores every other file.
+fn note_with_a_field_that_cannot_convert_is_unreadable(note_extra: &str) {
+    let f = odd_files("", note_extra);
+    let row = format!("unreadable: {}", f.odd_note);
+    let (code, out, err) = sm_east(&f, &["doctor", "--imports"]);
+    assert_eq!((code, err.as_str()), (0, ""), "{out}");
+    let lines: Vec<&str> = out.lines().collect();
+    assert!(
+        lines.contains(
+            &"automemory: files=2 not_stored=1 stored_without_file=0 unmapped=0 unreadable=1"
+        ),
+        "{out}"
+    );
+    assert!(lines.contains(&row.as_str()), "{out}");
+
+    let (code, out, err) = sm_east(&f, &["import", "automemory"]);
+    assert_eq!((code, err.as_str()), (0, ""), "{out}");
+    assert_eq!(
+        out.lines().collect::<Vec<_>>(),
+        [
+            "import automemory (applied): files=2 added=1 updated=0 retired=0 unchanged=0 unreadable=1 unmapped=0 yaml_errors=0",
+            row.as_str()
+        ]
+    );
+    assert_eq!(sources(&f), ["automemory:p-alpha/good-note.md"]);
+
+    let (code, out, err) = sm_east(&f, &["import", "catch-up"]);
+    assert_eq!((code, err.as_str()), (0, ""), "{out}");
+    no_traceback(&out, &err);
+    assert!(
+        out.lines().any(|l| l
+            == "automemory: ok added=0 updated=0 retired=0 unchanged=1 unreadable=1 unmapped=0"),
+        "{out}"
+    );
+    assert_eq!(
+        sources(&f),
+        [
+            "automemory:p-alpha/good-note.md",
+            "task:20261101-090500-odd",
+            "task:20261101-090600-good"
+        ]
+    );
+}
+
+#[test]
+fn a_note_modified_in_year_one_local_time_is_unreadable() {
+    note_with_a_field_that_cannot_convert_is_unreadable("modified: 0001-01-01\n");
+}
+
+#[test]
+fn a_note_name_past_4300_digits_is_unreadable() {
+    note_with_a_field_that_cannot_convert_is_unreadable(&format!("name: 0x{}\n", "f".repeat(3572)));
+}
+
+/// `commits: 1234567` (a short commit id of digits, which YAML reads as an int) is one commit
+/// id, stored as the one-item list `commits: ["1234567"]` is.
+#[test]
+fn a_commits_value_of_one_number_is_one_commit_id() {
+    let f = odd_files("commits: 1234567\n", "");
+    let (code, out, err) = sm_east(&f, &["import", "tasklog", f.day.to_str().unwrap()]);
+    assert_eq!((code, err.as_str()), (0, ""), "{out}");
+    assert_eq!(
+        out.lines().last(),
+        Some(
+            "total=2 inserted=2 deduped=0 superseded=0 rejected=0 supersede_missing=0 failed_rows=0"
+        )
+    );
+    let scalar = refs_tag_evidence(&f.home, "task:20261101-090500-odd");
+    assert_eq!(
+        (scalar.1.as_str(), scalar.2.as_str()),
+        ("executed", "1234567")
+    );
+    let g = odd_files("commits:\n  - \"1234567\"\n", "");
+    let (code, _, err) = sm_east(&g, &["import", "tasklog", g.odd_task.as_str()]);
+    assert_eq!((code, err.as_str()), (0, ""));
+    assert_eq!(
+        refs_tag_evidence(&g.home, "task:20261101-090500-odd"),
+        scalar
+    );
+}
+
+fn refs_tag_evidence(home: &Path, source: &str) -> (String, String, String) {
+    common::open(home)
+        .query_row(
+            "SELECT refs, tag, evidence FROM items WHERE source = ?1",
+            [source],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap()
+}
+
+/// A `commits` value that is one string, plain or quoted, is one commit id (never one id per
+/// character), stored as the one-item list of that value is: `1e10` is a string in YAML 1.1.
+#[test]
+fn a_commits_value_of_one_string_is_one_commit_id() {
+    let stored = |commits: &str| {
+        let f = odd_files(&format!("commits:{commits}\n"), "");
+        let (code, out, err) = sm_east(&f, &["import", "tasklog", f.odd_task.as_str()]);
+        assert_eq!((code, err.as_str()), (0, ""), "{out}");
+        refs_tag_evidence(&f.home, "task:20261101-090500-odd")
+    };
+    let scalars = ["abc1234", "\"1234567\"", "1e10"];
+    let got: Vec<_> = scalars.iter().map(|v| stored(&format!(" {v}"))).collect();
+    assert_eq!(
+        got.iter()
+            .map(|(_, tag, evidence)| (tag.as_str(), evidence.as_str()))
+            .collect::<Vec<_>>(),
+        [
+            ("executed", "abc1234"),
+            ("executed", "1234567"),
+            ("executed", "1e10")
+        ]
+    );
+    let listed: Vec<_> = scalars
+        .iter()
+        .map(|v| stored(&format!("\n  - {v}")))
+        .collect();
+    assert_eq!(got, listed);
+}
+
+/// A handoff written in year 0 in UTC is that file's problem, as for a task log: doctor lists
+/// it as unreadable, `sm import handoff <dir>` names it and stores nothing, and a catch-up
+/// counts it as a failed row and stores every other file.
+#[test]
+fn a_handoff_written_in_year_one_local_time_is_named_and_the_rest_imported() {
+    let f = odd_files("", "");
+    let ho = f.home.parent().unwrap().join("ho");
+    let odd = ho.join("odd.md");
+    write(&odd, "# Odd handoff\nWritten: 0001-01-01\n## Done\n- x\n");
+    write(
+        &ho.join("good.md"),
+        "# Good handoff\nWritten: 2026-11-01T09:00:00+00:00\n## Done\n- y\n",
+    );
+    let odd = odd.to_str().unwrap();
+    let (code, out, err) = sm_east(&f, &["doctor", "--imports"]);
+    assert_eq!((code, err.as_str()), (0, ""), "{out}");
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(
+        lines[1],
+        "imports: tasklog_files=2 handoff_files=2 not_stored=3 unreadable=1 stored_tasks_without_file=0"
+    );
+    let row = format!("unreadable: {odd}: date value out of range");
+    assert!(lines.contains(&row.as_str()), "{out}");
+
+    let (code, out, err) = sm_east(&f, &["import", "handoff", ho.to_str().unwrap()]);
+    assert_eq!(
+        (code, out.as_str(), err.as_str()),
+        (
+            1,
+            "",
+            format!("error: {odd}: OverflowError: date value out of range\n").as_str()
+        )
+    );
+    assert_eq!(sources(&f), Vec::<String>::new());
+
+    let (code, out, err) = sm_east(&f, &["import", "catch-up"]);
+    assert_eq!((code, err.as_str()), (0, ""), "{out}");
+    no_traceback(&out, &err);
+    assert!(
+        out.lines()
+            .any(|l| l == "imports: ok not_stored=3 inserted=3 failed_rows=1"),
+        "{out}"
+    );
+    assert_eq!(
+        sources(&f),
+        [
+            "automemory:p-alpha/good-note.md",
+            "automemory:p-alpha/odd-note.md",
+            "handoff:good.md",
+            "task:20261101-090500-odd",
+            "task:20261101-090600-good"
+        ]
+    );
+}
+
+/// A proposal line is one proposal: a line whose as_of is in year 0 in UTC is one rejected
+/// line, and the next line is stored. A proposal file that is not UTF-8 stops the import with
+/// an error that names it.
+#[test]
+fn a_proposal_line_dated_year_one_is_rejected_and_a_file_not_utf8_is_named() {
+    let f = odd_files("", "");
+    let dir = f.home.parent().unwrap().join("prop");
+    let line = |title: &str, as_of: &str| {
+        json!({"repo": "r1", "kind": "fact", "title": title, "body": "B", "tag": "derived",
+               "evidence": "e", "as_of": as_of})
+        .to_string()
+    };
+    write(
+        &dir.join("a.jsonl"),
+        &format!(
+            "{}\n{}\n",
+            line("Odd", "0001-01-01"),
+            line("Fine", "2026-11-01T09:00:00+00:00")
+        ),
+    );
+    let args = ["import", "proposal", dir.to_str().unwrap(), "--apply"];
+    let (code, out, err) = sm_east(&f, &args);
+    assert_eq!((code, err.as_str()), (0, ""), "{out}");
+    assert_eq!(
+        out.lines().last(),
+        Some(
+            "total=1 inserted=1 deduped=0 superseded=0 rejected=1 supersede_missing=0 failed_rows=0"
+        )
+    );
+    assert_eq!(common::column(&f.home, "SELECT title FROM items"), ["Fine"]);
+
+    let b = dir.join("b.jsonl");
+    std::fs::write(&b, b"\xff\n").unwrap();
+    let (code, out, err) = sm_east(&f, &args);
+    assert_eq!(
+        (code, out.as_str(), err.as_str()),
+        (
+            1,
+            "",
+            format!(
+                "error: {}: 'utf-8' codec can't decode byte 0xff in position 0: invalid start byte\n",
+                b.display()
+            )
+            .as_str()
+        )
+    );
+}
+
 // ---------------------------------------------------------------- URL credentials
 
 /// A scheme right after a letter, a digit or `_` still has its password redacted, through
@@ -2532,4 +2907,82 @@ fn url_credentials_after_a_word_char_are_redacted_by_put_and_handoff_import() {
         handoff_body.contains(&format!("- {want}")) && !handoff_body.contains("Hunter2"),
         "{handoff_body}"
     );
+}
+
+/// A token in a URL's user or password part, or at the start of a key=value value, leaves no
+/// part of the secret next to it in clear, through `sm put` and through a handoff import.
+#[test]
+fn a_token_next_to_a_second_secret_is_redacted_by_put_and_handoff_import() {
+    let (_d, tmp) = tmpdir();
+    let home = tmp.join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let raw = "s3a://AKIAIOSFODNN7EXAMPLE:wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY@my-bucket/data \
+               https://AKIAIOSFODNN7EXAMPLE:wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY@s3.amazonaws.com/b \
+               password=AKIAIOSFODNN7EXAMPLE/Hunter2-example \
+               aws_token: AKIAIOSFODNN7EXAMPLE:wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
+    let want = "[REDACTED:url_credentials]my-bucket/data [REDACTED:url_credentials]s3.amazonaws.com/b \
+                [REDACTED:key_value] [REDACTED:key_value]";
+    let id = common::put(&home, &["--repo", "anvil", "--tag", "derived", raw]);
+    let h = tmp.join("handoffs/tokens.md");
+    write(&h, &format!("# Tokens\n## Done\n- {raw}\n"));
+    let (code, _, err) = sm(&home, &["import", "handoff", h.to_str().unwrap()]);
+    assert_eq!((code, err.as_str()), (0, ""));
+    let db = open(&home);
+    let put_body: String = db
+        .query_row("SELECT body FROM items WHERE id = ?1", [&id], |r| r.get(0))
+        .unwrap();
+    assert_eq!(put_body, want);
+    let handoff_body: String = db
+        .query_row(
+            "SELECT body FROM items WHERE source LIKE 'handoff:%'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(
+        handoff_body.contains(&format!("- {want}"))
+            && !handoff_body.contains("Hunter2")
+            && !handoff_body.contains("wJalr"),
+        "{handoff_body}"
+    );
+}
+
+/// A secret written with spaces in a refs value goes with every ref it spans, through
+/// `put --refs` and `amend --add-refs`; the plain ref before it is kept.
+#[test]
+fn a_secret_with_spaces_in_refs_is_dropped_by_put_and_amend() {
+    for (refs, secret) in common::SPACED_REF_SECRETS {
+        let (_d, tmp) = tmpdir();
+        let home = tmp.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let put = common::put(
+            &home,
+            &[
+                "--repo",
+                "anvil",
+                "--tag",
+                "derived",
+                "--refs",
+                refs,
+                "rotation note one",
+            ],
+        );
+        let old = common::put(
+            &home,
+            &["--repo", "anvil", "--tag", "derived", "rotation note two"],
+        );
+        // amend stores a new item that replaces the old one, and prints its id
+        let (code, out, err) = sm(&home, &["amend", &old, "--add-refs", refs]);
+        assert_eq!((code, err.as_str()), (0, ""), "{refs}");
+        let amended = out.trim().to_string();
+        let db = open(&home);
+        for id in [&put, &amended] {
+            let stored: String = db
+                .query_row("SELECT refs FROM items WHERE id = ?1", [id], |r| r.get(0))
+                .unwrap();
+            assert_eq!(stored, "TKT-9", "{refs}");
+        }
+        drop(db);
+        assert!(!common::db_files_hold(&home, secret), "{refs}");
+    }
 }

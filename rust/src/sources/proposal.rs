@@ -1,4 +1,4 @@
-use crate::core::item::{Item, new_item_id, validate_as_of};
+use crate::core::item::{Item, check_stored_as_of, new_item_id, validate_as_of};
 use crate::core::refs::{RefsArg, extract_refs, merge_refs};
 use crate::core::tags::{validate_kind, validate_tag};
 use crate::error::{Base, SmError};
@@ -6,7 +6,7 @@ use crate::py::json::loads;
 use crate::py::path::{Errors, PyPath};
 use crate::py::str::{splitlines, strip};
 use crate::py::value::{PyValue, type_name};
-use crate::sources::{dict_get, sorted_paths, truthy};
+use crate::sources::{dict_get, file_error, sorted_paths, truthy};
 
 fn coerce_str_or_list(val: Option<&PyValue>) -> Result<String, SmError> {
     match val {
@@ -76,6 +76,7 @@ pub fn parse_proposal_line(line: &str) -> Result<Item, SmError> {
         _ => String::new(),
     };
     let as_of = validate_as_of(Some(&as_of_raw), false, false)?;
+    check_stored_as_of(&as_of)?;
     let item_id = new_item_id(None);
     let refs = merge_refs(&[
         Some(RefsArg::Str(&refs_raw)),
@@ -109,8 +110,8 @@ pub fn strip_code_fences(text: &str) -> String {
     strip(&lines.join("\n")).to_string()
 }
 
-/// `load_proposals_with_rejects(path)`: the items, and the count of lines that raised
-/// ValueError (JSONDecodeError included) or TypeError.
+/// `load_proposals_with_rejects(path)`: the items, and the count of lines that raised: a line
+/// is one proposal, so its error (a bad JSON row, a field that cannot convert) rejects it alone.
 pub fn load_proposals_with_rejects(path: &str) -> Result<(Vec<Item>, usize), SmError> {
     let p = PyPath::new(path).expanduser()?.resolve()?;
     let files = if p.is_file() {
@@ -128,7 +129,10 @@ pub fn load_proposals_with_rejects(path: &str) -> Result<(Vec<Item>, usize), SmE
     let mut items = Vec::new();
     let mut rejected = 0;
     for f in &files {
-        let cleaned = strip_code_fences(&f.read_text(Errors::Strict)?);
+        let text = f
+            .read_text(Errors::Strict)
+            .map_err(|e| file_error(f.as_str(), e))?;
+        let cleaned = strip_code_fences(&text);
         for raw_line in splitlines(&cleaned, false) {
             let s = strip(raw_line);
             if s.is_empty() {
@@ -136,8 +140,7 @@ pub fn load_proposals_with_rejects(path: &str) -> Result<(Vec<Item>, usize), SmE
             }
             match parse_proposal_line(s) {
                 Ok(it) => items.push(it),
-                Err(e) if e.is(Base::Value) || e.is(Base::Type) => rejected += 1,
-                Err(e) => return Err(e),
+                Err(_) => rejected += 1,
             }
         }
     }

@@ -8,6 +8,8 @@
 //! test reads the installed package version, this one reads the crate version: the Rust server
 //! reports its own (an accepted difference, service/mcp.rs `server_info`).
 
+mod common;
+
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -2015,4 +2017,27 @@ fn a_put_whose_id_cannot_be_written_back_is_refused_before_it_runs() {
         err.contains("sm mcp: reply error: 'utf-8' codec can't encode character '\\udcff'"),
         "{err}"
     );
+}
+
+/// `memory_put` stores its refs through the same redaction as `sm put`: a secret written with
+/// spaces in them goes with every ref it spans, the plain ref before it is kept.
+#[test]
+fn put_drops_a_secret_with_spaces_in_refs() {
+    let fx = Fx::new();
+    let repo = fx.repo_dir();
+    let (out, _) = fx.conv(
+        vec![
+            init(),
+            initialized(),
+            call(1, "memory_put", json!({"text": "Rotation note", "tag": "decided", "refs": "TKT-9 password: Hunter2-example-Zz9"})),
+        ],
+        &repo,
+    );
+    let put = payload(&out[1]);
+    let (out, _) = fx.conv(
+        vec![init(), call(1, "memory_show", json!({"ids": [put["id"]]}))],
+        &repo,
+    );
+    assert_eq!(payload(&out[1])["items"][0]["refs"], json!(["TKT-9"]));
+    assert!(!common::db_files_hold(&fx.home(), "Hunter2-example-Zz9"));
 }

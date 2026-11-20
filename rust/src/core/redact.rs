@@ -151,6 +151,7 @@ static SECRET_PATTERNS: LazyLock<Vec<(&'static str, Matcher)>> = LazyLock::new(|
     let s_inner = &*S_INNER;
     let an = "A-Za-z0-9";
     let word = |core: &str| Matcher::Guarded(Guarded::new(w, core, is_word, None));
+    let token_mark = "\\[REDACTED:(?:private|private_key|aws_key|github_token|slack_token|google_api_key|sk_key|jwt|bearer)\\]";
     vec![
         (
             "private_key",
@@ -184,13 +185,16 @@ static SECRET_PATTERNS: LazyLock<Vec<(&'static str, Matcher)>> = LazyLock::new(|
         // where the text cannot be `host:port/path`: the user holds no `.`, the password holds no
         // `:`, and its text before the first `/` is not empty and not all digits. No guard before
         // the scheme: in `DB_postgres://` or `2redis://` the scheme starts after the word char,
-        // and all after `://` is the same from any start in the scheme
+        // and all after `://` is the same from any start in the scheme. The marker of a pattern
+        // above (or of a private block) stands for a token, so in the user and the password it
+        // counts as one char that is no `:`, `.` or digit. Every class here leaves out `@`, so a
+        // match still ends at the first `@` after `://`
         (
             "url_credentials",
             Matcher::Plain(
                 Regex::new(&format!(
-                    "[A-Za-z][A-Za-z0-9+.-]*://(?:{u}*:[^{s_inner}/@\"']+@|[^{s_inner}/:@\"'.]*:{u}*[^{s_inner}/:@\"'0-9]{u}*(?:/{u}*)+@)",
-                    u = format!("[^{s_inner}/:@\"']"),
+                    "[A-Za-z][A-Za-z0-9+.-]*://(?:{u}*:[^{s_inner}/@\"']+@|(?:[^{s_inner}/:@\"'.]|{token_mark})*:{u}*(?:[^{s_inner}/:@\"'0-9]|{token_mark}){u}*(?:/{u}*)+@)",
+                    u = format!("(?:[^{s_inner}/:@\"']|{token_mark})"),
                 ))
                 .expect("redact pattern compiles"),
             ),
@@ -286,9 +290,40 @@ fn kv_aws_secret(t: &str, i: usize) -> Option<usize> {
     (n == 40 && !char_at(t, end).is_some_and(is_v)).then_some(end)
 }
 
-/// `(?!\[REDACTED:)(?![0-9]+(?!V))V{8,}["']?` at `w`: the end of the match.
+/// Does the value at `w` start with a marker an earlier pattern left, with more of the value
+/// after its `]`? The V run from `w` ends at that `]` (V holds no `]`), so it reads the marker only.
+fn marker_then_more(t: &str, w: usize) -> bool {
+    let close = run(t, w, is_v).0;
+    t[w..].starts_with("[REDACTED:")
+        && t.as_bytes().get(close) == Some(&b']')
+        && char_at(t, close + 1).is_some_and(is_v)
+}
+
+/// The end of the marker an earlier pattern left at `i`, `[REDACTED:<kind>]`.
+fn marker_end(t: &str, i: usize) -> Option<usize> {
+    let k = i + "[REDACTED:".len();
+    if !t[i..].starts_with("[REDACTED:") {
+        return None;
+    }
+    let (e, n) = run(t, k, |c| c.is_ascii_lowercase() || c == '_');
+    (n > 0 && t.as_bytes().get(e) == Some(&b']')).then_some(e + 1)
+}
+
+/// The end of the value at `w` whose first V run ends at `end`: it goes on past each marker an
+/// earlier pattern left in it (V holds no `]`), so the marker and the rest of the value go with it.
+fn past_markers(t: &str, w: usize, mut end: usize) -> usize {
+    let mut from = w;
+    while t.as_bytes().get(end) == Some(&b']') && t[from..end].contains("[REDACTED:") {
+        from = end + 1;
+        end = run(t, from, is_v).0;
+    }
+    end
+}
+
+/// `(?!\[REDACTED:)(?![0-9]+(?!V))V{8,}["']?` at `w`: the end of the match. A value that starts
+/// with a marker is taken only when more of the value follows it.
 fn kv_value(t: &str, w: usize) -> Option<usize> {
-    if ci_at(t, w, &REDACTED_SEQ).is_some() {
+    if ci_at(t, w, &REDACTED_SEQ).is_some() && !marker_then_more(t, w) {
         return None;
     }
     // `[0-9]+(?!V)`: digits are V, so only the longest digit run can end before a non-V char
@@ -296,17 +331,11 @@ fn kv_value(t: &str, w: usize) -> Option<usize> {
     if digits > 0 && !char_at(t, d_end).is_some_and(is_v) {
         return None;
     }
-    let (mut end, n) = run(t, w, is_v);
+    let (end, n) = run(t, w, is_v);
     if n < 8 {
         return None;
     }
-    // a marker an earlier pattern left in the value (V holds no `]`): the value goes on past its
-    // `]`, so the marker and the rest of the value go with it
-    let mut from = w;
-    while t.as_bytes().get(end) == Some(&b']') && t[from..end].contains("[REDACTED:") {
-        from = end + 1;
-        end = run(t, from, is_v).0;
-    }
+    let end = past_markers(t, w, end);
     // V holds no quote, so the greedy run is followed by the optional quote or by nothing
     Some(end + usize::from(matches!(t.as_bytes().get(end), Some(b'"' | b'\''))))
 }
@@ -319,8 +348,9 @@ fn kv_bare(t: &str, i: usize) -> Option<usize> {
     if b.get(w) == Some(&b'`') {
         w += 1;
     }
+    // a value that starts with a marker is a token: it goes on over `:` and `/` as `kv_value` does
     if ci_at(t, w, &REDACTED_SEQ).is_some() {
-        return None;
+        return marker_then_more(t, w).then(|| past_markers(t, w, run(t, w, is_v).0));
     }
     // `(?!m_[0-9A-Z]{26}(?!V))`, case-sensitive
     if b[w..].starts_with(b"m_")
@@ -333,18 +363,25 @@ fn kv_bare(t: &str, i: usize) -> Option<usize> {
         return None;
     }
     // `(?=BV*[0-9])` and the upper and lower ones: digits and ASCII letters are BV, so each
-    // holds when the BV run from `w` has one
+    // holds when the BV run from `w` has one. A marker an earlier pattern left in the run is part
+    // of it, as the token it stands for was, and holds all three, as a token does
     let (mut digit, mut upper, mut lower, mut n) = (false, false, false, 0usize);
-    let mut end = t.len();
-    for (off, c) in t[w..].char_indices() {
+    let mut end = w;
+    while let Some(c) = char_at(t, end) {
+        if let Some(m) = marker_end(t, end) {
+            (digit, upper, lower) = (true, true, true);
+            n += m - end;
+            end = m;
+            continue;
+        }
         if !is_bare_v(c) {
-            end = w + off;
             break;
         }
         digit |= c.is_ascii_digit();
         upper |= c.is_ascii_uppercase();
         lower |= c.is_ascii_lowercase();
         n += 1;
+        end += c.len_utf8();
     }
     // `BV{12,}(?!V|:)`: a shorter run is followed by a BV char, which is V, so only the longest
     // run can pass, and a char after it that is not BV is V only when it is `:` or `/`
@@ -491,14 +528,9 @@ fn private_tags(text: &str) -> Vec<Tag> {
     out
 }
 
-/// `_strip_private`: drop each `<private>` block through the close tag that balances it.
-fn strip_private(
-    text: &str,
-    mut counts: Option<&mut Counts>,
-    mut removed: Option<&mut Vec<String>>,
-) -> String {
-    let mut out = String::new();
-    let mut pos = 0;
+/// The span of each `<private>` block through the close tag that balances it.
+fn private_spans(text: &str) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
     let tags = private_tags(text);
     let mut i = 0;
     while i < tags.len() {
@@ -522,57 +554,99 @@ fn strip_private(
         let Some(end_idx) = end_idx.or(last_close) else {
             break;
         };
-        out.push_str(&text[pos..tags[i].start]);
-        out.push_str(PRIVATE_MARK);
-        if let Some(r) = removed.as_deref_mut() {
-            r.push(text[tags[i].start..tags[end_idx].end].to_string());
-        }
-        pos = tags[end_idx].end;
-        if let Some(c) = counts.as_deref_mut() {
-            *c.entry("private".into()).or_insert(0) += 1;
-        }
+        out.push((tags[i].start, tags[end_idx].end));
         i = end_idx + 1;
     }
-    out.push_str(&text[pos..]);
     out
 }
 
-/// `pat.subn(repl, text)` for a literal replacement.
-fn subn(pat: &Matcher, repl: &str, text: &str) -> (String, i64) {
+/// `text` with each span, left to right and none overlapping, replaced by `repl`.
+fn replace_spans(text: &str, spans: &[(usize, usize)], repl: &str) -> String {
     let mut out = String::new();
     let mut last = 0;
-    let mut n = 0;
-    for (s, e) in pat.spans(text) {
+    for &(s, e) in spans {
         out.push_str(&text[last..s]);
         out.push_str(repl);
         last = e;
-        n += 1;
     }
     out.push_str(&text[last..]);
-    (out, n)
+    out
+}
+
+/// The passes of `redact_text`: `_strip_private` (each `<private>` block through the close tag
+/// that balances it), then each pattern's `subn` on the text the passes before it left, each
+/// span replaced by its kind's marker. `each(kind, text, spans)` sees each pass before it
+/// replaces. The redacted text.
+fn redact_passes(text: &str, mut each: impl FnMut(&str, &str, &[(usize, usize)])) -> String {
+    let spans = private_spans(text);
+    each("private", text, &spans);
+    let mut out = replace_spans(text, &spans, PRIVATE_MARK);
+    for (kind, pat) in SECRET_PATTERNS.iter() {
+        let spans = pat.spans(&out);
+        each(kind, &out, &spans);
+        out = replace_spans(&out, &spans, &format!("[REDACTED:{kind}]"));
+    }
+    out
 }
 
 /// `redact_text(text, counts, removed)`.
 pub fn redact_text(
     text: &str,
     mut counts: Option<&mut Counts>,
-    removed: Option<&mut Vec<String>>,
+    mut removed: Option<&mut Vec<String>>,
 ) -> String {
     if text.is_empty() {
         return String::new();
     }
-    let mut out = strip_private(text, counts.as_deref_mut(), removed);
-    for (kind, pat) in SECRET_PATTERNS.iter() {
-        let (next, n) = subn(pat, &format!("[REDACTED:{kind}]"), &out);
-        out = next;
-        if n != 0
+    redact_passes(text, |kind, t, spans| {
+        if kind == "private"
+            && let Some(r) = removed.as_deref_mut()
+        {
+            r.extend(spans.iter().map(|&(s, e)| t[s..e].to_string()));
+        }
+        if !spans.is_empty()
             && let Some(c) = counts.as_deref_mut()
         {
-            *c.entry((*kind).into()).or_insert(0) += n;
+            *c.entry(kind.into()).or_insert(0) += spans.len() as i64;
         }
-    }
-    out
+    })
 }
+
+/// For each byte of `text`, does `redact_text` replace it? Every byte of a pass's output keeps
+/// the byte of `text` it came from (none inside a marker).
+fn redacted_bytes(text: &str) -> Vec<bool> {
+    let mut hit = vec![false; text.len()];
+    let mut origin: Vec<Option<usize>> = (0..text.len()).map(Some).collect();
+    redact_passes(text, |kind, _, spans| {
+        let mark = "[REDACTED:".len() + kind.len() + 1;
+        let mut next = Vec::with_capacity(origin.len());
+        let mut last = 0;
+        for &(s, e) in spans {
+            next.extend_from_slice(&origin[last..s]);
+            origin[s..e].iter().flatten().for_each(|&o| hit[o] = true);
+            next.extend(std::iter::repeat_n(None, mark));
+            last = e;
+        }
+        next.extend_from_slice(&origin[last..]);
+        origin = next;
+    });
+    hit
+}
+
+/// The refs in `refs` that a match of `redact_text` over the whole string covers or touches, so
+/// a secret written with spaces in it (`password: value`) goes with each ref it spans.
+fn refs_redaction_touches(refs: &str) -> std::collections::HashSet<&str> {
+    let hit = redacted_bytes(refs);
+    REF_TOKEN_RE
+        .find_iter(refs)
+        .filter(|m| hit[m.range()].contains(&true))
+        .map(|m| m.as_str())
+        .collect()
+}
+
+/// A run of chars `split_refs` keeps as one ref: it splits on `\s` and `,`.
+static REF_TOKEN_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(&format!("[^{},]+", *S_INNER)).expect("ref token pattern"));
 
 /// `redact_for_store(item, counts)`: title, body, evidence, tags and source redacted, and refs
 /// dropped that are secret-shaped or that the text gave only in a part redaction removed (a
@@ -598,9 +672,14 @@ pub fn redact_for_store(item: &Item, mut counts: Option<&mut Counts>) -> Item {
             .collect();
     }
     let all_refs = split_refs(Some(&RefsArg::Str(&item.refs)));
+    let touched = refs_redaction_touches(&item.refs);
     let kept: Vec<&String> = all_refs
         .iter()
-        .filter(|r| !redacted_refs.contains(*r) && redact_text(r, None, None) == **r)
+        .filter(|r| {
+            !redacted_refs.contains(*r)
+                && !touched.contains(r.as_str())
+                && redact_text(r, None, None) == **r
+        })
         .collect();
     let refs = if kept.len() != all_refs.len() {
         kept.iter()
@@ -1016,6 +1095,76 @@ mod tests {
         }
     }
 
+    /// Plain refs as people write them: ids, paths, hashes, dates and URLs with no credentials,
+    /// split by spaces, commas or both.
+    const PLAIN_REFS: [&str; 14] = [
+        "TKT-9",
+        "TKT-9 TKT-10",
+        "TKT-9,TKT-10, ABC-123",
+        "docs/run.md src/core/redact.rs",
+        "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0",
+        "685438b, 1107c518a",
+        "https://github.com/org/repo/pull/12 TKT-9",
+        "https://example.com:8443/a/b@c, docs/x.md",
+        "PR-77,https://cdn.example.com/img/logo@2x.png",
+        "rust/tests/port_transfer.rs:281 TKT-1",
+        "ssh://git@github.com/org/repo.git",
+        "token_rotation.md, password-reset.md secret_store.md",
+        "2026-11-20 TKT-4 m_01JABCDEFGHJKMNPQRSTVWXYZ0",
+        "TKT-5, , TKT-6,,TKT-7",
+    ];
+
+    #[test]
+    fn redact_for_store_keeps_plain_refs_as_they_are() {
+        for refs in PLAIN_REFS {
+            let item = Item {
+                refs: refs.to_string(),
+                ..Item::bare("m_r", "a", "fact", "T", "plain body", "assumed")
+            };
+            assert_eq!(redact_for_store(&item, None).refs, refs);
+        }
+    }
+
+    #[test]
+    fn redact_for_store_drops_every_ref_a_secret_written_with_spaces_spans() {
+        for (refs, secret, want) in [
+            (
+                "TKT-9 aws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+                "wJalrXUtnFEMI",
+                "TKT-9",
+            ),
+            (
+                "TKT-9 password: Hunter2-example-Zz9",
+                "Hunter2-example-Zz9",
+                "TKT-9",
+            ),
+            (
+                "TKT-9, Bearer Hunter2-example-token-0001 docs/run.md",
+                "Hunter2-example-token-0001",
+                "TKT-9 docs/run.md",
+            ),
+            (
+                "TKT-9 token = Hunter2-example,TKT-10",
+                "Hunter2-example",
+                "TKT-9 TKT-10",
+            ),
+            // the match starts inside the ref, not at its first byte
+            (
+                "TKT-9 x<private>Pv7example </private> TKT-10",
+                "Pv7example",
+                "TKT-9 TKT-10",
+            ),
+        ] {
+            let item = Item {
+                refs: refs.to_string(),
+                ..Item::bare("m_r", "a", "fact", "T", "plain body", "assumed")
+            };
+            let out = redact_for_store(&item, None).refs;
+            assert!(!out.contains(secret), "{refs} -> {out}");
+            assert_eq!(out, want, "{refs}");
+        }
+    }
+
     #[test]
     fn redact_for_store_redacts_tags_and_source() {
         let item = Item {
@@ -1191,6 +1340,215 @@ mod tests {
                 "{raw}"
             );
         }
+    }
+
+    #[test]
+    fn url_credentials_whose_user_or_password_is_a_token_an_earlier_pattern_replaced() {
+        // the token's marker holds `:`, which once made the URL rule miss a `/` password
+        let cases = [
+            (
+                "s3a://AKIAIOSFODNN7EXAMPLE:wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY@my-bucket/data",
+                "[REDACTED:url_credentials]my-bucket/data",
+                "aws_key",
+            ),
+            (
+                "https://AKIAIOSFODNN7EXAMPLE:wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY@s3.amazonaws.com/b",
+                "[REDACTED:url_credentials]s3.amazonaws.com/b",
+                "aws_key",
+            ),
+            (
+                "git clone https://ghp_EXAMPLEexampleEXAMPLEexampleEXAMPLE01:Hunter2/example@github.com/o/r",
+                "git clone [REDACTED:url_credentials]github.com/o/r",
+                "github_token",
+            ),
+            (
+                "https://bob:AKIAIOSFODNN7EXAMPLE/Hunter2-example@h.example.com/p",
+                "[REDACTED:url_credentials]h.example.com/p",
+                "aws_key",
+            ),
+            (
+                "https://bob:Hunter2-example/AKIAIOSFODNN7EXAMPLE@h.example.com/p",
+                "[REDACTED:url_credentials]h.example.com/p",
+                "aws_key",
+            ),
+        ];
+        for (raw, want, kind) in cases {
+            assert_eq!(
+                counted(raw),
+                (
+                    want.to_string(),
+                    counts(&[(kind, 1), ("url_credentials", 1)])
+                ),
+                "{raw}"
+            );
+        }
+        // a marker in the authority is never a host: a digit port after it stays as it is
+        assert_eq!(
+            counted("https://AKIAIOSFODNN7EXAMPLE:8080/a@b"),
+            (
+                "https://[REDACTED:aws_key]:8080/a@b".to_string(),
+                counts(&[("aws_key", 1)])
+            )
+        );
+    }
+
+    #[test]
+    fn a_key_value_value_that_starts_with_a_marker_goes_on_past_it() {
+        for raw in [
+            "password=AKIAIOSFODNN7EXAMPLE/Hunter2-example",
+            "password=AKIAIOSFODNN7EXAMPLE:Hunter2-example",
+            "password=\"AKIAIOSFODNN7EXAMPLE/Hunter2-example\"",
+        ] {
+            assert_eq!(
+                counted(raw),
+                (
+                    "[REDACTED:key_value]".to_string(),
+                    counts(&[("aws_key", 1), ("key_value", 1)])
+                ),
+                "{raw}"
+            );
+        }
+        assert_eq!(
+            counted("secret=ghp_EXAMPLEexampleEXAMPLEexampleEXAMPLE01/Hunter2-example"),
+            (
+                "[REDACTED:key_value]".to_string(),
+                counts(&[("github_token", 1), ("key_value", 1)])
+            )
+        );
+        // a marker that is the whole value stays the one marker
+        for raw in [
+            "password=AKIAIOSFODNN7EXAMPLE",
+            "password=AKIAIOSFODNN7EXAMPLE, next",
+            "password=AKIAIOSFODNN7EXAMPLE]",
+        ] {
+            let want = raw.replace("AKIAIOSFODNN7EXAMPLE", "[REDACTED:aws_key]");
+            assert_eq!(counted(raw), (want, counts(&[("aws_key", 1)])), "{raw}");
+        }
+        // only a marker the patterns wrote goes on: text that spells one in lower case stays
+        let typed = "password=[redacted:aws_key]/Hunter2-example";
+        assert_eq!(counted(typed), (typed.to_string(), Counts::new()));
+    }
+
+    #[test]
+    fn a_key_value_value_with_a_colon_after_a_starting_token_is_one_marker() {
+        let ak = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
+        let gh = "ghp_EXAMPLEexampleEXAMPLEexampleEXAMPLE01";
+        let cases = [
+            (format!("aws_token=AKIAIOSFODNN7EXAMPLE:{ak}"), "aws_key"),
+            (format!("secret={gh}:Hunter2-example"), "github_token"),
+            (
+                "apikey=sk-proj-EXAMPLEexampleEXAMPLEexampleEXAMPLE.Hunter2-example".to_string(),
+                "sk_key",
+            ),
+            (format!("aws_token: AKIAIOSFODNN7EXAMPLE:{ak}"), "aws_key"),
+            (format!("secret: {gh}:Hunter2-example"), "github_token"),
+            (
+                "password: `AKIAIOSFODNN7EXAMPLE/Hunter2-example".to_string(),
+                "aws_key",
+            ),
+            // a marker later in a bare value is part of it, as the token it stands for was
+            (
+                "secret: Hunter2-example9-AKIAIOSFODNN7EXAMPLE".to_string(),
+                "aws_key",
+            ),
+            (format!("token: Hunter2-example9-{gh}-Zz"), "github_token"),
+            (
+                "secret: hunter-example-AKIAIOSFODNN7EXAMPLE".to_string(),
+                "aws_key",
+            ),
+        ];
+        for (raw, kind) in cases {
+            assert_eq!(
+                counted(&raw),
+                (
+                    "[REDACTED:key_value]".to_string(),
+                    counts(&[(kind, 1), ("key_value", 1)])
+                ),
+                "{raw}"
+            );
+        }
+        // the colon form keeps a marker that is the whole value, as the `=` form does
+        for raw in [
+            "token: AKIAIOSFODNN7EXAMPLE",
+            "token: AKIAIOSFODNN7EXAMPLE and more",
+        ] {
+            let want = raw.replace("AKIAIOSFODNN7EXAMPLE", "[REDACTED:aws_key]");
+            assert_eq!(counted(raw), (want, counts(&[("aws_key", 1)])), "{raw}");
+        }
+    }
+
+    /// One made-up token per pattern that runs before url_credentials or key_value, with the
+    /// part of it that must not stay in clear.
+    const TOKENS_BEFORE_URL_AND_KEY_VALUE: [(&str, &str); 15] = [
+        ("<private>Pv7example</private>", "Pv7example"),
+        (
+            "-----BEGIN RSA PRIVATE KEY-----\nMIIEexampleKEY\n-----END RSA PRIVATE KEY-----",
+            "MIIEexampleKEY",
+        ),
+        ("AKIAIOSFODNN7EXAMPLE", "IOSFODNN7EXAMPLE"),
+        (
+            "ghp_EXAMPLEexampleEXAMPLEexampleEXAMPLE01",
+            "EXAMPLEexampleEXAMPLE",
+        ),
+        ("github_pat_EXAMPLE_example_EXAMPLE_01", "EXAMPLE_example"),
+        ("xoxb-EXAMPLE-example-01", "EXAMPLE-example"),
+        (
+            "AIzaEXAMPLEexampleEXAMPLEexampleEXAMPLE",
+            "EXAMPLEexampleEXAMPLE",
+        ),
+        (
+            "sk-EXAMPLEexampleEXAMPLEexampleEXAMPLE",
+            "EXAMPLEexampleEXAMPLE",
+        ),
+        ("eyJEXAMPLE.eyJexample.EXAMPLEsig", "EXAMPLEsig"),
+        ("Bearer EXAMPLEexample01", "EXAMPLEexample01"),
+        ("postgres://bob:Pw0example@db.example.com", "Pw0example"),
+        ("sig=EXAMPLEexampleEXAMPLE01", "EXAMPLEexampleEXAMPLE01"),
+        (
+            "X-Amz-Signature=EXAMPLEexampleEXAMPLE01",
+            "EXAMPLEexampleEXAMPLE01",
+        ),
+        (
+            "https://b.example.com/f?AWSAccessKeyId=EX&Signature=EXAMPLEexampleEXAMPLE01",
+            "EXAMPLEexampleEXAMPLE01",
+        ),
+        (
+            "AccountKey=EXAMPLEexampleEXAMPLE01==",
+            "EXAMPLEexampleEXAMPLE01",
+        ),
+    ];
+
+    #[test]
+    fn a_token_next_to_a_second_secret_leaves_neither_in_clear() {
+        let shapes = [
+            "s3a://{t}:Hunter2-example/x@h.example.com/p",
+            "https://{t}:Hunter2-example@h.example.com/p",
+            "https://bob:{t}/Hunter2-example@h.example.com/p",
+            "https://bob:Hunter2-example/{t}@h.example.com/p",
+            "password={t}/Hunter2-example",
+            "password={t}:Hunter2-example",
+            "password=Hunter2-example/{t}/Hunter2-example",
+            "password=Hunter2-example/{t}",
+            "secret: {t}:Hunter2-example",
+            "secret: Hunter2-example9-{t}-Zz",
+            "secret: Hunter2-example9-{t}",
+        ];
+        let mut leaks = Vec::new();
+        for (token, core) in TOKENS_BEFORE_URL_AND_KEY_VALUE {
+            for shape in shapes {
+                // a URL inside a URL's user or password part is no credential URL shape, and a
+                // bare colon value stops at `:` and `/` (`kv_bare`)
+                if token.contains("://") && (shape.contains("://") || shape.contains(": ")) {
+                    continue;
+                }
+                let raw = shape.replace("{t}", token);
+                let got = redact_text(&raw, None, None);
+                if got.contains("Hunter2-example") || got.contains(core) {
+                    leaks.push(format!("{raw:?} -> {got:?}"));
+                }
+            }
+        }
+        assert!(leaks.is_empty(), "{}", leaks.join("\n"));
     }
 
     #[test]

@@ -244,13 +244,10 @@ pub fn plan_automemory(
         let project = path.parent().parent();
         plan.sources
             .insert(format!("{SOURCE_PREFIX}{}/{}", project.name(), path.name()));
-        let mf = match parse_memory_file(&path) {
-            Ok(mf) => mf,
-            Err(e) if e.class == "UnicodeDecodeError" => {
-                plan.unreadable.push(path.as_str().to_string());
-                continue;
-            }
-            Err(e) => return Err(e),
+        // reading, parsing or converting one note raises for that note alone
+        let Ok(mf) = parse_memory_file(&path) else {
+            plan.unreadable.push(path.as_str().to_string());
+            continue;
         };
         if !repos.contains_key(project.as_str()) {
             let r = project_repo(&project, repo_aliases, roots)?;

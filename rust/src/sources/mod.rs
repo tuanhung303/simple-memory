@@ -13,9 +13,29 @@ use std::os::unix::fs::MetadataExt;
 #[cfg(test)]
 use serde_json::Value;
 
-use crate::error::SmError;
+use crate::error::{Base, SmError};
 use crate::py::path::PyPath;
 use crate::py::value::{PyValue, type_name};
+
+/// An error raised while reading, parsing or converting the source file `path`, for an import of
+/// a path the user named: one line that names the file, in a class the CLI prints as
+/// `error: <line>` (a class it would print as a traceback becomes a ValueError).
+pub(crate) fn file_error(path: &str, e: SmError) -> SmError {
+    let printed = matches!(
+        e.base,
+        Base::Value | Base::Key | Base::Type | Base::Os | Base::Sqlite
+    );
+    if !printed {
+        return SmError::value(format!("{path}: {}: {}", e.class, e.msg));
+    }
+    if e.msg.contains(path) {
+        return e;
+    }
+    SmError {
+        msg: format!("{path}: {}", e.msg),
+        ..e
+    }
+}
 
 /// `path.stat().st_mtime` (follows links): CPython's `sec + nsec * 1e-9`.
 pub(crate) fn mtime(p: &PyPath) -> Result<f64, SmError> {

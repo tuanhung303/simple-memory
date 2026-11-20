@@ -1,4 +1,6 @@
-use crate::core::item::{Item, epoch_to_as_of, new_item_id, validate_as_of};
+use std::borrow::Cow;
+
+use crate::core::item::{Item, check_stored_as_of, epoch_to_as_of, new_item_id, validate_as_of};
 use crate::core::refs::{RefsArg, extract_refs, merge_refs};
 use crate::core::tags::append_tag;
 use crate::error::{Base, SmError};
@@ -6,7 +8,7 @@ use crate::py::path::{Errors, PyPath};
 use crate::py::str::{lower, split, strip};
 use crate::py::value::PyValue;
 use crate::py::yaml::safe_load;
-use crate::sources::{dict_get as get, iterate, mtime, sorted_paths, truthy};
+use crate::sources::{dict_get as get, file_error, iterate, mtime, sorted_paths, truthy};
 
 /// `str(data.get(key) or fallback)`.
 fn get_str_or(data: &[(PyValue, PyValue)], key: &str, fallback: &str) -> Result<String, SmError> {
@@ -89,6 +91,7 @@ pub fn parse_tasklog_file(path: &str) -> Result<Item, SmError> {
         }
         Err(e) => return Err(e),
     };
+    check_stored_as_of(&as_of)?;
 
     let sections = [
         format_section("Results", get(&data, "results"))?,
@@ -110,8 +113,14 @@ pub fn parse_tasklog_file(path: &str) -> Result<Item, SmError> {
     let commits: Vec<String> = match get(&data, "commits").filter(|v| truthy(v)) {
         None => Vec::new(),
         Some(v) => {
+            // one scalar, a string or a number (a short commit id of digits loads as an int),
+            // is one commit id: the list of one, never one id per character
+            let ids = match v {
+                PyValue::Str(_) | PyValue::Int(_) | PyValue::Float(_) => vec![Cow::Borrowed(v)],
+                _ => iterate(v)?,
+            };
             let mut out = Vec::new();
-            for c in iterate(v)?.iter().filter(|c| truthy(c)) {
+            for c in ids.iter().filter(|c| truthy(c)) {
                 let text = c.try_py_str()?;
                 if !strip(&text).is_empty() {
                     out.push(strip(&text).to_string());
@@ -175,13 +184,14 @@ pub fn parse_tasklog_file(path: &str) -> Result<Item, SmError> {
 /// `load_tasklogs(path)`.
 pub fn load_tasklogs(path: &str) -> Result<Vec<Item>, SmError> {
     let p = PyPath::new(path).expanduser()?.resolve()?;
+    let parse = |f: &str| parse_tasklog_file(f).map_err(|e| file_error(f, e));
     if p.is_file() {
-        return Ok(vec![parse_tasklog_file(p.as_str())?]);
+        return Ok(vec![parse(p.as_str())?]);
     }
     if p.is_dir() {
         return sorted_paths(p.rglob("*.yaml")?)
             .iter()
-            .map(|f| parse_tasklog_file(f.as_str()))
+            .map(|f| parse(f.as_str()))
             .collect();
     }
     Err(SmError::new(
@@ -344,7 +354,9 @@ mod tests {
         .unwrap();
         assert_eq!(
             (it.evidence.as_str(), it.tag.as_str()),
-            ("a, b, c", "executed")
+            ("abc", "executed"),
+            "a commits value that is one scalar, a string or a number, is one commit id, stored as \
+             the one-item list of that value is stored"
         );
         assert_eq!(it.superseded_by.as_deref(), Some("False"));
         assert_eq!(it.tags, "as_of:mtime, superseded_by:False");
@@ -374,8 +386,31 @@ mod tests {
             it.evidence, "ab1, 7",
             "a falsy commit is skipped before str()"
         );
-        let e = parse_tasklog_file(&write(d.path(), "d.yaml", b"id: d\ncommits: 5\n")).unwrap_err();
-        assert_eq!(e.python_text(), "TypeError: 'int' object is not iterable");
+        let it = parse_tasklog_file(&write(d.path(), "d.yaml", b"id: d\ncommits: 5\n")).unwrap();
+        assert_eq!(
+            (it.evidence.as_str(), it.tag.as_str(), it.refs.as_str()),
+            ("5", "executed", "d 5"),
+            "a number is one commit id"
+        );
+        let it =
+            parse_tasklog_file(&write(d.path(), "f.yaml", b"id: f\ncommits: 1.5e+3\n")).unwrap();
+        assert_eq!(
+            it.evidence, "1500.0",
+            "a float is one commit id, as str() gives it"
+        );
+        let it = parse_tasklog_file(&write(d.path(), "g.yaml", b"id: g\ncommits: 1e10\n")).unwrap();
+        assert_eq!(
+            it.evidence, "1e10",
+            "YAML 1.1 reads 1e10 as a str; a commits value that is one scalar, a string or a \
+             number, is one commit id"
+        );
+        let w = write(d.path(), "w.yaml", b"id: w\ncommits: '  '\n");
+        let it = parse_tasklog_file(&w).unwrap();
+        assert_eq!(
+            (it.evidence.as_str(), it.tag.as_str()),
+            (w.as_str(), "derived"),
+            "a blank string is no commits"
+        );
         let e = parse_tasklog_file(&write(d.path(), "e.yaml", b"id: e\ncommits: 2026-10-25\n"))
             .unwrap_err();
         assert_eq!(

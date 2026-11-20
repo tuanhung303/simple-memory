@@ -5,7 +5,7 @@
 
 use std::sync::LazyLock;
 
-use crate::core::item::{Item, epoch_to_as_of, new_item_id, validate_as_of};
+use crate::core::item::{Item, check_stored_as_of, epoch_to_as_of, new_item_id, validate_as_of};
 use crate::core::refs::item_refs;
 use crate::core::tags::VALID_TAGS;
 use crate::error::{Base, SmError};
@@ -170,7 +170,7 @@ fn text_of(value: Option<&PyValue>) -> Result<String, SmError> {
     })
 }
 
-/// `parse_memory_file(path)`: raises UnicodeDecodeError on a file that is not UTF-8.
+/// `parse_memory_file(path)`: raises on a file that is not UTF-8 or a field that cannot convert.
 pub fn parse_memory_file(path: &PyPath) -> Result<MemoryFile, SmError> {
     let text = path.read_text(Errors::Strict)?;
     let (front, body) = split_frontmatter(&text);
@@ -195,6 +195,7 @@ pub fn parse_memory_file(path: &PyPath) -> Result<MemoryFile, SmError> {
             None => epoch_to_as_of(mtime(path)?)?,
         },
     };
+    check_stored_as_of(&as_of)?;
     let type_ = match lower(&text_of(get("type"))?) {
         t if t.is_empty() => "unknown".to_string(),
         t => t,

@@ -6,7 +6,9 @@ use indexmap::IndexMap;
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::core::fold::fold;
-use crate::core::item::{Item, compute_content_hash, new_item_id, now_iso, validate_as_of};
+use crate::core::item::{
+    Item, check_stored_as_of, compute_content_hash, new_item_id, now_iso, validate_as_of,
+};
 use crate::core::redact::{redact_for_store, redact_text};
 use crate::core::refs::{RefsArg, extract_refs, item_refs, split_refs};
 use crate::core::tags::{
@@ -185,8 +187,7 @@ pub fn allow_na_tag(item: &Item) -> bool {
 fn validate_item(item: &Item) -> Result<(), SmError> {
     validate_kind(Some(&item.kind))?;
     validate_tag(Some(&item.tag), Some(&item.evidence), allow_na_tag(item))?;
-    validate_as_of(Some(&item.as_of), false, false)?;
-    Ok(())
+    check_stored_as_of(&item.as_of)
 }
 
 /// A task log or handoff file: one item source per file.

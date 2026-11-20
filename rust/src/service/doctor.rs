@@ -109,6 +109,13 @@ fn sorted_unique(paths: Vec<PyPath>) -> Vec<PyPath> {
     sorted_paths(unique)
 }
 
+/// A task log or handoff the parser refused, as doctor lists it: an error raised while reading,
+/// parsing or converting one file is that file's problem, never the end of the scan.
+fn unreadable_row(f: &PyPath, e: &SmError) -> String {
+    let msg = split(&e.msg).join(" ");
+    format!("{f}: {}", slice(&msg, None, Some(160)))
+}
+
 /// `import_lag(conn, full_cfg)`: task logs and handoffs on disk with no stored item.
 pub fn import_lag(conn: &Connection, full_cfg: &PyValue) -> Result<ImportLag, SmError> {
     Ok(import_lag_by_repo(conn, full_cfg)?.0)
@@ -188,13 +195,10 @@ pub(crate) fn import_lag_by_repo(
     for f in &tl_files {
         let item = match parse_tasklog_file(f.as_str()) {
             Ok(it) => alias_repos(vec![it], &al).remove(0),
-            Err(e) if e.is(crate::error::Base::Value) || e.is(crate::error::Base::Type) => {
-                let msg = split(&e.msg).join(" ");
-                lag.unreadable
-                    .push(format!("{f}: {}", slice(&msg, None, Some(160))));
+            Err(e) => {
+                lag.unreadable.push(unreadable_row(f, &e));
                 continue;
             }
-            Err(e) => return Err(e),
         };
         seen_tasks.insert((item.repo.clone(), item.source.clone()));
         // a stored source does not make a task log stored: a hand edit keeps the source and
@@ -212,7 +216,13 @@ pub(crate) fn import_lag_by_repo(
     }
     let ho_files = sorted_unique(ho_files);
     for f in &ho_files {
-        let item = alias_repos(vec![parse_handoff_file(f.as_str(), Some(&repos))?], &al).remove(0);
+        let item = match parse_handoff_file(f.as_str(), Some(&repos)) {
+            Ok(it) => alias_repos(vec![it], &al).remove(0),
+            Err(e) => {
+                lag.unreadable.push(unreadable_row(f, &e));
+                continue;
+            }
+        };
         let stored_hash = redact_for_store(&item, None).content_hash;
         if !is_stored(&item.repo, &item.source, &stored_hash) {
             lag.not_stored.push(f.as_str().to_string());
