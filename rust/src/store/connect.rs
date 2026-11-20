@@ -33,6 +33,13 @@ const MIGRATIONS: &[(i64, &str)] = &[
             "/migrations/0002_indexes.sql"
         )),
     ),
+    (
+        3,
+        include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/migrations/0003_dedupe_per_file.sql"
+        )),
+    ),
 ];
 
 /// `sqlite3.complete_statement(sql)`.
@@ -429,11 +436,11 @@ mod tests {
         assert_eq!(pragma(&conn, "journal_mode").to_lowercase(), "wal");
         assert_eq!(pragma(&conn, "busy_timeout"), "5000");
         assert_eq!(pragma(&conn, "foreign_keys"), "1");
-        assert_eq!(pragma(&conn, "user_version"), "2");
+        assert_eq!(pragma(&conn, "user_version"), "3");
         drop(conn);
-        // A second connect finds user_version 2 and runs no migration.
+        // A second connect finds user_version 3 and runs no migration.
         let conn = connect(db.to_str().unwrap(), None).unwrap();
-        assert_eq!(apply_migrations(&conn, None).unwrap(), 2);
+        assert_eq!(apply_migrations(&conn, None).unwrap(), 3);
     }
 
     // Two processes open a new store at once. The loser read user_version 0
@@ -455,7 +462,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             migrate_under_lock(&loser, None, WRITE_LOCK_WAIT_S).unwrap(),
-            2
+            3
         );
         assert!(loser.is_autocommit());
         assert_eq!(
@@ -464,7 +471,7 @@ mod tests {
                 .unwrap(),
             "m_1"
         );
-        assert_eq!(user_version(&loser).unwrap(), 2);
+        assert_eq!(user_version(&loser).unwrap(), 3);
     }
 
     #[test]

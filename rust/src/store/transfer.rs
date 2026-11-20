@@ -5,7 +5,8 @@ use crate::core::tags::{validate_kind, validate_tag};
 use crate::error::{Base, SmError};
 use crate::store::connect::transaction;
 use crate::store::items::{
-    ITEM_COLUMNS, allow_na_tag, bind_all, bind_text, insert_item, redact_checked, row_to_item,
+    ITEM_COLUMNS, active_in_slot, allow_na_tag, bind_all, bind_text, insert_item, redact_checked,
+    row_to_item,
 };
 
 /// `export_items(conn, repo=..., include_history=...)`: items sorted by id; one repo, or every repo
@@ -105,19 +106,12 @@ pub fn import_items(conn: &Connection, items: &[Item]) -> Result<ImportResult, S
                 }
                 continue;
             }
-            if item.status == "active" {
-                bind_all(&[&item.repo, &item.content_hash])?;
-                let taken = conn
-                    .query_row(
-                        "SELECT 1 FROM items WHERE repo = ? AND content_hash = ? AND status = 'active'",
-                        [&item.repo, &item.content_hash],
-                        |_| Ok(()),
-                    )
-                    .optional()?;
-                if taken.is_some() {
-                    res.conflicts.push(item.id.clone());
-                    continue;
-                }
+            if item.status == "active"
+                && active_in_slot(conn, &item.repo, &item.content_hash, &item.source, None)?
+                    .is_some()
+            {
+                res.conflicts.push(item.id.clone());
+                continue;
             }
             insert_item(conn, &item, &item.status, None)?;
             res.added += 1;

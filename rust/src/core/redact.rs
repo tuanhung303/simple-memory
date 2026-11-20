@@ -119,15 +119,26 @@ enum Matcher {
     Plain(Regex),
     Guarded(Guarded),
     KeyValue,
+    QuerySignature(Regex),
 }
 
 impl Matcher {
-    fn find(&self, t: &str, pos: usize) -> Option<(usize, usize)> {
-        match self {
-            Matcher::Plain(re) => re.find_at(t, pos).map(|m| (m.start(), m.end())),
-            Matcher::Guarded(g) => g.find(t, pos),
-            Matcher::KeyValue => key_value_find(t, pos),
+    /// Every match, left to right, none overlapping.
+    fn spans(&self, t: &str) -> Vec<(usize, usize)> {
+        let find: Box<dyn Fn(usize) -> Option<(usize, usize)>> = match self {
+            Matcher::Plain(re) => Box::new(|pos| re.find_at(t, pos).map(|m| (m.start(), m.end()))),
+            Matcher::Guarded(g) => Box::new(|pos| g.find(t, pos)),
+            Matcher::KeyValue => Box::new(|pos| key_value_find(t, pos)),
+            Matcher::QuerySignature(re) => return query_signature_spans(re, t),
+        };
+        let mut out = Vec::new();
+        let mut pos = 0;
+        // no pattern matches empty, so the next search starts at the end of the last match
+        while let Some((s, e)) = find(pos) {
+            out.push((s, e));
+            pos = e;
         }
+        out
     }
 }
 
@@ -171,6 +182,17 @@ static SECRET_PATTERNS: LazyLock<Vec<(&'static str, Matcher)>> = LazyLock::new(|
         ("bearer", word(&format!("Bearer[{s_inner}]+[A-Za-z0-9._~+/=-]{{8,}}"))),
         ("url_credentials", word(&format!("[A-Za-z][A-Za-z0-9+.-]*://[^{s_inner}/:@\"']+:[^{s_inner}/@\"']+@"))),
         ("azure_sas", word("sig=[A-Za-z0-9%+/=_-]{16,}")),
+        // before key_value, whose `Token=` value would run to the end of the URL
+        (
+            "signed_url",
+            word("(?i:X-(?:Amz|Goog)-(?:Signature|Security-Token))=[A-Za-z0-9%+/=_-]{16,}"),
+        ),
+        (
+            "signed_url",
+            Matcher::QuerySignature(
+                Regex::new("Signature=[A-Za-z0-9%+/=_-]{16,}").expect("redact pattern compiles"),
+            ),
+        ),
         ("azure_key", word("(?:AccountKey|SharedAccessKey)=[A-Za-z0-9+/=]{16,}")),
         ("key_value", Matcher::KeyValue),
     ]
@@ -196,6 +218,9 @@ fn key_char(c: char) -> bool {
     }
 }
 
+/// The AWS secret access key names; they also take `kv_aws_secret`.
+const ACCESS_KEY_WORDS: [&str; 2] = ["secret_access_key", "secretaccesskey"];
+
 /// `(?:password|...|apikey)(?:_key|key|_value|s)?` as IGNORECASE char sets, every word with every
 /// suffix (and none).
 static KEY_TAILS: LazyLock<Vec<Vec<Vec<char>>>> = LazyLock::new(|| {
@@ -203,9 +228,13 @@ static KEY_TAILS: LazyLock<Vec<Vec<Vec<char>>>> = LazyLock::new(|| {
     let suffixes = ["", "_key", "key", "_value", "s"];
     words
         .iter()
+        .chain(&ACCESS_KEY_WORDS)
         .flat_map(|w| suffixes.iter().map(move |s| ci_seq(&format!("{w}{s}"))))
         .collect()
 });
+
+static ACCESS_KEY_TAILS: LazyLock<Vec<Vec<Vec<char>>>> =
+    LazyLock::new(|| ACCESS_KEY_WORDS.iter().map(|w| ci_seq(w)).collect());
 
 /// `\[REDACTED:` under re.IGNORECASE.
 static REDACTED_SEQ: LazyLock<Vec<Vec<char>>> = LazyLock::new(|| ci_seq("[REDACTED:"));
@@ -224,12 +253,23 @@ fn skip_space(t: &str, i: usize) -> usize {
     run(t, i, isspace).0
 }
 
-/// Does the key run end with a key word and an optional suffix?
-fn key_tail(seg: &str) -> bool {
-    let tail: Vec<char> = seg.chars().rev().take(14).collect();
-    KEY_TAILS.iter().any(|seq| {
+/// Does the key run end with one of `tails`?
+fn ends_with_any(seg: &str, tails: &[Vec<Vec<char>>]) -> bool {
+    let longest = tails.iter().map(Vec::len).max().unwrap_or(0);
+    let tail: Vec<char> = seg.chars().rev().take(longest).collect();
+    tails.iter().any(|seq| {
         seq.len() <= tail.len() && seq.iter().rev().zip(&tail).all(|(set, c)| set.contains(c))
     })
+}
+
+/// After an access key name's `:`, at `i`: a bare 40-char value of the AWS secret alphabet, which
+/// `kv_bare` refuses when it holds a `/`. The end of the match.
+fn kv_aws_secret(t: &str, i: usize) -> Option<usize> {
+    let w = run(t, i, |c| c == ' ' || c == '\t').0;
+    let (end, n) = run(t, w, |c| {
+        c.is_ascii_alphanumeric() || matches!(c, '/' | '+' | '=')
+    });
+    (n == 40 && !char_at(t, end).is_some_and(is_v)).then_some(end)
 }
 
 /// `(?!\[REDACTED:)(?![0-9]+(?!V))V{8,}["']?` at `w`: the end of the match.
@@ -296,7 +336,7 @@ fn kv_bare(t: &str, i: usize) -> Option<usize> {
 /// The value part after the key run that ends at `e`: the end of the match. Each choice here is
 /// forced: a quote after the key is taken (else no `:` or `=` follows), and `\s*` is greedy
 /// (else a space stands where `:` or `=` must be).
-fn kv_after_key(t: &str, e: usize) -> Option<usize> {
+fn kv_after_key(t: &str, e: usize, access_key: bool) -> Option<usize> {
     let b = t.as_bytes();
     let q = e + usize::from(matches!(b.get(e), Some(b'"' | b'\'')));
     let v = skip_space(t, q);
@@ -308,7 +348,9 @@ fn kv_after_key(t: &str, e: usize) -> Option<usize> {
             } else {
                 None
             };
-            quoted.or_else(|| kv_bare(t, v + 1))
+            quoted
+                .or_else(|| kv_bare(t, v + 1))
+                .or_else(|| access_key.then(|| kv_aws_secret(t, v + 1)).flatten())
         }
         Some(b'=') => {
             let w = skip_space(t, v + 1);
@@ -337,8 +379,9 @@ fn key_value_find(t: &str, pos: usize) -> Option<(usize, usize)> {
             return None;
         }
         let (e, _) = run(t, r0, key_char);
-        if key_tail(&t[r0..e])
-            && let Some(end) = kv_after_key(t, e)
+        let seg = &t[r0..e];
+        if ends_with_any(seg, &KEY_TAILS)
+            && let Some(end) = kv_after_key(t, e, ends_with_any(seg, &ACCESS_KEY_TAILS))
         {
             let start = if r0 > pos && matches!(b[r0 - 1], b'"' | b'\'') {
                 r0 - 1
@@ -350,6 +393,33 @@ fn key_value_find(t: &str, pos: usize) -> Option<(usize, usize)> {
         i = e;
     }
     None
+}
+
+/// `[?&]Signature=value` in a URL that also carries `AWSAccessKeyId=` or `GoogleAccessId=` (S3 and
+/// GCS query-string signing): each span from `Signature`. The URL is the run of non-space chars;
+/// each run is read once, so the cost is linear in the text.
+fn query_signature_spans(re: &Regex, t: &str) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < t.len() {
+        let start = run(t, i, isspace).0;
+        let end = run(t, start, |c| !isspace(c)).0;
+        let url = &t[start..end];
+        if url.contains("AWSAccessKeyId=") || url.contains("GoogleAccessId=") {
+            let mut from = 0;
+            while let Some(m) = re.find_at(url, from) {
+                if matches!(url[..m.start()].bytes().next_back(), Some(b'?' | b'&')) {
+                    out.push((start + m.start(), start + m.end()));
+                    from = m.end();
+                } else {
+                    // `S` is one byte
+                    from = m.start() + 1;
+                }
+            }
+        }
+        i = end;
+    }
+    out
 }
 
 // ---------------------------------------------------------------- private blocks
@@ -440,8 +510,7 @@ fn subn(pat: &Matcher, repl: &str, text: &str) -> (String, i64) {
     let mut out = String::new();
     let mut last = 0;
     let mut n = 0;
-    // no pattern matches empty, so the next search starts at the end of the last match
-    while let Some((s, e)) = pat.find(text, last) {
+    for (s, e) in pat.spans(text) {
         out.push_str(&text[last..s]);
         out.push_str(repl);
         last = e;
@@ -473,25 +542,33 @@ pub fn redact_text(
     out
 }
 
-/// `redact_for_store(item, counts)`: title, body and evidence redacted, and refs that are
-/// secret-shaped or came only from a removed private block dropped.
+/// `redact_for_store(item, counts)`: title, body, evidence, tags and source redacted, and refs
+/// dropped that are secret-shaped or that the text gave only in a part redaction removed (a
+/// private block, or a secret an importer took a path ref from before redaction).
 pub fn redact_for_store(item: &Item, mut counts: Option<&mut Counts>) -> Item {
     let mut removed: Vec<String> = Vec::new();
     let title = redact_text(&item.title, counts.as_deref_mut(), Some(&mut removed));
     let body = redact_text(&item.body, counts.as_deref_mut(), Some(&mut removed));
-    let evidence = redact_text(&item.evidence, counts, Some(&mut removed));
-    let joined = removed.join("\n");
-    let kept_text = format!("{title}\n{body}\n{evidence}");
-    let in_kept: std::collections::HashSet<String> =
-        extract_refs(Some(&kept_text)).into_iter().collect();
-    let private_refs: std::collections::HashSet<String> = extract_refs(Some(&joined))
-        .into_iter()
-        .filter(|r| !in_kept.contains(r))
-        .collect();
+    let evidence = redact_text(&item.evidence, counts.as_deref_mut(), Some(&mut removed));
+    let tags = redact_text(&item.tags, counts.as_deref_mut(), None);
+    let source = redact_text(&item.source, counts, None);
+    let mut redacted_refs = std::collections::HashSet::new();
+    if title != item.title || body != item.body || evidence != item.evidence {
+        let in_kept: std::collections::HashSet<String> =
+            extract_refs(Some(&format!("{title}\n{body}\n{evidence}")))
+                .into_iter()
+                .collect();
+        let raw_text = format!("{}\n{}\n{}", item.title, item.body, item.evidence);
+        redacted_refs = extract_refs(Some(&raw_text))
+            .into_iter()
+            .chain(extract_refs(Some(&removed.join("\n"))))
+            .filter(|r| !in_kept.contains(r))
+            .collect();
+    }
     let all_refs = split_refs(Some(&RefsArg::Str(&item.refs)));
     let kept: Vec<&String> = all_refs
         .iter()
-        .filter(|r| !private_refs.contains(*r) && redact_text(r, None, None) == **r)
+        .filter(|r| !redacted_refs.contains(*r) && redact_text(r, None, None) == **r)
         .collect();
     let refs = if kept.len() != all_refs.len() {
         kept.iter()
@@ -501,7 +578,13 @@ pub fn redact_for_store(item: &Item, mut counts: Option<&mut Counts>) -> Item {
     } else {
         item.refs.clone()
     };
-    if title == item.title && body == item.body && evidence == item.evidence && refs == item.refs {
+    if title == item.title
+        && body == item.body
+        && evidence == item.evidence
+        && refs == item.refs
+        && tags == item.tags
+        && source == item.source
+    {
         return item.clone();
     }
     let content_hash = if body != item.body {
@@ -515,6 +598,8 @@ pub fn redact_for_store(item: &Item, mut counts: Option<&mut Counts>) -> Item {
         body,
         evidence,
         refs,
+        tags,
+        source,
         content_hash,
         ..item.clone()
     }
@@ -651,6 +736,210 @@ mod tests {
             ),
             "Endpoint=sb://ns.example.invalid/;SharedAccessKeyName=Root;[REDACTED:azure_key]"
         );
+    }
+
+    #[test]
+    fn aws_secret_access_key_assignments() {
+        let r = |t: &str| redact_text(t, None, None);
+        let key = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
+        assert_eq!(
+            r(&format!("AWS_SECRET_ACCESS_KEY={key}")),
+            "[REDACTED:key_value]"
+        );
+        assert_eq!(
+            r(&format!("[default]\naws_secret_access_key = {key}\n")),
+            "[default]\n[REDACTED:key_value]\n"
+        );
+        assert_eq!(
+            r(&format!("export AWS_SECRET_ACCESS_KEY=\"{key}\"")),
+            "export [REDACTED:key_value]"
+        );
+        // prose, a short value and a key name alone stay
+        for t in [
+            "rotate the secret access key monthly",
+            "secret_access_key=short",
+            "set aws_secret_access_key in the vault",
+            "access_key=Zx9Qw8Er7Ty6Uu5Ii4",
+        ] {
+            assert_eq!(r(t), t);
+        }
+    }
+
+    #[test]
+    fn aws_secret_access_key_colon_and_json_forms() {
+        let r = |t: &str| redact_text(t, None, None);
+        let key = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
+        assert_eq!(
+            r(&format!("aws_secret_access_key: {key}\nregion: x")),
+            "[REDACTED:key_value]\nregion: x"
+        );
+        assert_eq!(
+            r(&format!("AWS_SECRET_ACCESS_KEY: {key} done")),
+            "[REDACTED:key_value] done"
+        );
+        assert_eq!(
+            r(&format!(
+                "{{\"AccessKeyId\": \"x\", \"SecretAccessKey\": \"{key}\", \"Expiration\": \"y\"}}"
+            )),
+            "{\"AccessKeyId\": \"x\", [REDACTED:key_value], \"Expiration\": \"y\"}"
+        );
+        // a 40-char path stays after other key names, and a path or a longer name after this one
+        let path = "Kv2026/Prod/AppConfig/Region/Ab12Cd34EfG";
+        for t in [
+            format!("secrets: {path}"),
+            "see docs/secret_access_key.md for details".to_string(),
+            "the field secret_access_key_id_rotation_policy_name is documented".to_string(),
+            "aws_secret_access_key: ~/.aws/credentials".to_string(),
+            "the column api_key_access_key=customer_facing_value_name is a label".to_string(),
+        ] {
+            assert_eq!(r(&t), t);
+        }
+        assert_eq!(
+            r(&format!("aws_secret_access_key: {path}")),
+            "[REDACTED:key_value]"
+        );
+    }
+
+    #[test]
+    fn query_string_signed_urls_with_an_access_id() {
+        let r = |t: &str| redact_text(t, None, None);
+        assert_eq!(
+            r(
+                "https://b.s3.example.invalid/f?AWSAccessKeyId=AKIAABCDEFGHIJKLMNOP&Expires=1700000000&Signature=AbCdEf1234567890%2BgHiJ%3D"
+            ),
+            "https://b.s3.example.invalid/f?AWSAccessKeyId=[REDACTED:aws_key]&Expires=1700000000&[REDACTED:signed_url]"
+        );
+        assert_eq!(
+            r(
+                "get https://storage.example.invalid/b/o?Signature=BxNQtk4lyAbCdEf%2Fabc%3D&GoogleAccessId=svc@p.example.invalid&Expires=1 now"
+            ),
+            "get https://storage.example.invalid/b/o?[REDACTED:signed_url]&GoogleAccessId=svc@p.example.invalid&Expires=1 now"
+        );
+        let hex = "0123456789abcdef".repeat(2);
+        assert_eq!(
+            r(&format!(
+                "https://b.s3.example.invalid/f?x-amz-signature={hex}"
+            )),
+            "https://b.s3.example.invalid/f?[REDACTED:signed_url]"
+        );
+        // no access id in the same URL, or the id in another word: Signature stays
+        for t in [
+            "https://cb.example.invalid/r?Signature=AbCdEf1234567890abcd&state=1",
+            "AWSAccessKeyId=x then https://cb.example.invalid/r?Signature=AbCdEf1234567890abcd",
+        ] {
+            assert_eq!(r(t), t);
+        }
+    }
+
+    #[test]
+    fn many_query_signatures_in_one_run_take_linear_time() {
+        // 8000 signatures in one 248 KB run with no space; a scan of the run per match took
+        // over 20 s here in a debug build
+        let sigs = "&Signature=AAAAAAAAAAAAAAAAAAAA".repeat(8000);
+        let started = std::time::Instant::now();
+        assert_eq!(
+            redact_text(&format!("x{sigs}"), None, None),
+            format!("x{sigs}")
+        );
+        assert_eq!(
+            redact_text(&format!("h?AWSAccessKeyId=x{sigs}"), None, None),
+            format!(
+                "h?AWSAccessKeyId=x{}",
+                "&[REDACTED:signed_url]".repeat(8000)
+            )
+        );
+        let took = started.elapsed();
+        assert!(took < std::time::Duration::from_secs(2), "took {took:?}");
+    }
+
+    #[test]
+    fn s3_and_gcs_signed_url_signatures_and_tokens() {
+        let r = |t: &str| redact_text(t, None, None);
+        let hex = "0123456789abcdef".repeat(4);
+        assert_eq!(
+            r(&format!(
+                "https://b.s3.example.invalid/f.csv?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Date=20261101T000000Z\
+                 &X-Amz-Expires=900&X-Amz-SignedHeaders=host&X-Amz-Security-Token=IQoJb3JpZ2luX2Vj%2F%2BAbCd1234\
+                 &X-Amz-Signature={hex}"
+            )),
+            "https://b.s3.example.invalid/f.csv?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Date=20261101T000000Z\
+             &X-Amz-Expires=900&X-Amz-SignedHeaders=host&[REDACTED:signed_url]&[REDACTED:signed_url]"
+        );
+        assert_eq!(
+            r(&format!(
+                "https://storage.example.invalid/b/o?X-Goog-Algorithm=GOOG4-RSA-SHA256&X-Goog-Signature={hex}&X-Goog-Expires=900"
+            )),
+            "https://storage.example.invalid/b/o?X-Goog-Algorithm=GOOG4-RSA-SHA256&[REDACTED:signed_url]&X-Goog-Expires=900"
+        );
+        // the header name in prose and a short value stay
+        for t in [
+            "the X-Amz-Signature header is missing",
+            "X-Amz-Signature=abc123",
+            "X-Goog-Signature: see the docs",
+        ] {
+            assert_eq!(r(t), t);
+        }
+    }
+
+    #[test]
+    fn redact_for_store_drops_refs_taken_from_redacted_text() {
+        // an importer takes refs from the raw text, so a secret with `/` arrives as a path ref
+        for (secret, fragment) in [
+            (
+                "aws_secret_access_key=Zx9Qw8Er7Ty6/Uu5Ii4Oo3Pp/2Aa1Ss0Dd9Ff8Gg7",
+                "Uu5Ii4Oo3Pp",
+            ),
+            (
+                "Authorization: Bearer abcDEF123/ghiJKL456/mnoPQR789",
+                "ghiJKL456",
+            ),
+            ("password=Hunter2abc/def/ghijk", "Hunter2abc"),
+        ] {
+            let body = format!("set {secret} then see docs/run.md for ABC-123 at {FAKE_SHA}");
+            let item = Item {
+                refs: format!("{} R5", extract_refs(Some(&body)).join(" ")),
+                ..Item::bare("m_r", "a", "fact", "T", &body, "assumed")
+            }
+            .post_init();
+            assert!(item.refs.contains(fragment), "{}", item.refs);
+            let out = redact_for_store(&item, None);
+            assert_eq!(
+                out.refs,
+                format!("ABC-123 docs/run.md {FAKE_SHA} R5"),
+                "{secret}"
+            );
+        }
+    }
+
+    #[test]
+    fn redact_for_store_redacts_tags_and_source() {
+        let item = Item {
+            tags: format!("t, {}", fake_gh()),
+            source: format!("src {}", fake_gh()),
+            ..Item::bare("m_t", "a", "fact", "T", "body", "assumed")
+        }
+        .post_init();
+        let mut c = Counts::new();
+        let out = redact_for_store(&item, Some(&mut c));
+        assert_eq!(
+            (out.tags.as_str(), out.source.as_str()),
+            ("t, [REDACTED:github_token]", "src [REDACTED:github_token]")
+        );
+        assert_eq!(out.content_hash, item.content_hash);
+        assert_eq!(c, counts(&[("github_token", 2)]));
+        // the importers' sources hold no secret shape and stay as they are
+        for source in [
+            "task:20261101-090000-aabbccdd-redact-test-1a2b",
+            "handoff:20261025-020000-handoff-sample.md",
+            "automemory:-Users-a-GitHub-b/token-notes.md",
+        ] {
+            let it = Item {
+                source: source.into(),
+                ..Item::bare("m_s", "a", "fact", "T", "body", "assumed")
+            }
+            .post_init();
+            assert_eq!(redact_for_store(&it, None), it);
+        }
     }
 
     #[test]

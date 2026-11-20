@@ -21,7 +21,7 @@ use crate::service::import_::{cfg_get, float_of, int_of};
 use crate::sources::transcript::{SessionScan, lanes_put_until, scan_transcript};
 use crate::sources::{dict_get, get_attr, mtime, truthy};
 use crate::store::connect::connect;
-use crate::store::items::put_items_batch;
+use crate::store::items::{file_backed, put_items_batch};
 
 pub const STATE_FILE: &str = "capture-state.json";
 const MAX_TITLE_CHARS: isize = 160;
@@ -611,7 +611,7 @@ fn covering_ids(conn: &Connection) -> Result<(Covers, Covers), SmError> {
     for (source, evidence, as_of) in rows {
         let until = cover_until(&as_of.unwrap_or_default())?;
         let source = source.unwrap_or_default();
-        if source.starts_with("task:") || source.starts_with("handoff:") {
+        if file_backed(&source) {
             for t in hex8_tokens(&source) {
                 add_cover(&mut hex8, t, until);
             }

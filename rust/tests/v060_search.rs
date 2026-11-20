@@ -1367,3 +1367,197 @@ fn unquoted_dash_exclusions_snake_subtoken_why_and_exact_snake_exclusion() {
         vec!["quasar rates are high; access is limited for guests"]
     );
 }
+
+fn result_ids(out: &str) -> (Vec<String>, Value) {
+    let v: Value = serde_json::from_str(out).unwrap();
+    let ids = v["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["id"].as_str().unwrap().to_string())
+        .collect();
+    (ids, v)
+}
+
+#[test]
+fn exclusions_reach_matches_past_a_pool_the_excluded_word_fills() {
+    let (_d, home) = scratch();
+    let conn = open(&home);
+    let seed = |id: &str, body: &str, as_of: &str| {
+        let mut it = Item::bare(id, "anvil", "fact", "", body, "verified");
+        it.evidence = "made-up check".to_string();
+        it.as_of = as_of.to_string();
+        put_item(&conn, &it.post_init(), None).unwrap();
+    };
+    // 110 short matches of both words (best bm25, newest) all hold the excluded word: they
+    // fill the 100-row biased pool and the 50-row recent AND pool on their own.
+    for i in 0..110 {
+        seed(
+            &format!("m_x{i:03}"),
+            &format!("widget gadget legacyx case{i}"),
+            TS,
+        );
+    }
+    for i in 1..=3 {
+        seed(
+            &format!("m_keep{i}"),
+            &format!("widget gadget kept item {i} with a much longer body so its bm25 ranks lower"),
+            "2026-10-01T10:00:00+00:00",
+        );
+    }
+    // 100 newer one-word matches fill a widened --recent OR pool before it reaches m_keep*,
+    // so --recent finds m_keep* only through its AND pool
+    for i in 0..100 {
+        seed(&format!("m_one{i:03}"), &format!("widget alone {i}"), TS);
+    }
+    let keep = ["m_keep1", "m_keep2", "m_keep3"].map(String::from).to_vec();
+    let ones: Vec<String> = (0..100).map(|i| format!("m_one{i:03}")).collect();
+    for (recent, want) in [(false, [keep.clone(), ones].concat()), (true, keep)] {
+        let mut args = vec![
+            "query",
+            "widget gadget -legacyx",
+            "--repo",
+            "anvil",
+            "--limit",
+            "200",
+            "--format",
+            "json",
+        ];
+        if recent {
+            args.push("--recent");
+        }
+        let (code, out, err) = sm(&home, &args);
+        assert_eq!(code, 0, "{err}");
+        let (mut ids, v) = result_ids(&out);
+        ids.sort();
+        assert_eq!(ids, want, "recent={recent}");
+        // every match is in the pool, so the footer must not call it full
+        assert_eq!(v["more"]["pool_full"], json!(false), "recent={recent}");
+    }
+}
+
+#[test]
+fn an_item_with_every_query_word_is_ranked_past_a_pool_of_one_word_matches() {
+    let (_d, home) = scratch();
+    let conn = open(&home);
+    let seed = |id: &str, body: &str| {
+        let mut it = Item::bare(id, "anvil", "fact", "", body, "verified");
+        it.evidence = "made-up check".to_string();
+        it.as_of = TS.to_string();
+        put_item(&conn, &it.post_init(), None).unwrap();
+    };
+    for i in 0..60 {
+        seed(&format!("m_d{i:02}"), &format!("deploy step {i}"));
+        seed(&format!("m_m{i:02}"), &format!("migration step {i}"));
+    }
+    let mut long = "The long incident note: we ran the deploy and then the migration".to_string();
+    for w in 1..=40 {
+        long.push_str(&format!(" and checked shard{w}"));
+    }
+    seed("m_both", &long);
+    let (code, out, err) = sm(
+        &home,
+        &[
+            "query",
+            "deploy migration",
+            "--repo",
+            "anvil",
+            "--limit",
+            "200",
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(code, 0, "{err}");
+    let (ids, v) = result_ids(&out);
+    assert!(ids.iter().any(|id| id == "m_both"), "{ids:?}");
+    // the one-word matches still overflow the OR pool
+    assert_eq!(v["more"]["pool_full"], json!(true));
+}
+
+fn more_line(home: &Path, args: &[&str]) -> String {
+    let (code, out, err) = sm(home, args);
+    assert_eq!(code, 0, "{err}");
+    out.lines()
+        .find(|l| l.starts_with("more: "))
+        .unwrap_or_else(|| panic!("no more: line in {out}"))
+        .to_string()
+}
+
+#[test]
+fn the_footer_names_the_pool_size_after_a_widened_or_and_extended_fetch() {
+    let (_d, home) = scratch();
+    let conn = open(&home);
+    let seed = |id: &str, body: &str| {
+        let mut it = Item::bare(id, "anvil", "fact", "", body, "verified");
+        it.evidence = "made-up check".to_string();
+        it.as_of = TS.to_string();
+        put_item(&conn, &it.post_init(), None).unwrap();
+    };
+    // 110 best matches hold the excluded word, so the 100-row pool is fetched again 400 wide;
+    // 400 of the 410 rows fill it and 290 of them stay
+    for i in 0..110 {
+        seed(&format!("m_x{i:03}"), &format!("widget legacyx case{i}"));
+    }
+    for i in 0..300 {
+        seed(
+            &format!("m_p{i:03}"),
+            &format!("widget plain item number {i}"),
+        );
+    }
+    // 60 + 60 one-word rows fill the 100-row OR pool; the AND form adds m_both as row 101
+    for i in 0..60 {
+        seed(&format!("m_d{i:02}"), &format!("deploy step {i}"));
+        seed(&format!("m_m{i:02}"), &format!("migration step {i}"));
+    }
+    seed(
+        "m_both",
+        "a longer note: we ran the deploy and then the migration on the cluster",
+    );
+    let widened = more_line(&home, &["query", "widget -legacyx", "--repo", "anvil"]);
+    assert!(
+        widened.starts_with("more: 286+ beyond --limit 4 (pool of 400 full) -> "),
+        "{widened}"
+    );
+    let extended = more_line(&home, &["query", "deploy migration", "--repo", "anvil"]);
+    assert!(
+        extended.starts_with("more: 97+ beyond --limit 4 (pool of 101 full) -> "),
+        "{extended}"
+    );
+}
+
+#[test]
+fn an_exclusion_over_more_matches_than_sqlite_binds_in_one_statement_still_answers() {
+    let (_d, home) = scratch();
+    let conn = open(&home);
+    // 33,000 matches pass SQLite's 32,766 bound variables; the exclusion removes all but m_keep,
+    // so the pool widens until one fetch holds every match
+    conn.execute_batch(
+        "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 33000)
+         INSERT INTO items (id, repo, kind, title, body, tag, as_of, content_hash)
+         SELECT 'm_x' || i, 'anvil', 'fact', '', 'alphaq betaqq row ' || i, 'verified',
+                '2026-10-25T10:00:00+00:00', 'h' || i FROM n;
+         INSERT INTO items (id, repo, kind, title, body, tag, as_of, content_hash)
+         VALUES ('m_keep', 'anvil', 'fact', '', 'alphaq kept row', 'verified',
+                 '2026-10-01T10:00:00+00:00', 'hk');",
+    )
+    .unwrap();
+    for recent in [false, true] {
+        let mut args = vec![
+            "query",
+            "alphaq -betaqq",
+            "--repo",
+            "anvil",
+            "--format",
+            "json",
+        ];
+        if recent {
+            args.push("--recent");
+        }
+        let (code, out, err) = sm(&home, &args);
+        assert_eq!(code, 0, "recent={recent}: {err}");
+        let (ids, v) = result_ids(&out);
+        assert_eq!(ids, vec!["m_keep"], "recent={recent}");
+        assert_eq!(v["more"]["pool_full"], json!(false), "recent={recent}");
+    }
+}

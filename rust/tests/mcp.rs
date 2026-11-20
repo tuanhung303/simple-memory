@@ -73,6 +73,7 @@ impl From<Value> for Line {
 struct Fx {
     tmp: tempfile::TempDir,
     home_override: Option<PathBuf>,
+    utc_offset: Option<&'static str>,
 }
 
 impl Fx {
@@ -80,6 +81,7 @@ impl Fx {
         Fx {
             tmp: tempfile::tempdir().unwrap(),
             home_override: None,
+            utc_offset: None,
         }
     }
 
@@ -106,6 +108,9 @@ impl Fx {
             if let Some(val) = std::env::var_os(key) {
                 c.env(key, val);
             }
+        }
+        if let Some(offset) = self.utc_offset {
+            c.env("SM_UTC_OFFSET", offset);
         }
         c
     }
@@ -1264,6 +1269,77 @@ fn an_oserror_in_a_tool_answers_is_error_and_the_server_keeps_running() {
     assert_eq!(out[1], json!({"jsonrpc": "2.0", "id": 2, "result": {}}));
     assert!(
         err.contains("sm mcp: memory_query: [Errno 20] Not a directory"),
+        "{err}"
+    );
+}
+
+#[test]
+fn a_date_out_of_range_answers_is_error_and_the_server_keeps_running() {
+    // At +07:00 local time, 9999-12-31T23:59:59Z is in year 10000; 0001-01-01T00:00:00+05:00 is
+    // in year 0 in UTC. Each raises OverflowError, which is no ValueError.
+    let mut fx = Fx::new();
+    fx.utc_offset = Some("+07:00");
+    let repo = fx.repo_dir();
+    let (out, _) = fx.conv(
+        vec![call(
+            1,
+            "memory_put",
+            json!({"text": "A", "tag": "assumed"}),
+        )],
+        &repo,
+    );
+    let id = payload(&out[0])["id"].clone();
+    for (name, arguments) in [
+        ("memory_list", json!({"until": "9999-12-31T23:59:59Z"})),
+        (
+            "memory_query",
+            json!({"query": "x", "since": "0001-01-01T00:00:00+05:00"}),
+        ),
+        (
+            "memory_amend",
+            json!({"id": id, "as_of": "0001-01-01T00:00:00+05:00"}),
+        ),
+    ] {
+        let (out, err) = fx.conv(vec![call(1, name, arguments.clone()), ping(2)], &repo);
+        assert_eq!(
+            out,
+            vec![
+                json!({"jsonrpc": "2.0", "id": 1, "result": {"content": [
+                    {"type": "text", "text": "error: date value out of range"}], "isError": true}}),
+                json!({"jsonrpc": "2.0", "id": 2, "result": {}}),
+            ],
+            "{name} {arguments}"
+        );
+        assert!(
+            err.contains(&format!("sm mcp: {name}: date value out of range")),
+            "{name} {arguments}: {err}"
+        );
+        assert!(!err.contains("Traceback"), "{name} {arguments}: {err}");
+    }
+}
+
+#[test]
+fn a_line_nested_past_the_depth_limit_is_a_parse_error_and_the_server_keeps_running() {
+    let fx = Fx::new();
+    let repo = fx.repo_dir();
+    let deep = format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\",\"params\":{{\"a\":{}{}}}}}\n",
+        "[".repeat(10_001),
+        "]".repeat(10_001)
+    );
+    let (out, err) = fx.converse(
+        vec![Line::Raw(deep.into_bytes().leak()), ping(2).into()],
+        &repo,
+    );
+    assert_eq!(
+        out,
+        vec![
+            json!({"jsonrpc": "2.0", "id": null, "error": {"code": -32700, "message": "Parse error"}}),
+            json!({"jsonrpc": "2.0", "id": 2, "result": {}}),
+        ]
+    );
+    assert!(
+        err.contains("sm mcp: parse error: maximum nesting depth (10000) exceeded"),
         "{err}"
     );
 }

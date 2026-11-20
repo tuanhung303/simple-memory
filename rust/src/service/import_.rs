@@ -7,6 +7,7 @@ use crate::config::{
     Aliases, aliases, get_db_path, load_config, project_dir_repo, repo_roots, resolve_repo, roots,
 };
 use crate::core::item::Item;
+use crate::core::redact::redact_text;
 use crate::error::SmError;
 use crate::py::path::PyPath;
 use crate::py::value::{PyValue, type_name};
@@ -281,9 +282,15 @@ pub fn automemory_without_file(
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let prefix_len = SOURCE_PREFIX.chars().count() as isize;
+    // the store holds each source in its redacted form
+    let stored: HashSet<String> = plan
+        .sources
+        .iter()
+        .map(|s| redact_text(s, None, None))
+        .collect();
     let mut gone = Vec::new();
     for (id, source) in rows {
-        if plan.sources.contains(&source) {
+        if stored.contains(&source) {
             continue;
         }
         let rest = crate::py::str::slice(&source, Some(prefix_len), None);
@@ -512,6 +519,31 @@ mod tests {
         let r = run_automemory_import(None, false, Some(h)).unwrap();
         assert_eq!(am_counts(&r), (0, 0, 0, 2));
         holder.execute_batch("ROLLBACK").unwrap();
+    }
+
+    /// A file name the store redacts in the source still matches its file on the next run, so
+    /// the item is neither retired nor added again.
+    #[test]
+    fn automemory_redacted_source_still_matches_its_file() {
+        let (_tmp, home, mem) = automemory_fixture();
+        let h = home.as_str();
+        std::fs::write(
+            mem.join("token=Zx9Qw8Er7Ty6.md"),
+            "---\nname: b\ndescription: b\nmetadata:\n  type: project\n  tag: decided\n---\nBody B\n",
+        )
+        .unwrap();
+        let r = run_automemory_import(None, false, Some(h)).unwrap();
+        assert_eq!((am_counts(&r), r.files), ((2, 0, 0, 0), 2));
+        let db = crate::config::get_db_path(Some(h)).unwrap();
+        let conn = rusqlite::Connection::open(db.as_str()).unwrap();
+        let source: String = conn
+            .query_row("SELECT source FROM items WHERE body = 'Body B'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(source, "automemory:p-alpha/[REDACTED:key_value]");
+        let r = run_automemory_import(None, false, Some(h)).unwrap();
+        assert_eq!(am_counts(&r), (0, 0, 0, 2));
     }
 
     /// An edit with the same size and mtime updates the item, a retired item of an unchanged

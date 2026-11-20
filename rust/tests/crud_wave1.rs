@@ -97,12 +97,12 @@ fn migration_0002_upgrades_v1_store_and_indexes_drive_query_plans() {
         assert!(!pre_indexes.contains(&"items_superseded_by".to_string()));
     }
 
-    // Reopening via connect() upgrades v1 -> v2, creates all 3 indexes, and preserves all rows.
+    // Reopening via connect() upgrades v1 -> v3, creates all 3 indexes, and preserves all rows.
     let conn = connect(db_path.to_str().unwrap(), None).unwrap();
     let version: i64 = conn
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 2);
+    assert_eq!(version, 3);
     let post_indexes = index_names(&conn);
     for idx in ["items_status_repo", "items_source", "items_superseded_by"] {
         assert!(
@@ -148,7 +148,7 @@ fn migration_0002_upgrades_v1_store_and_indexes_drive_query_plans() {
     let version2: i64 = conn2
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(version2, 2);
+    assert_eq!(version2, 3);
 }
 
 // ------------------------------------------------------------------ sm retire
@@ -756,7 +756,8 @@ fn amend_handles_task_handoff_automemory_legacy_and_turn_sources() {
         )
         .unwrap();
 
-    // Amending task: and automemory: clears new.source so catch-up/automemory never reverts it.
+    // Amending task: gives new.source amended:<source> and automemory: clears it, so
+    // catch-up/automemory never reverts it.
     let (tl_new, body_changed) = amend_item(
         &conn,
         &tl_id,
@@ -767,7 +768,10 @@ fn amend_handles_task_handoff_automemory_legacy_and_turn_sources() {
     )
     .unwrap();
     assert!(body_changed);
-    assert_eq!(get_item(&conn, &tl_new).unwrap().unwrap().source, "");
+    assert_eq!(
+        get_item(&conn, &tl_new).unwrap().unwrap().source,
+        "amended:task:20261101-100000-aabbccdd-amend-abcd"
+    );
     let (am_new, _) = amend_item(
         &conn,
         &am_id,
@@ -789,7 +793,7 @@ fn amend_handles_task_handoff_automemory_legacy_and_turn_sources() {
     assert_eq!(get_item(&conn, &tl_new).unwrap().unwrap().status, "active");
     assert_eq!(get_item(&conn, &am_new).unwrap().unwrap().status, "active");
 
-    // Handoff source is also detached on amend.
+    // A handoff item also keeps its file as amended:<source>.
     let ho_item = Item {
         source: "handoff:20261101-100000-demo-session.md".into(),
         ..sample_item("m_ho_1", "alpha", "handoff", "Handoff body", "derived")
@@ -804,7 +808,10 @@ fn amend_handles_task_handoff_automemory_legacy_and_turn_sources() {
         },
     )
     .unwrap();
-    assert_eq!(get_item(&conn, &ho_new).unwrap().unwrap().source, "");
+    assert_eq!(
+        get_item(&conn, &ho_new).unwrap().unwrap().source,
+        "amended:handoff:20261101-100000-demo-session.md"
+    );
 
     // Legacy item with id = "legacy:memories:1", source = "", tag = "n/a":
     // omitting --tag preserves n/a by copying old.id into new.source; subsequent amend works too.

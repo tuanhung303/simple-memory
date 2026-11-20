@@ -16,7 +16,7 @@ use crate::py::str::{isdecimal, slice, split, splitlines};
 use crate::py::value::PyValue;
 use crate::service::backup::{backup_age_hours, run_backup};
 use crate::service::capture::{Run, run_process};
-use crate::service::doctor::{import_lag, tasklog_repo_dirs};
+use crate::service::doctor::{import_lag, import_lag_by_repo, tasklog_repo_dirs};
 use crate::service::import_::{cfg_on, cfg2, float_of, run_automemory_import, run_import};
 use crate::store::connect::connect;
 use crate::store::items::retire_item;
@@ -188,22 +188,20 @@ fn retire_missing(home: &PyPath, cfg: &PyValue, dry_run: bool) -> Result<Counts,
         ("no_folder", 0),
     ]);
     let conn = connect(get_db_path(Some(home.as_str()))?.as_str(), None)?;
-    let missing = import_lag(&conn, cfg)?.stored_tasks_without_file;
-    for source in &missing {
-        let mut stmt =
-            conn.prepare("SELECT id, repo FROM items WHERE source = ? AND status = 'active'")?;
-        let rows = stmt
-            .query_map([source], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-            })?
+    let (_, missing) = import_lag_by_repo(&conn, cfg)?;
+    for (repo, source) in &missing {
+        let mut stmt = conn
+            .prepare("SELECT id FROM items WHERE repo = ? AND source = ? AND status = 'active'")?;
+        let ids = stmt
+            .query_map([repo, source], |r| r.get::<_, String>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        for (id, repo) in rows {
+        for id in ids {
             c["candidates"] += 1;
-            let Some(dir) = repo_dirs.get(&repo) else {
+            let Some(dir) = repo_dirs.get(repo) else {
                 c["no_folder"] += 1;
                 continue;
             };
-            if !wts.contains_key(&repo) {
+            if !wts.contains_key(repo) {
                 wts.insert(repo.clone(), worktrees(dir)?);
                 refs.insert(repo.clone(), branch_refs(dir)?);
             }
@@ -212,7 +210,7 @@ fn retire_missing(home: &PyPath, cfg: &PyValue, dry_run: bool) -> Result<Counts,
             {
                 let name = format!("{rest}.yaml");
                 let mut found = false;
-                for wt in &wts[&repo] {
+                for wt in &wts[repo] {
                     if !wt
                         .join("docs/tasklog")
                         .glob(&format!("*/{name}"))?
@@ -227,7 +225,7 @@ fn retire_missing(home: &PyPath, cfg: &PyValue, dry_run: bool) -> Result<Counts,
                     continue;
                 }
                 let rel = format!("docs/tasklog/{y}-{m}-{d}/{name}");
-                if at_a_branch_tip(dir, &refs[&repo], &rel)? {
+                if at_a_branch_tip(dir, &refs[repo], &rel)? {
                     c["on_branch"] += 1;
                     continue;
                 }

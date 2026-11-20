@@ -271,6 +271,42 @@ fn tl_text(id: &str, title: &str, as_of: &str, extra: &str, result: &str) -> Str
     )
 }
 
+/// A secret with `/` in a task log is redacted in the body, and the importer's path ref of it
+/// is dropped with it; the other refs of the same line stay.
+#[test]
+fn tasklog_import_drops_refs_of_a_redacted_secret() {
+    let (_d, tmp) = tmpdir();
+    let home = tmp.join("home");
+    let tl = tmp.join("anvil/docs/tasklog/2026-11-01/090000-cred.yaml");
+    write(
+        &tl,
+        &tl_text(
+            "20261101-090000-aabb0011-cred-0001",
+            "Rotate creds",
+            "2026-11-01T09:00:00+00:00",
+            "",
+            "set aws_secret_access_key=Zx9Qw8Er7Ty6/Uu5Ii4Oo3Pp/2Aa1Ss0Dd9Ff8Gg7 per docs/run.md",
+        ),
+    );
+    assert_eq!(import(&home, "tasklog", &tl, false, false).inserted, 1);
+    let db = open(&home);
+    let (body, refs): (String, String) = db
+        .query_row("SELECT body, refs FROM items", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap();
+    assert_eq!(body, "Results:\n- set [REDACTED:key_value] per docs/run.md");
+    assert_eq!(refs, "20261101-090000-aabb0011-cred-0001 docs/run.md");
+    let in_fold: i64 = db
+        .query_row(
+            "SELECT count(*) FROM items_fold WHERE items_fold MATCH '\"Uu5Ii4Oo3Pp\"*'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(in_fold, 0);
+}
+
 #[test]
 fn service_tasklog_and_handoff_reimport_and_superseded_by() {
     let (_d, tmp) = tmpdir();
@@ -699,7 +735,7 @@ fn service_doctor_imports_lists_files_not_stored() {
     let handoffs = tmp.join("handoffs/p");
     write(&handoffs.join("h1.md"), "# H1\n## Done\n- x\n");
     write(&handoffs.join("h2.md"), "# H2\n## Done\n- y\n");
-    // same kept body as h1 in the same repo: the import dedupes it onto h1's item
+    // same kept body as h1 in the same repo: another file, so it gets its own item
     write(&handoffs.join("h3.md"), "# H3 retitled\n## Done\n- x\n");
     std::fs::create_dir_all(&home).unwrap();
     write(
@@ -712,7 +748,7 @@ fn service_doctor_imports_lists_files_not_stored() {
         ),
     );
     import(&home, "tasklog", &stored, false, false);
-    // another id, same body in the same repo: the import dedupes it onto a.yaml's item
+    // another id, same body in the same repo: another file, so it gets its own item
     let same_body = root.join("r1/docs/tasklog/2026-11-01/a2.yaml");
     let text = std::fs::read_to_string(&stored).unwrap();
     write(
@@ -721,15 +757,11 @@ fn service_doctor_imports_lists_files_not_stored() {
             .replacen("0000000a-a-aaaa", "00000002-a-2222", 1)
             .replacen("title: T", "title: Retitled", 1),
     );
-    assert_eq!(
-        import(&home, "tasklog", &same_body, false, false).deduped,
-        1
-    );
+    let res = import(&home, "tasklog", &same_body, false, false);
+    assert_eq!((res.inserted, res.deduped), (1, 0));
     import(&home, "handoff", &handoffs.join("h1.md"), false, false);
-    assert_eq!(
-        import(&home, "handoff", &handoffs.join("h3.md"), false, false).deduped,
-        1
-    );
+    let res = import(&home, "handoff", &handoffs.join("h3.md"), false, false);
+    assert_eq!((res.inserted, res.deduped), (1, 0));
     let gone = tasklog(
         &tmp.join("elsewhere/docs/tasklog/2026-10-01/g.yaml"),
         "20261001-090000-0000000e-g-eeee",
@@ -777,6 +809,652 @@ fn service_doctor_imports_lists_files_not_stored() {
         lag.stored_tasks_without_file,
         ["task:20261001-090000-0000000e-g-eeee"]
     );
+}
+
+#[test]
+fn service_import_stores_each_file_whose_body_another_file_holds() {
+    let (_d, tmp) = tmpdir();
+    let home = tmp.join("home");
+    let root = tmp.join("gh");
+    let tl = |name: &str, id: &str, title: &str, results: &str| {
+        let p = root.join(format!("r1/docs/tasklog/2026-11-01/{name}.yaml"));
+        write(
+            &p,
+            &format!("id: {id}\ntitle: {title}\nresults:\n{results}"),
+        );
+        p
+    };
+    let tl_a = tl(
+        "a",
+        "20261101-090000-aaaa",
+        "Auth fix TKT-101",
+        "  - tests pass\n",
+    );
+    let tl_b = tl(
+        "b",
+        "20261101-100000-bbbb",
+        "Billing fix TKT-202",
+        "  - tests pass\n",
+    );
+    let handoffs = tmp.join("handoffs/r1");
+    write(
+        &handoffs.join("ha.md"),
+        "# HANDOFF: alpha\n\n## Done\n- tests pass\n",
+    );
+    write(
+        &handoffs.join("hb.md"),
+        "# HANDOFF: beta TKT-909\n\n## Done\n- tests pass\n",
+    );
+    std::fs::create_dir_all(&home).unwrap();
+    write(
+        &home.join("config.toml"),
+        &format!(
+            "[automemory]\nroot = \"{}\"\n[upkeep]\ntasklog_roots = [\"{}\"]\nhandoff_dirs = [\"{}\"]\n",
+            empty_dir(&tmp).display(),
+            root.display(),
+            tmp.join("handoffs").display()
+        ),
+    );
+    let active = || {
+        common::column(
+            &home,
+            "SELECT title FROM items WHERE status = 'active' ORDER BY title",
+        )
+    };
+    let not_stored = || {
+        let lag = doctor_imports(&home).lag.unwrap().0.not_stored;
+        lag.iter()
+            .map(|p| {
+                Path::new(p)
+                    .file_name()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect::<Vec<_>>()
+    };
+    import(&home, "tasklog", &tl_a, false, false);
+    import(&home, "handoff", &handoffs.join("ha.md"), false, false);
+    // only another file holds b's and hb's body: they are not stored
+    assert_eq!(not_stored(), ["b.yaml", "hb.md"]);
+
+    let res = import(&home, "tasklog", &tl_b, false, false);
+    assert_eq!((res.inserted, res.deduped), (1, 0));
+    let res = import(&home, "handoff", &handoffs.join("hb.md"), false, false);
+    assert_eq!((res.inserted, res.deduped), (1, 0));
+    assert_eq!(
+        active(),
+        [
+            "Auth fix TKT-101",
+            "Billing fix TKT-202",
+            "alpha",
+            "beta TKT-909"
+        ]
+    );
+    assert_eq!(not_stored(), Vec::<String>::new());
+    // a second import of the same files is a no-op
+    let res = import(&home, "tasklog", &root, false, false);
+    assert_eq!((res.inserted, res.deduped, res.superseded), (0, 2, 0));
+    let res = import(&home, "handoff", &tmp.join("handoffs"), false, false);
+    assert_eq!((res.inserted, res.deduped, res.superseded), (0, 2, 0));
+
+    // a's edit supersedes a's own item only; b keeps the old body
+    tl(
+        "a",
+        "20261101-090000-aaaa",
+        "Auth fix TKT-101",
+        "  - tests pass\n  - shipped\n",
+    );
+    let res = import(&home, "tasklog", &root, false, false);
+    assert_eq!((res.inserted, res.deduped, res.superseded), (1, 1, 1));
+    assert_eq!(not_stored(), Vec::<String>::new());
+    let b_rows = common::column(
+        &home,
+        "SELECT status || ' ' || body FROM items WHERE source = 'task:20261101-100000-bbbb'",
+    );
+    assert_eq!(b_rows, ["active Results:\n- tests pass"]);
+
+    // b first stored after a's edit: a new file with the old body of a
+    let tl_c = tl(
+        "c",
+        "20261101-110000-cccc",
+        "Cache fix TKT-303",
+        "  - tests pass\n",
+    );
+    assert_eq!(not_stored(), ["c.yaml"]);
+    let res = import(&home, "tasklog", &tl_c, false, false);
+    assert_eq!((res.inserted, res.deduped), (1, 0));
+    assert_eq!(not_stored(), Vec::<String>::new());
+
+    // a title amend of b keeps c, the other file with b's body
+    let b_id = &common::column(
+        &home,
+        "SELECT id FROM items WHERE status = 'active' AND source = 'task:20261101-100000-bbbb'",
+    )[0];
+    let (code, _, err) = sm(&home, &["amend", b_id, "--title", "Billing fix TKT-202 v2"]);
+    assert_eq!((code, err.as_str()), (0, ""));
+    // export, then import into a fresh home: both files with the same body come through
+    let (code, out, _) = sm(&home, &["export", "--all"]);
+    assert_eq!(code, 0);
+    let dump = tmp.join("dump.jsonl");
+    write(&dump, &out);
+    let home2 = tmp.join("home2");
+    let (code, _, err) = sm(&home2, &["import", "jsonl", dump.to_str().unwrap()]);
+    assert_eq!((code, err.as_str()), (0, ""));
+    let titles = "SELECT title FROM items WHERE status = 'active' ORDER BY title";
+    assert_eq!(
+        common::column(&home2, titles),
+        [
+            "Auth fix TKT-101",
+            "Billing fix TKT-202 v2",
+            "Cache fix TKT-303",
+            "alpha",
+            "beta TKT-909"
+        ]
+    );
+    // a manually retired file item stays retired, though no other file item holds its body now
+    let c_id = &common::column(
+        &home,
+        "SELECT id FROM items WHERE status = 'active' AND source = 'task:20261101-110000-cccc'",
+    )[0];
+    assert_eq!(sm(&home, &["retire", c_id, "--reason", "obsolete"]).0, 0);
+    let res = import(&home, "tasklog", &root, false, false);
+    assert_eq!((res.inserted, res.deduped), (0, 3));
+    assert_eq!(not_stored(), Vec::<String>::new());
+}
+
+/// A task id or a handoff file name in two repos gives one item per repo: a file supersedes
+/// only its own repo's items, with different or equal bodies.
+#[test]
+fn service_import_keeps_one_item_per_repo_for_a_shared_task_id_or_handoff_name() {
+    for same_body in [false, true] {
+        let (_d, tmp) = tmpdir();
+        let home = tmp.join("home");
+        let root = tmp.join("gh");
+        let hdir = tmp.join("handoffs");
+        std::fs::create_dir_all(&home).unwrap();
+        write(
+            &home.join("config.toml"),
+            &format!(
+                "[automemory]\nroot = \"{}\"\n[repos]\nroots = [\"{}\"]\n[upkeep]\ntasklog_roots = [\"{}\"]\nhandoff_dirs = [\"{}\"]\n",
+                empty_dir(&tmp).display(),
+                root.display(),
+                root.display(),
+                hdir.display()
+            ),
+        );
+        let tl = |repo: &str, extra: &str| {
+            let p = root.join(format!("{repo}/docs/tasklog/2026-11-01/shared.yaml"));
+            let result = if same_body { "tests pass" } else { repo };
+            write(
+                &p,
+                &format!(
+                    "id: 20261101-090000-shared\ntitle: Shared {repo}\nresults:\n  - {result}\n{extra}"
+                ),
+            );
+            p
+        };
+        // each handoff folder holds one file name; its CWD line names the repo
+        let ho = |repo: &str, extra: &str| {
+            let p = hdir.join(format!("{repo}-session/HANDOFF.md"));
+            let done = if same_body { "tests pass" } else { repo };
+            write(
+                &p,
+                &format!(
+                    "# HANDOFF: shared {repo}\nCWD: {}\n\n## Done\n- {done}\n{extra}",
+                    root.join(repo).display()
+                ),
+            );
+            p
+        };
+        let active = || {
+            common::column(
+                &home,
+                "SELECT repo || ' ' || source || ' ' || title FROM items WHERE status = 'active' \
+                 ORDER BY repo, source",
+            )
+        };
+        let both = [
+            "r1 handoff:HANDOFF.md shared r1",
+            "r1 task:20261101-090000-shared Shared r1",
+            "r2 handoff:HANDOFF.md shared r2",
+            "r2 task:20261101-090000-shared Shared r2",
+        ];
+        let lag = || {
+            let l = doctor_imports(&home).lag.unwrap().0;
+            (l.not_stored.len(), l.stored_tasks_without_file.len())
+        };
+        let (a1, a2, h1, h2) = (tl("r1", ""), tl("r2", ""), ho("r1", ""), ho("r2", ""));
+        for (kind, p) in [
+            ("tasklog", &a1),
+            ("tasklog", &a2),
+            ("handoff", &h1),
+            ("handoff", &h2),
+        ] {
+            let res = import(&home, kind, p, false, false);
+            assert_eq!(
+                (res.inserted, res.deduped, res.superseded),
+                (1, 0, 0),
+                "{kind} {p:?} same_body={same_body}"
+            );
+        }
+        assert_eq!(active(), both, "same_body={same_body}");
+        assert_eq!(lag(), (0, 0));
+        // a second run of every file stores nothing and supersedes nothing
+        for (kind, p) in [
+            ("tasklog", &a1),
+            ("tasklog", &a2),
+            ("handoff", &h1),
+            ("handoff", &h2),
+        ] {
+            let res = import(&home, kind, p, false, false);
+            assert_eq!((res.inserted, res.deduped, res.superseded), (0, 1, 0));
+        }
+        // an edit of either repo's file supersedes only that repo's item
+        let (r1_task, r1_ho) = (
+            common::column(
+                &home,
+                "SELECT id FROM items WHERE repo = 'r1' AND source LIKE 'task:%'",
+            ),
+            common::column(
+                &home,
+                "SELECT id FROM items WHERE repo = 'r1' AND source LIKE 'handoff:%'",
+            ),
+        );
+        tl("r1", "  - edited\n");
+        ho("r1", "- edited\n");
+        assert_eq!(lag(), (2, 0));
+        for (kind, p) in [("tasklog", &a1), ("handoff", &h1)] {
+            let res = import(&home, kind, p, false, false);
+            assert_eq!((res.inserted, res.superseded), (1, 1), "{kind}");
+        }
+        assert_eq!(active(), both);
+        let old = common::column(
+            &home,
+            "SELECT o.id || ' ' || n.repo FROM items o JOIN items n ON n.id = o.superseded_by \
+             WHERE o.status = 'superseded' ORDER BY o.rowid",
+        );
+        assert_eq!(
+            old,
+            [format!("{} r1", r1_task[0]), format!("{} r1", r1_ho[0])]
+        );
+        tl("r2", "  - edited\n");
+        ho("r2", "- edited\n");
+        for (kind, p) in [("tasklog", &a2), ("handoff", &h2)] {
+            let res = import(&home, kind, p, false, false);
+            assert_eq!((res.inserted, res.superseded), (1, 1), "{kind}");
+        }
+        assert_eq!(active(), both);
+        // r1's files go back to their first bodies: their first items come back, r2's stay
+        let r2_ids = common::column(
+            &home,
+            "SELECT id FROM items WHERE repo = 'r2' AND status = 'active' ORDER BY source",
+        );
+        tl("r1", "");
+        ho("r1", "");
+        for (kind, p) in [("tasklog", &a1), ("handoff", &h1)] {
+            let res = import(&home, kind, p, false, false);
+            assert_eq!((res.inserted, res.superseded), (1, 1), "{kind}");
+        }
+        assert_eq!(
+            common::column(
+                &home,
+                "SELECT id FROM items WHERE status = 'active' ORDER BY repo, source",
+            ),
+            [&r1_ho[0], &r1_task[0], &r2_ids[0], &r2_ids[1]].map(String::as_str)
+        );
+        assert_eq!(lag(), (0, 0));
+        for (kind, p) in [
+            ("tasklog", &a1),
+            ("tasklog", &a2),
+            ("handoff", &h1),
+            ("handoff", &h2),
+        ] {
+            let res = import(&home, kind, p, false, false);
+            assert_eq!((res.inserted, res.superseded), (0, 0));
+        }
+        // a plain query in each repo finds that repo's task log and handoff
+        for repo in ["r1", "r2"] {
+            let mut titles: Vec<String> = query(&home, "shared", repo)
+                .into_iter()
+                .map(|i| i.title)
+                .collect();
+            titles.sort();
+            assert_eq!(titles, [format!("Shared {repo}"), format!("shared {repo}")]);
+        }
+    }
+}
+
+/// The state the old cross-repo rule left: r1's task item superseded by r2's item of the same
+/// source. The next import of r1's file restores r1's row (no new row), the doctor lists the
+/// file until then, and a second run does nothing. An amended row, a manual supersede by an
+/// item of another source, and a file whose body changed since are left as they are.
+#[test]
+fn service_import_restores_a_task_item_another_repo_hid() {
+    let (_d, tmp) = tmpdir();
+    let home = tmp.join("home");
+    let root = tmp.join("gh");
+    std::fs::create_dir_all(&home).unwrap();
+    write(
+        &home.join("config.toml"),
+        &format!(
+            "[automemory]\nroot = \"{}\"\n[upkeep]\ntasklog_roots = [\"{}\"]\nhandoff_dirs = []\n",
+            empty_dir(&tmp).display(),
+            root.display()
+        ),
+    );
+    let tl = |repo: &str, name: &str, result: &str| {
+        let p = root.join(format!("{repo}/docs/tasklog/2026-11-01/{name}.yaml"));
+        write(
+            &p,
+            &format!("id: 20261101-{name}\ntitle: T {repo} {name}\nresults:\n  - {result}\n"),
+        );
+        p
+    };
+    let id_of = |repo: &str, name: &str| {
+        common::column(
+            &home,
+            &format!(
+                "SELECT id FROM items WHERE repo = '{repo}' AND source = 'task:20261101-{name}' \
+                 ORDER BY rowid"
+            ),
+        )
+        .remove(0)
+    };
+    let id_of_new = |repo: &str| {
+        common::column(
+            &home,
+            &format!(
+                "SELECT id FROM items WHERE repo = '{repo}' AND source = 'task:20261101-090000-plain' \
+                 ORDER BY rowid DESC"
+            ),
+        )
+        .remove(0)
+    };
+    // the old rule's result, made by hand: r1's row superseded by r2's row of its source
+    let hide = |name: &str| {
+        let (r1, r2) = (id_of("r1", name), id_of("r2", name));
+        common::open(&home)
+            .execute(
+                "UPDATE items SET status = 'superseded', superseded_by = ?1 WHERE id = ?2",
+                [&r2, &r1],
+            )
+            .unwrap();
+        r1
+    };
+    let not_stored = || {
+        let mut names: Vec<String> = doctor_imports(&home)
+            .lag
+            .unwrap()
+            .0
+            .not_stored
+            .iter()
+            .map(|p| {
+                let p = Path::new(p);
+                let repo = p.ancestors().nth(4).unwrap().file_name().unwrap();
+                format!(
+                    "{}/{}",
+                    repo.to_str().unwrap(),
+                    p.file_name().unwrap().to_str().unwrap()
+                )
+            })
+            .collect();
+        names.sort();
+        names
+    };
+    let state = |id: &str| {
+        common::column(
+            &home,
+            &format!(
+                "SELECT status || ' ' || ifnull(superseded_by, '-') FROM items WHERE id = '{id}'"
+            ),
+        )
+        .remove(0)
+    };
+    for n in [
+        "090000-plain",
+        "100000-amended",
+        "110000-manual",
+        "120000-edited",
+    ] {
+        tl("r1", n, &format!("r1 {n}"));
+        tl("r2", n, &format!("r2 {n}"));
+    }
+    assert_eq!(import(&home, "tasklog", &root, false, false).inserted, 8);
+    // plain: hidden by r2, then r2 edits its file, so r1's row points at a superseded r2 row
+    let plain = hide("090000-plain");
+    let r2_plain = id_of("r2", "090000-plain");
+    let r2_file = tl("r2", "090000-plain", "r2 plain edited");
+    let res = import(&home, "tasklog", &r2_file, false, false);
+    assert_eq!((res.inserted, res.superseded), (1, 1));
+    assert_eq!(state(&r2_plain), format!("superseded {}", id_of_new("r2")));
+    // amended: an amend by hand supersedes r1's row; that stays
+    let amended = id_of("r1", "100000-amended");
+    let (code, out, _) = sm(&home, &["amend", &amended, "--title", "T amended by hand"]);
+    assert_eq!(code, 0);
+    let amended_row = out.trim().to_string();
+    // manual: a manual item of r2 (another source) supersedes r1's row by hand; that stays
+    let manual_case = id_of("r1", "110000-manual");
+    let manual = put(&home, "manual note on the manual case", "decided", "r2");
+    assert_eq!(sm(&home, &["supersede", &manual_case, &manual]).0, 0);
+    // edited: hidden by r2, then r1's file changes: the import inserts a new row
+    let edited = hide("120000-edited");
+    let r2_edited = id_of("r2", "120000-edited");
+    tl("r1", "120000-edited", "r1 edited again");
+
+    assert_eq!(
+        not_stored(),
+        ["r1/090000-plain.yaml", "r1/120000-edited.yaml"]
+    );
+    let res = import(&home, "tasklog", &root.join("r1"), false, false);
+    assert_eq!((res.inserted, res.deduped, res.superseded), (2, 2, 0));
+    assert_eq!(not_stored(), Vec::<String>::new());
+    let res = import(&home, "tasklog", &root.join("r1"), false, false);
+    assert_eq!((res.inserted, res.deduped, res.superseded), (0, 4, 0));
+    assert_eq!(state(&plain), "active -");
+    assert_eq!(state(&amended), format!("superseded {amended_row}"));
+    assert_eq!(state(&manual_case), format!("superseded {manual}"));
+    assert_eq!(state(&edited), format!("superseded {r2_edited}"));
+    assert_eq!(
+        common::column(
+            &home,
+            "SELECT repo || ' ' || source FROM items WHERE status = 'active' ORDER BY repo, source",
+        ),
+        [
+            "r1 amended:task:20261101-100000-amended",
+            "r1 task:20261101-090000-plain",
+            "r1 task:20261101-120000-edited",
+            "r2 ",
+            "r2 task:20261101-090000-plain",
+            "r2 task:20261101-100000-amended",
+            "r2 task:20261101-110000-manual",
+            "r2 task:20261101-120000-edited",
+        ]
+    );
+}
+
+/// A row that a newer version of the same file in the SAME repo replaced is not restored through
+/// the other-repo rule: A -> B in one repo, B retired by hand (the source has no active row), the
+/// file back to A. The retire stays: A is deduped against its superseded row, nothing comes back,
+/// and the doctor lists nothing.
+#[test]
+fn service_import_does_not_restore_a_row_its_own_repo_replaced() {
+    let (_d, tmp) = tmpdir();
+    let home = tmp.join("home");
+    let root = tmp.join("gh");
+    std::fs::create_dir_all(&home).unwrap();
+    write(
+        &home.join("config.toml"),
+        &format!(
+            "[automemory]\nroot = \"{}\"\n[upkeep]\ntasklog_roots = [\"{}\"]\nhandoff_dirs = []\n",
+            empty_dir(&tmp).display(),
+            root.display()
+        ),
+    );
+    let file = root.join("r1/docs/tasklog/2026-11-01/090000-same.yaml");
+    let body = |result: &str| {
+        write(
+            &file,
+            &format!("id: 20261101-090000-same\ntitle: T same\nresults:\n  - {result}\n"),
+        );
+    };
+    let counts = || {
+        let res = import(&home, "tasklog", &file, false, false);
+        (res.inserted, res.deduped, res.superseded)
+    };
+    let states = || {
+        common::column(
+            &home,
+            "SELECT status || ' ' || ifnull(superseded_by, '-') FROM items ORDER BY rowid",
+        )
+    };
+    body("body A");
+    assert_eq!(counts(), (1, 0, 0));
+    body("body B");
+    assert_eq!(counts(), (1, 0, 1));
+    let ids = common::column(&home, "SELECT id FROM items ORDER BY rowid");
+    assert_eq!(sm(&home, &["retire", &ids[1], "--reason", "by hand"]).0, 0);
+    assert_eq!(
+        states(),
+        [format!("superseded {}", ids[1]), s("superseded -")]
+    );
+    body("body A");
+    assert_eq!(counts(), (0, 1, 0));
+    assert_eq!(
+        states(),
+        [format!("superseded {}", ids[1]), s("superseded -")]
+    );
+    assert_eq!(counts(), (0, 1, 0));
+    assert_eq!(
+        doctor_imports(&home).lag.unwrap().0.not_stored,
+        Vec::<String>::new()
+    );
+}
+
+#[test]
+fn service_import_stores_a_file_whose_body_a_manual_item_holds() {
+    let (_d, tmp) = tmpdir();
+    let home = tmp.join("home");
+    let root = tmp.join("gh");
+    let p = root.join("r1/docs/tasklog/2026-11-01/a.yaml");
+    write(
+        &p,
+        "id: 20261101-090000-aaaa\ntitle: Auth fix\nresults:\n  - tests pass\n",
+    );
+    std::fs::create_dir_all(&home).unwrap();
+    write(
+        &home.join("config.toml"),
+        &format!(
+            "[automemory]\nroot = \"{}\"\n[upkeep]\ntasklog_roots = [\"{}\"]\nhandoff_dirs = []\n",
+            empty_dir(&tmp).display(),
+            root.display()
+        ),
+    );
+    let not_stored = || doctor_imports(&home).lag.unwrap().0.not_stored.len();
+    let manual = put(&home, "Results:\n- tests pass", "decided", "r1");
+    assert_eq!(not_stored(), 1);
+    let res = import(&home, "tasklog", &p, false, false);
+    assert_eq!((res.inserted, res.deduped), (1, 0));
+    let active = "SELECT source FROM items WHERE status = 'active' ORDER BY source";
+    assert_eq!(
+        common::column(&home, active),
+        ["", "task:20261101-090000-aaaa"]
+    );
+    assert_eq!(not_stored(), 0);
+    // a manual put of that body still returns an active row that holds it
+    assert_eq!(
+        put(&home, "Results:\n- tests pass", "decided", "r1"),
+        manual
+    );
+    // an amend keeps the file item in a slot of its own (amended:<source>), so the manual item
+    // with its body does not block it
+    let file_id = &common::column(
+        &home,
+        "SELECT id FROM items WHERE status = 'active' AND source != ''",
+    )[0];
+    let (code, _, err) = sm(&home, &["amend", file_id, "--title", "Auth fix v2"]);
+    assert_eq!((code, err.as_str()), (0, ""));
+    assert_eq!(
+        common::column(&home, active),
+        ["", "amended:task:20261101-090000-aaaa"]
+    );
+    assert_eq!(not_stored(), 0);
+}
+
+#[test]
+fn service_import_stores_a_file_whose_body_an_amended_item_holds() {
+    let (_d, tmp) = tmpdir();
+    let home = tmp.join("home");
+    let root = tmp.join("gh");
+    let dir = root.join("r1/docs/tasklog/2026-11-01");
+    let tl = |name: &str, id: &str, title: &str| {
+        write(
+            &dir.join(format!("{name}.yaml")),
+            &format!("id: {id}\ntitle: {title}\nresults:\n  - tests pass\n"),
+        );
+    };
+    tl("a", "20261101-090000-aaaa", "Auth fix TKT-101");
+    std::fs::create_dir_all(&home).unwrap();
+    write(
+        &home.join("config.toml"),
+        &format!(
+            "[automemory]\nroot = \"{}\"\n[upkeep]\ntasklog_roots = [\"{}\"]\nhandoff_dirs = []\n",
+            empty_dir(&tmp).display(),
+            root.display()
+        ),
+    );
+    let not_stored = || {
+        let lag = doctor_imports(&home).lag.unwrap().0.not_stored;
+        lag.iter()
+            .map(|p| {
+                Path::new(p)
+                    .file_name()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect::<Vec<_>>()
+    };
+    let active = || {
+        common::column(
+            &home,
+            "SELECT source || ' ' || title FROM items WHERE status = 'active' ORDER BY title",
+        )
+    };
+    import(&home, "tasklog", &root, false, false);
+    let a_id = &common::column(&home, "SELECT id FROM items WHERE status = 'active'")[0];
+    let (code, out, err) = sm(&home, &["amend", a_id, "--title", "Auth fix renamed"]);
+    assert_eq!((code, err.as_str()), (0, ""));
+    let renamed = out.trim().to_string();
+    // the amended row's source is amended:task:...; a's own superseded row keeps a's file stored
+    assert_eq!(not_stored(), Vec::<String>::new());
+    tl("b", "20261101-100000-bbbb", "Billing fix TKT-202");
+    assert_eq!(not_stored(), ["b.yaml"]);
+    let res = import(&home, "tasklog", &root, false, false);
+    assert_eq!((res.inserted, res.deduped), (1, 1));
+    assert_eq!(
+        active(),
+        [
+            "amended:task:20261101-090000-aaaa Auth fix renamed",
+            "task:20261101-100000-bbbb Billing fix TKT-202"
+        ]
+    );
+    assert_eq!(not_stored(), Vec::<String>::new());
+    // an amend that changes the body: neither file is imported again
+    let (code, _, _) = sm(&home, &["amend", &renamed, "--body", "tests pass, shipped"]);
+    assert_eq!(code, 0);
+    let res = import(&home, "tasklog", &root, false, false);
+    assert_eq!((res.inserted, res.deduped, res.superseded), (0, 2, 0));
+    assert_eq!(
+        active(),
+        [
+            "amended:task:20261101-090000-aaaa Auth fix renamed",
+            "task:20261101-100000-bbbb Billing fix TKT-202"
+        ]
+    );
+    assert_eq!(not_stored(), Vec::<String>::new());
 }
 
 #[test]
@@ -1165,7 +1843,7 @@ fn imports_and_doctor_alias_the_repo_a_key_or_folder_names() {
     std::fs::create_dir_all(code.join("proj")).unwrap();
     let tasklogs = code.join("proj-wt/docs/tasklog/2026-11-01");
     for task_id in ["20261101-090000-t1", "20261101-090000-t2"] {
-        // same body: the second dedupes
+        // same body, another file: each gets its own item
         write(
             &tasklogs.join(format!("{task_id}.yaml")),
             &format!(
@@ -1182,7 +1860,7 @@ fn imports_and_doctor_alias_the_repo_a_key_or_folder_names() {
         .collect();
     let handoffs = tmp.join("handoffs").join(key);
     for name in ["a.md", "b.md"] {
-        // same body: the second dedupes
+        // same body, another file: each gets its own item
         write(
             &handoffs.join(name),
             "# Handoff\n\n## Done\n- shipped the alias rule\n",
@@ -1208,7 +1886,7 @@ fn imports_and_doctor_alias_the_repo_a_key_or_folder_names() {
             res.by_repo.get("proj").copied(),
             res.by_repo.len()
         ),
-        (1, 1, Some(2), 1)
+        (2, 0, Some(2), 1)
     );
     let res = import(
         &home,
@@ -1224,9 +1902,9 @@ fn imports_and_doctor_alias_the_repo_a_key_or_folder_names() {
             res.by_repo.get("proj").copied(),
             res.by_repo.len()
         ),
-        (1, 1, Some(2), 1)
+        (2, 0, Some(2), 1)
     );
-    // doctor parses each file with the same roots and aliases, so a deduped file counts as stored
+    // doctor parses each file with the same roots and aliases, so an imported file counts as stored
     assert_eq!(
         doctor_imports(&home).lag.unwrap().0.not_stored,
         Vec::<String>::new()

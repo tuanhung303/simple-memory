@@ -12,7 +12,7 @@
 
 ## Storage and dual FTS5 indexes
 
-All state lives in `$SIMPLE_MEMORY_HOME/memory.db` (default `~/.simple-memory/memory.db`) in SQLite WAL mode with `foreign_keys = ON`. Schema migrations `rust/migrations/0001_init.sql` and `rust/migrations/0002_indexes.sql` (versioned via `PRAGMA user_version = 2`) create `items`, dual FTS5 tables, triggers, and secondary indexes on `(status, repo)`, `source`, and partial `superseded_by WHERE superseded_by IS NOT NULL`:
+All state lives in `$SIMPLE_MEMORY_HOME/memory.db` (default `~/.simple-memory/memory.db`) in SQLite WAL mode with `foreign_keys = ON`. Schema migrations `rust/migrations/0001_init.sql`, `0002_indexes.sql` and `0003_dedupe_per_file.sql` (versioned via `PRAGMA user_version = 3`) create `items`, dual FTS5 tables, triggers, and secondary indexes on `(status, repo)`, `source`, and partial `superseded_by WHERE superseded_by IS NOT NULL`:
 
 ```sql
 CREATE TABLE items (
@@ -31,7 +31,11 @@ CREATE TABLE items (
   superseded_by TEXT,
   content_hash  TEXT NOT NULL
 );
-CREATE UNIQUE INDEX items_dedupe ON items(repo, content_hash) WHERE status = 'active';
+-- one active body per repo among items no file backs; a task log or handoff item (task:*, handoff:*), or one amended by hand (amended:task:*, amended:handoff:*), dedupes only within its own source
+CREATE UNIQUE INDEX items_dedupe ON items(repo, content_hash,
+  CASE WHEN substr(source, 1, 5) = 'task:' OR substr(source, 1, 8) = 'handoff:'
+    OR substr(source, 1, 13) = 'amended:task:' OR substr(source, 1, 16) = 'amended:handoff:'
+    THEN source ELSE '' END) WHERE status = 'active';
 ```
 
 SQLite `INSERT`/`UPDATE`/`DELETE` triggers keep two FTS5 virtual tables synchronized inside every write transaction:
@@ -47,7 +51,7 @@ Retrieval operates over a two-layer ontology: SQLite `items` columns (`kind`, ev
 
 ## Ranking and default bias
 
-`rust/src/core/rank.rs` (`parse_query_exclusions`, `score_candidates`) splits unquoted `-term` and `-"phrase"` exclusions out of the positive query (stripping standalone uppercase `OR`/`AND` tokens while keeping hyphenated tokens such as `rate-limit` positive), extracts reference tokens (`refs`), builds an `OR` FTS5 query expanded by `[keyword_aliases]`, gathers top candidates from both FTS indexes plus exact ref matches (`FTS_CANDIDATE_LIMIT = 50`, widened to `BIASED_CANDIDATE_LIMIT = 100` whenever any tag, kind, `scope:<path>` bias, or exclusion is active and `--recent` is off), removes candidates matching any excluded term or phrase across folded `refs + title + tags + body`, and sorts descending by:
+`rust/src/core/rank.rs` (`parse_query_exclusions`, `score_candidates`) splits unquoted `-term` and `-"phrase"` exclusions out of the positive query (stripping standalone uppercase `OR`/`AND` tokens while keeping hyphenated tokens such as `rate-limit` positive), extracts reference tokens (`refs`), builds an `OR` FTS5 query expanded by `[keyword_aliases]`, gathers top candidates from both FTS indexes plus exact ref matches (`FTS_CANDIDATE_LIMIT = 50`, widened to `BIASED_CANDIDATE_LIMIT = 100` whenever any tag, kind, `scope:<path>` bias, or exclusion is active and `--recent` is off), adds with `--recent` off the top matches of the `AND` form of a query of two or more terms (so an item that holds every term is not cut by one-term matches), removes candidates matching any excluded term or phrase across folded `refs + title + tags + body` (fetching again 4 times wider while a full fetch keeps fewer FTS matches than the pool cap), and sorts descending by:
 
 ```text
 (active, ref_hits, phrase_hit, accent_hit, score, as_of_epoch, id)
@@ -76,7 +80,8 @@ score = bm25_scaled * (1 + recency_boost + 0.3 * matched_bias_count + accent_boo
 rust/
 ├── migrations/
 │   ├── 0001_init.sql            SQLite tables, FTS5 indexes, triggers
-│   └── 0002_indexes.sql         B-tree indexes on (status, repo), source, partial superseded_by
+│   ├── 0002_indexes.sql         B-tree indexes on (status, repo), source, partial superseded_by
+│   └── 0003_dedupe_per_file.sql items_dedupe also keys task log and handoff items, amended or not, by source
 ├── src/
 │   ├── core/                    pure domain logic: fold, refs, terms (stands_as_word), rank, tags, item, redact, dedup
 │   ├── store/                   all SQLite queries: connect, items, search, related, stats, transfer, upkeep

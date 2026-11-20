@@ -189,13 +189,68 @@ fn validate_item(item: &Item) -> Result<(), SmError> {
     Ok(())
 }
 
-/// The active item of a repo holding a content hash.
-fn active_by_hash(conn: &Connection, repo: &str, hash: &str) -> Result<Option<String>, SmError> {
-    bind_all(&[repo, hash])?;
+/// A task log or handoff file: one item source per file.
+pub fn file_backed(source: &str) -> bool {
+    source.starts_with("task:") || source.starts_with("handoff:")
+}
+
+/// The source an amend gives a task log or handoff item: `amended:` and the file's source. It
+/// is not the file's source, so the importer never takes the amended row for the file's
+/// current version, and it keeps the item in a dedupe slot of its own.
+const AMENDED_PREFIX: &str = "amended:";
+
+/// The source's slot in the `items_dedupe` index (migration 0003): a file's own source or an
+/// amended file item's source, or '' for every other item.
+pub fn dedupe_slot(source: &str) -> &str {
+    if file_backed(source) || source.strip_prefix(AMENDED_PREFIX).is_some_and(file_backed) {
+        source
+    } else {
+        ""
+    }
+}
+
+const SLOT_SQL: &str = "CASE WHEN substr(source, 1, 5) = 'task:' OR substr(source, 1, 8) = 'handoff:' \
+                        OR substr(source, 1, 13) = 'amended:task:' \
+                        OR substr(source, 1, 16) = 'amended:handoff:' THEN source ELSE '' END";
+
+/// The active item of a repo, other than `other_than`, whose body an item from `source` repeats:
+/// any row for an item no file backs, else a row of the same file only, so neither another file
+/// nor a manual or amended row stands in for a file.
+fn active_by_hash(
+    conn: &Connection,
+    repo: &str,
+    hash: &str,
+    source: &str,
+    other_than: Option<&str>,
+) -> Result<Option<String>, SmError> {
+    let slot = dedupe_slot(source);
+    bind_all(&[repo, hash, slot])?;
     one_str(
         conn,
-        "SELECT id FROM items WHERE repo = ? AND content_hash = ? AND status = 'active'",
-        [repo, hash],
+        "SELECT id FROM items WHERE repo = ?1 AND content_hash = ?2 AND status = 'active' \
+         AND id IS NOT ?4 AND (?3 = '' OR source = ?3)",
+        params![repo, hash, slot, other_than],
+    )
+}
+
+/// The active item, other than `other_than`, that holds the `items_dedupe` slot an active item
+/// from `source` needs.
+pub fn active_in_slot(
+    conn: &Connection,
+    repo: &str,
+    hash: &str,
+    source: &str,
+    other_than: Option<&str>,
+) -> Result<Option<String>, SmError> {
+    let slot = dedupe_slot(source);
+    bind_all(&[repo, hash, slot])?;
+    one_str(
+        conn,
+        &format!(
+            "SELECT id FROM items WHERE repo = ?1 AND content_hash = ?2 AND status = 'active' \
+             AND id IS NOT ?4 AND {SLOT_SQL} = ?3"
+        ),
+        params![repo, hash, slot, other_than],
     )
 }
 
@@ -266,7 +321,9 @@ pub fn put_item(
         .map(|s| strip(s).to_string())
         .collect();
     transaction(conn, None, |conn| {
-        if let Some(existing_id) = active_by_hash(conn, &item.repo, &item.content_hash)? {
+        if let Some(existing_id) =
+            active_by_hash(conn, &item.repo, &item.content_hash, &item.source, None)?
+        {
             let other: Vec<&String> = sup_list.iter().filter(|o| **o != existing_id).collect();
             if !other.is_empty() {
                 mark_superseded(conn, &other, &existing_id)?;
@@ -281,11 +338,23 @@ pub fn put_item(
     })
 }
 
-fn active_ids_of_source(conn: &Connection, source: &str) -> Result<Vec<String>, SmError> {
+/// The active ids of `source`, in `repo` only when one is given: a task log or handoff names
+/// its file by task id or file name, which another repo can repeat, so it reads its own repo;
+/// an auto-memory source names one file of one project.
+fn active_ids_of_source(
+    conn: &Connection,
+    source: &str,
+    repo: Option<&str>,
+) -> Result<Vec<String>, SmError> {
     bind_text(source)?;
-    let mut stmt = conn.prepare("SELECT id FROM items WHERE source = ? AND status = 'active'")?;
+    if let Some(r) = repo {
+        bind_text(r)?;
+    }
+    let mut stmt = conn.prepare(
+        "SELECT id FROM items WHERE source = ?1 AND status = 'active' AND (?2 IS NULL OR repo = ?2)",
+    )?;
     let ids = stmt
-        .query_map([source], |r| r.get::<_, String>(0))?
+        .query_map(params![source, repo], |r| r.get::<_, String>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(ids)
 }
@@ -422,18 +491,21 @@ fn row_error(e: &SmError) -> bool {
     matches!(e.base, Base::Value | Base::Key | Base::Type | Base::Sqlite)
 }
 
-fn active_ids_of_source_in_repo(
+/// The item `by` that replaced a row of `repo` and `source` has that source in another repo: a
+/// task log or handoff hidden by the rule before one item per repo.
+fn hidden_by_another_repo(
     conn: &Connection,
     repo: &str,
     source: &str,
-) -> Result<Vec<String>, SmError> {
-    bind_all(&[repo, source])?;
-    let mut stmt =
-        conn.prepare("SELECT id FROM items WHERE repo = ? AND source = ? AND status = 'active'")?;
-    let ids = stmt
-        .query_map([repo, source], |r| r.get::<_, String>(0))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(ids)
+    by: &str,
+) -> Result<bool, SmError> {
+    bind_all(&[repo, source, by])?;
+    Ok(one_str(
+        conn,
+        "SELECT id FROM items WHERE id = ?3 AND source = ?2 AND repo != ?1",
+        params![repo, source, by],
+    )?
+    .is_some())
 }
 
 /// One row of put_items_batch inside its savepoint: (inserted, deduped, superseded, missing, target).
@@ -444,11 +516,9 @@ fn batch_row(
 ) -> Result<(i64, i64, i64, i64, String), SmError> {
     validate_item(item)?;
     let (mut ins, mut dup, mut sup, mut missing) = (0, 0, 0, 0);
-    let mut existing = active_by_hash(conn, &item.repo, &item.content_hash)?;
+    let mut existing = active_by_hash(conn, &item.repo, &item.content_hash, &item.source, None)?;
     let mut restore_id: Option<String> = None;
-    if existing.is_none()
-        && (item.source.starts_with("task:") || item.source.starts_with("handoff:"))
-    {
+    if existing.is_none() && file_backed(&item.source) {
         bind_all(&[&item.repo, &item.source, &item.content_hash])?;
         let prior: Option<(String, Option<String>, String)> = conn
             .query_row(
@@ -467,9 +537,13 @@ fn batch_row(
                 }
             }
             // Restore an earlier body when the file's own source still has an active version
-            // (reverted A -> B -> A); keep superseded items replaced by another source alone.
-            Some((id, Some(_), _)) => {
-                if active_ids_of_source_in_repo(conn, &item.repo, &item.source)?.is_empty() {
+            // (reverted A -> B -> A), or when another repo's item of the same source replaced it
+            // (the rule before one item per repo); keep items an amend or a manual supersede
+            // replaced alone.
+            Some((id, Some(by), _)) => {
+                if active_ids_of_source(conn, &item.source, Some(&item.repo))?.is_empty()
+                    && !hidden_by_another_repo(conn, &item.repo, &item.source, &by)?
+                {
                     existing = Some(id);
                 } else {
                     restore_id = Some(id);
@@ -483,10 +557,11 @@ fn batch_row(
         target_id = id;
         dup = 1;
     } else if let Some(rid) = restore_id {
-        let old_same_source: Vec<String> = active_ids_of_source(conn, &item.source)?
-            .into_iter()
-            .filter(|id| id != &rid)
-            .collect();
+        let old_same_source: Vec<String> =
+            active_ids_of_source(conn, &item.source, Some(&item.repo))?
+                .into_iter()
+                .filter(|id| id != &rid)
+                .collect();
         conn.execute(
             "UPDATE items SET status = 'active', superseded_by = NULL WHERE id = ?",
             [&rid],
@@ -502,12 +577,11 @@ fn batch_row(
             target_id = id;
             dup = 1;
         } else {
-            let old_same_source =
-                if item.source.starts_with("task:") || item.source.starts_with("handoff:") {
-                    active_ids_of_source(conn, &item.source)?
-                } else {
-                    Vec::new()
-                };
+            let old_same_source = if file_backed(&item.source) {
+                active_ids_of_source(conn, &item.source, Some(&item.repo))?
+            } else {
+                Vec::new()
+            };
             insert_item(conn, item, "active", None)?;
             target_id = item.id.clone();
             ins = 1;
@@ -680,7 +754,7 @@ pub fn source_state(
             |r| newest_row(r, 0),
         )
         .optional()?;
-    let active = active_ids_of_source(conn, &item.source)?;
+    let active = active_ids_of_source(conn, &item.source, None)?;
     let other_id = other_active_id(conn, item)?;
     let same = newest_holds(newest.as_ref(), item);
     Ok((same || other_id.is_some(), active, other_id))
@@ -1018,10 +1092,9 @@ pub fn amend_item(
             .tag
             .map(str::to_string)
             .unwrap_or_else(|| old.tag.clone());
-        let mut new_source = if old.source.starts_with("task:")
-            || old.source.starts_with("handoff:")
-            || old.source.starts_with("automemory:")
-        {
+        let mut new_source = if file_backed(&old.source) {
+            format!("{AMENDED_PREFIX}{}", old.source)
+        } else if old.source.starts_with("automemory:") {
             String::new()
         } else {
             old.source.clone()
@@ -1186,12 +1259,14 @@ pub fn amend_item(
             return Err(SmError::value("No changes to apply"));
         }
 
-        bind_all(&[&new_item.repo, &new_item.content_hash, old_id])?;
-        if let Some(other) = one_str(
-            conn,
-            "SELECT id FROM items WHERE repo = ? AND content_hash = ? AND status = 'active' AND id != ?",
-            [&new_item.repo, &new_item.content_hash, old_id],
-        )? {
+        // dedupe by the old item's source, so an amend of one file's item does not collide with
+        // another file's; the new row's index slot (its amended:<source>, or '') must also be free
+        let (repo, hash) = (&new_item.repo, &new_item.content_hash);
+        let other = match active_by_hash(conn, repo, hash, &old.source, Some(old_id))? {
+            Some(id) => Some(id),
+            None => active_in_slot(conn, repo, hash, &new_item.source, Some(old_id))?,
+        };
+        if let Some(other) = other {
             return Err(SmError::value(format!(
                 "Repo '{}' already has an active item with the same body ({other}); use sm supersede {old_id} {other}",
                 new_item.repo
@@ -1241,7 +1316,7 @@ pub fn fill_refs(conn: &Connection, dry_run: bool) -> Result<IndexMap<&'static s
         let empty_before = rows.iter().filter(|r| strip(&r.1).is_empty()).count() as i64;
         let mut changes: Vec<(String, String)> = Vec::new();
         for (id, refs, title, body, evidence, source) in &rows {
-            let ev = if source.is_empty() {
+            let ev = if source.is_empty() || source.starts_with(AMENDED_PREFIX) {
                 evidence.as_str()
             } else {
                 ""

@@ -401,22 +401,29 @@ pub fn search_candidates(
     if all_rowids.is_empty() {
         return Ok(Vec::new());
     }
-    let placeholders = vec!["?"; all_rowids.len()].join(", ");
     let cols_sql = ITEM_COLUMNS
         .iter()
         .map(|c| format!("i.{c}"))
         .collect::<Vec<_>>()
         .join(", ");
-    let sql =
-        format!("SELECT i.rowid AS rid, {cols_sql} FROM items i WHERE i.rowid IN ({placeholders})");
-    let mut stmt = conn.prepare(&sql).map_err(sql_err)?;
-    let rows = stmt
-        .query_map(rusqlite::params_from_iter(all_rowids.iter()), |r| {
-            Ok((r.get::<_, i64>("rid")?, row_to_item(r)?))
-        })
-        .map_err(sql_err)?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(sql_err)?;
+    let all_rowids: Vec<i64> = all_rowids.into_iter().collect();
+    let mut rows = Vec::with_capacity(all_rowids.len());
+    // SQLite binds at most 32,766 variables per statement
+    for chunk in all_rowids.chunks(10_000) {
+        let placeholders = vec!["?"; chunk.len()].join(", ");
+        let sql = format!(
+            "SELECT i.rowid AS rid, {cols_sql} FROM items i WHERE i.rowid IN ({placeholders})"
+        );
+        let mut stmt = conn.prepare(&sql).map_err(sql_err)?;
+        let found = stmt
+            .query_map(rusqlite::params_from_iter(chunk), |r| {
+                Ok((r.get::<_, i64>("rid")?, row_to_item(r)?))
+            })
+            .map_err(sql_err)?;
+        for row in found {
+            rows.push(row.map_err(sql_err)?);
+        }
+    }
     Ok(rows
         .into_iter()
         .map(|(rid, item)| Candidate {
@@ -441,11 +448,12 @@ pub struct SearchOpts<'a> {
     pub scope_biases: &'a [(String, Vec<String>)],
 }
 
-/// (unranked candidates, query refs, the pool cap when an index filled it, positive query).
+/// (unranked candidates, query refs, the pool size when its fetch filled, positive query).
 type Gathered = (Vec<Candidate>, Vec<String>, Option<i64>, String);
 
-/// `_gather`: (unranked candidates, query refs, the pool cap when an index filled it, else None,
-/// and the positive query after stripping exclusions and standalone uppercase boolean noise).
+/// `_gather`: (unranked candidates, query refs, the FTS rows of the pool when its last fetch
+/// filled, else None, and the positive query after stripping exclusions and standalone uppercase
+/// boolean noise).
 fn gather(
     conn: &Connection,
     query: &str,
@@ -463,25 +471,24 @@ fn gather(
     }
     let mut candidates: Vec<Candidate> = Vec::new();
     let mut cap = FTS_CANDIDATE_LIMIT;
-    let mut full = false;
+    let mut pool = None;
+    let fold_q_and = build_fts_query(Some(&positive_query), o.aliases, true, "AND")?;
+    let raw_q_and = if has_accents(Some(&positive_query)) {
+        build_fts_query(Some(&positive_query), o.aliases, false, "AND")?
+    } else {
+        String::new()
+    };
     if o.recent {
-        let fold_q_and = build_fts_query(Some(&positive_query), o.aliases, true, "AND")?;
-        let raw_q_and = if has_accents(Some(&positive_query)) {
-            build_fts_query(Some(&positive_query), o.aliases, false, "AND")?
-        } else {
-            String::new()
-        };
-        let q = CandidateQuery {
-            fold_fts_query: &fold_q_and,
-            raw_fts_query: &raw_q_and,
-            by_date: true,
-            ..Default::default()
-        };
-        candidates = search_candidates(conn, &q, f)?;
-        full = candidates.iter().filter(|c| c.fold_bm25.is_some()).count() as i64 >= cap;
-        if !excluded.is_empty() {
-            candidates.retain(|c| !item_matches_exclusion(&c.item, &excluded));
-        }
+        (candidates, pool) = fetch_kept(cap, &excluded, |limit| {
+            let q = CandidateQuery {
+                fold_fts_query: &fold_q_and,
+                raw_fts_query: &raw_q_and,
+                candidate_limit: limit,
+                by_date: true,
+                ..Default::default()
+            };
+            search_candidates(conn, &q, f)
+        })?;
     }
     if candidates.is_empty() {
         cap = if (bias_widens_pool(o.bias) || !o.scope_biases.is_empty() || !excluded.is_empty())
@@ -497,21 +504,57 @@ fn gather(
         } else {
             String::new()
         };
-        let q = CandidateQuery {
-            query_refs: &query_refs,
-            fold_fts_query: &fold_q,
-            raw_fts_query: &raw_q,
-            candidate_limit: cap,
-            by_date: o.recent,
-        };
-        candidates = search_candidates(conn, &q, f)?;
-        // each accented-index match also matches the folded index, so the folded count decides
-        full = candidates.iter().filter(|c| c.fold_bm25.is_some()).count() as i64 >= cap;
-        if !excluded.is_empty() {
-            candidates.retain(|c| !item_matches_exclusion(&c.item, &excluded));
-        }
+        // an item with every term can lose the OR pool to many one-term rows; the AND form
+        // finds it at the same bm25 (one term: same rows, so it is skipped)
+        let add_and = !o.recent && fold_q_and.contains(" AND ");
+        (candidates, pool) = fetch_kept(cap, &excluded, |limit| {
+            let q = CandidateQuery {
+                query_refs: &query_refs,
+                fold_fts_query: &fold_q,
+                raw_fts_query: &raw_q,
+                candidate_limit: limit,
+                by_date: o.recent,
+            };
+            let mut found = search_candidates(conn, &q, f)?;
+            if add_and {
+                let q = CandidateQuery {
+                    fold_fts_query: &fold_q_and,
+                    raw_fts_query: &raw_q_and,
+                    candidate_limit: limit,
+                    ..Default::default()
+                };
+                let seen: HashSet<String> = found.iter().map(|c| c.item.id.clone()).collect();
+                let extra = search_candidates(conn, &q, f)?;
+                found.extend(extra.into_iter().filter(|c| !seen.contains(&c.item.id)));
+            }
+            Ok(found)
+        })?;
     }
-    Ok((candidates, query_refs, full.then_some(cap), positive_query))
+    Ok((candidates, query_refs, pool, positive_query))
+}
+
+/// (the fetched candidates less the excluded ones, the FTS rows fetched when they filled the
+/// limit: the limit, plus the AND rows the OR rows lacked). The
+/// exclusions run after the SQL limit, so a full fetch with fewer than `cap` FTS matches left
+/// is fetched again 4 times wider. Each accented-index match also matches the folded index,
+/// so the folded count decides.
+fn fetch_kept(
+    cap: i64,
+    excluded: &[String],
+    mut fetch: impl FnMut(i64) -> Result<Vec<Candidate>, SmError>,
+) -> Result<(Vec<Candidate>, Option<i64>), SmError> {
+    let fts = |cs: &[Candidate]| cs.iter().filter(|c| c.fold_bm25.is_some()).count() as i64;
+    let mut limit = cap;
+    loop {
+        let mut found = fetch(limit)?;
+        let fetched = fts(&found);
+        let full = fetched >= limit;
+        found.retain(|c| !item_matches_exclusion(&c.item, excluded));
+        if !full || fts(&found) >= cap {
+            return Ok((found, full.then_some(fetched)));
+        }
+        limit *= 4;
+    }
 }
 
 fn score_opts<'a>(
@@ -532,8 +575,8 @@ fn score_opts<'a>(
     }
 }
 
-/// `search_scored`: (every candidate in rank order with why, the pool cap when an index filled
-/// it, else None). Terms go on the first `explain` only.
+/// `search_scored`: (every candidate in rank order with why, the pool size when its fetch
+/// filled, else None). Terms go on the first `explain` only.
 pub fn search_scored(
     conn: &Connection,
     query: &str,
@@ -550,8 +593,8 @@ pub fn search_scored(
     Ok((scored, cap))
 }
 
-/// `search_pool`: (the items of the best `cap` ranked matches, in no set order; the cap when the
-/// pool was full). Ranking runs only when a full pool holds more than the cap, or with recent.
+/// `search_pool`: (the items of the best `size` ranked matches, in no set order; the size when
+/// the pool was full). Ranking runs only when a full pool holds more than its size, or with recent.
 pub fn search_pool(
     conn: &Connection,
     query: &str,

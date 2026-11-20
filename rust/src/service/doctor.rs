@@ -99,14 +99,6 @@ pub struct ImportLag {
     pub stored_tasks_without_file: Vec<String>,
 }
 
-fn str_set(conn: &Connection, sql: &str) -> Result<HashSet<String>, SmError> {
-    let mut stmt = conn.prepare(sql)?;
-    let rows = stmt
-        .query_map([], |r| r.get::<_, String>(0))?
-        .collect::<rusqlite::Result<HashSet<_>>>()?;
-    Ok(rows)
-}
-
 /// `sorted(set(paths))`.
 fn sorted_unique(paths: Vec<PyPath>) -> Vec<PyPath> {
     let mut seen = HashSet::new();
@@ -119,6 +111,16 @@ fn sorted_unique(paths: Vec<PyPath>) -> Vec<PyPath> {
 
 /// `import_lag(conn, full_cfg)`: task logs and handoffs on disk with no stored item.
 pub fn import_lag(conn: &Connection, full_cfg: &PyValue) -> Result<ImportLag, SmError> {
+    Ok(import_lag_by_repo(conn, full_cfg)?.0)
+}
+
+/// `import_lag`, and the (repo, source) of each active task item whose repo has no file with
+/// its task id: one task id in two repos is two items, so a file in one repo does not keep the
+/// other repo's item.
+pub(crate) fn import_lag_by_repo(
+    conn: &Connection,
+    full_cfg: &PyValue,
+) -> Result<(ImportLag, Vec<(String, String)>), SmError> {
     let cfg = cfg_get(full_cfg, "upkeep")?;
     cfg_get(full_cfg, "repo_aliases")?;
     let al = aliases(full_cfg);
@@ -128,13 +130,19 @@ pub fn import_lag(conn: &Connection, full_cfg: &PyValue) -> Result<ImportLag, Sm
     // comes back is imported again.
     // When (repo, source) still has an active row, only an active row with that hash counts as
     // stored, so reverting a file A -> B -> A surfaces for re-import instead of matching old A.
-    let stored = "status = 'active' OR superseded_by IS NOT NULL OR tags LIKE '%retired:%'";
+    // Hashes are kept by source: only a row of the same file stores a file's body, as the import
+    // dedupes, never a row of another file or a manual or amended row.
+    // A row another repo's item of the same source replaced (the rule before one item per repo)
+    // is not stored either: the import restores it.
+    let stored = "i.status = 'active' OR i.superseded_by IS NOT NULL OR i.tags LIKE '%retired:%'";
     let mut stmt = conn.prepare(&format!(
-        "SELECT repo, source, status, superseded_by, tags, content_hash FROM items WHERE {stored}"
+        "SELECT i.repo, i.source, i.status, i.superseded_by, i.tags, i.content_hash, \
+         ifnull(b.source = i.source AND b.repo != i.repo, 0) FROM items i \
+         LEFT JOIN items b ON b.id = i.superseded_by WHERE {stored}"
     ))?;
-    let mut active_hashes: HashSet<(String, String)> = HashSet::new();
+    let mut active_hashes: HashSet<(String, String, String)> = HashSet::new();
     let mut active_sources: HashSet<(String, String)> = HashSet::new();
-    let mut stored_hashes: HashSet<(String, String)> = HashSet::new();
+    let mut stored_hashes: HashSet<(String, String, String)> = HashSet::new();
     {
         let mut rows = stmt.query([])?;
         while let Some(r) = rows.next()? {
@@ -144,29 +152,33 @@ pub fn import_lag(conn: &Connection, full_cfg: &PyValue) -> Result<ImportLag, Sm
             let superseded_by: Option<String> = r.get(3)?;
             let tags: String = r.get(4)?;
             let hash: String = r.get(5)?;
+            let hidden: bool = r.get(6)?;
+            let key = (repo.clone(), source.clone(), hash);
             if status == "active" {
-                active_hashes.insert((repo.clone(), hash.clone()));
-                active_sources.insert((repo.clone(), source));
+                active_hashes.insert(key.clone());
+                active_sources.insert((repo, source));
             }
-            if status == "active" || superseded_by.is_some() || has_retired_tag(&tags) {
-                stored_hashes.insert((repo, hash));
+            if status == "active" || (superseded_by.is_some() && !hidden) || has_retired_tag(&tags)
+            {
+                stored_hashes.insert(key);
             }
         }
     }
     let is_stored = |repo: &str, source: &str, hash: &str| {
-        let key = (repo.to_string(), hash.to_string());
+        let key = (repo.to_string(), source.to_string(), hash.to_string());
         if active_sources.contains(&(repo.to_string(), source.to_string())) {
             active_hashes.contains(&key)
         } else {
             stored_hashes.contains(&key)
         }
     };
-    let active_tasks = str_set(
-        conn,
-        "SELECT DISTINCT source FROM items WHERE status = 'active' AND source LIKE 'task:%'",
-    )?;
+    let active_tasks: Vec<(String, String)> = active_sources
+        .iter()
+        .filter(|(_, source)| source.starts_with("task:"))
+        .cloned()
+        .collect();
     let mut lag = ImportLag::default();
-    let mut seen_tasks: HashSet<String> = HashSet::new();
+    let mut seen_tasks: HashSet<(String, String)> = HashSet::new();
     let mut tl_files = Vec::new();
     for raw_root in iterate(cfg_get(cfg, "tasklog_roots")?)? {
         let root = config_dir(&raw_root, "upkeep.tasklog_roots")?;
@@ -184,7 +196,7 @@ pub fn import_lag(conn: &Connection, full_cfg: &PyValue) -> Result<ImportLag, Sm
             }
             Err(e) => return Err(e),
         };
-        seen_tasks.insert(item.source.clone());
+        seen_tasks.insert((item.repo.clone(), item.source.clone()));
         // a stored source does not make a task log stored: a hand edit keeps the source and
         // changes the body, and the import then supersedes the old item. The import stores the
         // redacted body, so compare that hash, or a body with a redacted part is listed each run.
@@ -208,10 +220,16 @@ pub fn import_lag(conn: &Connection, full_cfg: &PyValue) -> Result<ImportLag, Sm
     }
     lag.tasklog_files = tl_files.len() as i64;
     lag.handoff_files = ho_files.len() as i64;
-    let mut gone: Vec<String> = active_tasks.difference(&seen_tasks).cloned().collect();
+    let mut gone: Vec<(String, String)> = active_tasks
+        .into_iter()
+        .filter(|key| !seen_tasks.contains(key))
+        .collect();
     gone.sort();
-    lag.stored_tasks_without_file = gone;
-    Ok(lag)
+    let mut sources: Vec<String> = gone.iter().map(|(_, source)| source.clone()).collect();
+    sources.sort();
+    sources.dedup();
+    lag.stored_tasks_without_file = sources;
+    Ok((lag, gone))
 }
 
 /// The dict `_automemory_lag` returns; `None` is `{"automemory_off": True}`.

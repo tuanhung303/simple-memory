@@ -377,6 +377,259 @@ fn catchup_retires_a_task_item_whose_file_is_gone_everywhere() {
     );
 }
 
+/// Two task logs with one body: each item can be amended (title, tags, refs, body), both stay
+/// active and distinct, each keeps its file as `amended:<source>`, and catch-up neither undoes
+/// an amendment nor imports either file again. A manual amend onto a manual body is refused.
+#[test]
+fn amending_two_task_items_with_one_body_keeps_both_through_catchup() {
+    let e = env();
+    let dir = e.repo.join("docs/tasklog/2026-11-01");
+    for (name, title) in [
+        ("090000-auth", "Auth fix TKT-101"),
+        ("100000-bill", "Bill fix TKT-202"),
+    ] {
+        write(
+            &dir.join(format!("{name}.yaml")),
+            &format!("id: 20261101-{name}\ntitle: {title}\nresults:\n  - All tests pass\n"),
+        );
+    }
+    catchup(&e);
+    let id_of = |source: &str| {
+        column(
+            &e.home,
+            &format!("SELECT id FROM items WHERE status = 'active' AND source = '{source}'"),
+        )
+        .remove(0)
+    };
+    let amend = |id: &str, args: &[&str]| {
+        let mut argv = vec!["amend", id];
+        argv.extend_from_slice(args);
+        let (code, out, err) = sm(&e.home, &argv);
+        // a new body may print the overlap hint for the other item; nothing else
+        assert_eq!(code, 0, "{args:?}: {err}");
+        assert!(
+            err.is_empty() || err.contains(" shares "),
+            "{args:?}: {err}"
+        );
+        out.trim().to_string()
+    };
+    let a = amend(
+        &id_of("task:20261101-090000-auth"),
+        &["--title", "Auth final"],
+    );
+    let b = amend(
+        &id_of("task:20261101-100000-bill"),
+        &["--title", "Bill final"],
+    );
+    let b = amend(&b, &["--add-tags", "reviewed"]);
+    let b = amend(&b, &["--add-refs", "TKT-303"]);
+    let a = amend(&a, &["--add-tags", "reviewed"]);
+    let b = amend(&b, &["--body", "Results:\n- All tests pass\n- shipped"]);
+    let a = amend(&a, &["--body", "Results:\n- All tests pass\n- shipped"]);
+    let active = || {
+        states(
+            &e.home,
+            "SELECT id, source || ' | ' || title || ' | ' || tags || ' | ' || body FROM items \
+             WHERE status = 'active' AND kind = 'task'",
+        )
+    };
+    let expected = map(&[
+        (
+            a.as_str(),
+            "amended:task:20261101-090000-auth | Auth final | as_of:mtime, reviewed | Results:\n- All tests pass\n- shipped",
+        ),
+        (
+            b.as_str(),
+            "amended:task:20261101-100000-bill | Bill final | as_of:mtime, reviewed | Results:\n- All tests pass\n- shipped",
+        ),
+    ]);
+    assert_eq!(active(), expected);
+    let rows = column(&e.home, "SELECT id FROM items ORDER BY rowid").len();
+    for _ in 0..2 {
+        let row = catchup(&e);
+        assert_eq!(
+            row["parts"]["imports"]["counts"],
+            json!({"not_stored": 0, "inserted": 0, "failed_rows": 0})
+        );
+        assert_eq!(
+            row["parts"]["retire_missing"]["counts"]["retired"],
+            json!(0)
+        );
+        let res = run_import("tasklog", dir.to_str().unwrap(), false, false, e.h()).unwrap();
+        assert_eq!((res.inserted, res.deduped, res.superseded), (0, 2, 0));
+        assert_eq!(active(), expected);
+        assert_eq!(
+            column(
+                &e.home,
+                "SELECT id FROM items WHERE status = 'active' AND ' ' || refs || ' ' LIKE '% TKT-303 %'",
+            ),
+            [b.as_str()]
+        );
+        assert_eq!(
+            column(&e.home, "SELECT id FROM items ORDER BY rowid").len(),
+            rows
+        );
+    }
+    // the refs backfill reads an amended item's evidence (the file path) as it reads a manual
+    // item's, as it did when an amend cleared the source
+    assert_eq!(sm(&e.home, &["doctor", "--backfill-refs"]).0, 0);
+    assert_eq!(
+        column(
+            &e.home,
+            "SELECT id FROM items WHERE status = 'active' AND refs LIKE '%/090000-auth.yaml%'",
+        ),
+        [a.as_str()]
+    );
+
+    // export and import: both amended items (with the seed and auto-memory items) land in a
+    // store whose manual item holds their body
+    let (code, out, _) = sm(&e.home, &["export", "--repo", "r1"]);
+    assert_eq!(code, 0);
+    let dump = e.tmp.join("dump.jsonl");
+    write(&dump, &out);
+    let other = e.tmp.join("other-home");
+    std::fs::create_dir_all(&other).unwrap();
+    put_seed(&other, "Results:\n- All tests pass\n- shipped", "r1");
+    let (code, out, _) = sm(&other, &["import", "jsonl", dump.to_str().unwrap()]);
+    assert_eq!(code, 0);
+    assert!(out.contains(" added=4 unchanged=0 conflicts=0 "), "{out}");
+    // and back: that manual item lands next to the two amended items that hold its body
+    let (code, out, _) = sm(&other, &["export", "--repo", "r1"]);
+    assert_eq!(code, 0);
+    write(&dump, &out);
+    let (code, out, _) = sm(&e.home, &["import", "jsonl", dump.to_str().unwrap()]);
+    assert_eq!(code, 0);
+    assert!(out.contains(" added=1 unchanged=4 conflicts=0 "), "{out}");
+
+    // the manual dedupe still holds: a manual item cannot take another manual item's body
+    let m1 = put_seed(&e.home, "manual one", "r1");
+    let m2 = put_seed(&e.home, "manual two", "r1");
+    let (code, _, err) = sm(&e.home, &["amend", &m2, "--body", "manual one"]);
+    assert_eq!(code, 1);
+    assert!(
+        err.contains(&format!(
+            "Repo 'r1' already has an active item with the same body ({m1})"
+        )),
+        "{err}"
+    );
+}
+
+/// One task id in two repos: catch-up keeps one active item per repo through edits, and a file
+/// that moves to the other repo retires the old repo's item by the missing-file path.
+#[test]
+fn catchup_keeps_one_item_per_repo_for_a_shared_task_id_and_retires_a_moved_file() {
+    let e = env();
+    let r2 = e.tmp.join("gh/r2");
+    std::fs::create_dir_all(r2.join("docs/tasklog")).unwrap();
+    git(&["init", "-q", r2.to_str().unwrap()]);
+    let tl = |repo: &Path, name: &str, body: &str| {
+        let p = repo.join(format!("docs/tasklog/2026-11-01/{name}.yaml"));
+        write(
+            &p,
+            &format!("id: 20261101-{name}\ntitle: T {name}\nresults:\n  - {body}\n"),
+        );
+        p
+    };
+    let active = || {
+        states(
+            &e.home,
+            "SELECT repo || ' ' || source, title || ' ' || body FROM items \
+             WHERE kind = 'task' AND status = 'active'",
+        )
+    };
+    let imports = |row: &Value| row["parts"]["imports"]["counts"].clone();
+    let retired = |row: &Value| row["parts"]["retire_missing"]["counts"].clone();
+    let none_retired =
+        json!({"candidates": 0, "retired": 0, "in_worktree": 0, "on_branch": 0, "no_folder": 0});
+    tl(&e.repo, "090000-shared", "r1 api");
+    tl(&r2, "090000-shared", "r2 client");
+    let row = catchup(&e);
+    assert_eq!(
+        imports(&row),
+        json!({"not_stored": 2, "inserted": 2, "failed_rows": 0})
+    );
+    assert_eq!(retired(&row), none_retired);
+    let first = map(&[
+        (
+            "r1 task:20261101-090000-shared",
+            "T 090000-shared Results:\n- r1 api",
+        ),
+        (
+            "r2 task:20261101-090000-shared",
+            "T 090000-shared Results:\n- r2 client",
+        ),
+    ]);
+    assert_eq!(active(), first);
+    let r2_id = column(
+        &e.home,
+        "SELECT id FROM items WHERE repo = 'r2' AND kind = 'task'",
+    );
+    tl(&e.repo, "090000-shared", "r1 docs");
+    let row = catchup(&e);
+    assert_eq!(
+        imports(&row),
+        json!({"not_stored": 1, "inserted": 1, "failed_rows": 0})
+    );
+    let mut edited = first.clone();
+    edited.insert(
+        "r1 task:20261101-090000-shared".into(),
+        "T 090000-shared Results:\n- r1 docs".into(),
+    );
+    assert_eq!(active(), edited);
+    assert_eq!(
+        column(
+            &e.home,
+            "SELECT id FROM items WHERE repo = 'r2' AND kind = 'task' AND status = 'active'",
+        ),
+        r2_id
+    );
+    let again = catchup(&e);
+    assert_eq!(
+        imports(&again),
+        json!({"not_stored": 0, "inserted": 0, "failed_rows": 0})
+    );
+    assert_eq!(retired(&again), none_retired);
+
+    // a task log moves from r1 to r2: r2 stores it, r1's item is retired with no replacement
+    let moved = tl(&e.repo, "100000-moved", "moved body");
+    catchup(&e);
+    std::fs::remove_file(&moved).unwrap();
+    tl(&r2, "100000-moved", "moved body");
+    let lag = doctor_imports(&e.home).lag.unwrap().0;
+    assert_eq!(
+        (lag.not_stored.len(), lag.stored_tasks_without_file),
+        (1, vec!["task:20261101-100000-moved".to_string()])
+    );
+    let row = catchup(&e);
+    assert_eq!(
+        imports(&row),
+        json!({"not_stored": 1, "inserted": 1, "failed_rows": 0})
+    );
+    assert_eq!(
+        retired(&row),
+        json!({"candidates": 1, "retired": 1, "in_worktree": 0, "on_branch": 0, "no_folder": 0})
+    );
+    assert_eq!(
+        states(
+            &e.home,
+            "SELECT repo || ' ' || status, ifnull(superseded_by, '-') FROM items \
+             WHERE source = 'task:20261101-100000-moved'",
+        ),
+        map(&[("r1 superseded", "-"), ("r2 active", "-")])
+    );
+    let again = catchup(&e);
+    assert_eq!(
+        imports(&again),
+        json!({"not_stored": 0, "inserted": 0, "failed_rows": 0})
+    );
+    assert_eq!(retired(&again), none_retired);
+    let lag = doctor_imports(&e.home).lag.unwrap().0;
+    assert_eq!(
+        (lag.not_stored.len(), lag.stored_tasks_without_file.len()),
+        (0, 0)
+    );
+}
+
 /// A checkout that lags its remote, or a branch not yet merged, lacks the file: keep the item.
 /// A file deleted in a later commit is in history but at no tip: that item is retired.
 #[test]
@@ -481,7 +734,7 @@ fn a_retired_task_log_whose_file_comes_back_is_restored() {
 }
 
 #[test]
-fn a_retired_task_log_stays_retired_when_another_item_holds_its_body() {
+fn a_retired_task_log_comes_back_when_a_manual_item_holds_its_body() {
     let e = env();
     let t = tasklog(
         &e.repo.join("docs/tasklog/2026-11-01/090000-adad-c.yaml"),
@@ -499,16 +752,16 @@ fn a_retired_task_log_stays_retired_when_another_item_holds_its_body() {
     .remove(0);
     let other = put_seed(&e.home, &body, "r1");
     write(&t, &held);
-    // the body is stored, on the other item
+    // a manual item does not stand in for the file: the file is not stored until it comes back
     assert_eq!(
         doctor_imports(&e.home).lag.unwrap().0.not_stored,
-        Vec::<String>::new()
+        [t.to_str().unwrap()]
     );
     let res = run_import("tasklog", t.to_str().unwrap(), false, false, e.h()).unwrap();
-    assert_eq!((res.inserted, res.deduped), (0, 1));
+    assert_eq!((res.inserted, res.deduped), (1, 0));
     assert_eq!(
         task_rows(&e.home),
-        vec![(item_id.clone(), "superseded".into(), None)]
+        vec![(item_id.clone(), "active".into(), None)]
     );
     assert_ne!(other, item_id);
 }

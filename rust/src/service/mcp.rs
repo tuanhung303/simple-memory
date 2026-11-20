@@ -733,7 +733,7 @@ impl Server {
                 ),
                 ("isError", PyValue::Bool(is_error)),
             ])),
-            Err(e) if tool_error(&e) => {
+            Err(e) => {
                 let raw = if e.is(Base::Key) {
                     unrepr(&e.msg)
                 } else {
@@ -752,7 +752,6 @@ impl Server {
                     ("isError", PyValue::Bool(true)),
                 ]))
             }
-            Err(e) => Err(Fail::Stop(e)),
         }
     }
 
@@ -882,14 +881,6 @@ fn supported() -> PyValue {
     )
 }
 
-/// `TOOL_ERRORS`: the errors `sm` reports as `error: ...`.
-fn tool_error(e: &SmError) -> bool {
-    matches!(
-        e.base,
-        Base::Value | Base::Key | Base::Type | Base::Os | Base::Sqlite
-    )
-}
-
 /// The str a KeyError holds, from its `str()` (the key's repr).
 pub fn unrepr(r: &str) -> String {
     let mut chars = r.chars();
@@ -1003,11 +994,10 @@ pub fn answer_line(server: &Server, raw: &[u8], out: &mut Out) -> Result<Option<
         Ok(text) => loads(text),
     };
     let response = match parsed {
-        Err(e) if e.class == "JSONDecodeError" || e.class == "UnicodeDecodeError" => {
+        Err(e) => {
             out.eprint(&format!("sm mcp: parse error: {}", e.msg))?;
             Some(error(PyValue::None, PARSE_ERROR, "Parse error", None))
         }
-        Err(e) => return Err(e),
         Ok(msg) => server.handle(&msg, out)?,
     };
     let Some(resp) = response else {
