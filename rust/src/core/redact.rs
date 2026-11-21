@@ -3,6 +3,7 @@
 //! looks at one char or a fixed-length text (argued at each pattern below):
 //! - A lookbehind on one char class goes into the regex as `(?:\A|[^X])`; the core of each such
 //!   pattern starts with a char of X, so the core start is the match start (`\A`) or one char on.
+//!   Unlike Python, a literal escape `\n`, `\r` or `\t` before the core also passes (two chars on).
 //! - `\b` before a word char (`\bBearer`, `\bsig=`, ...) is `(?<!\w)`, with Python's `\w` from
 //!   `py::str`, and `\s` is Python's `\s`.
 //! - re.IGNORECASE letters are sre's sets (`py::str::ci_chars`): `i` also matches U+0130 and
@@ -28,6 +29,11 @@ pub const PRIVATE_MARK: &str = "[REDACTED:private]";
 
 fn char_at(t: &str, i: usize) -> Option<char> {
     t[i..].chars().next()
+}
+
+/// Is there a literal escape `\n`, `\r` or `\t` (a backslash, then that letter) at `i`?
+fn escape_at(t: &str, i: usize) -> bool {
+    matches!(t.as_bytes().get(i..), Some([b'\\', b'n' | b'r' | b't', ..]))
 }
 
 /// The end of the run of chars that pass `pred` from `i`, and its length in chars.
@@ -83,7 +89,9 @@ impl Guarded {
         in_x: fn(char) -> bool,
         in_y: Option<fn(char) -> bool>,
     ) -> Guarded {
-        let re = Regex::new(&format!("(?:\\A|[^{x_inner}])(?:{core})"))
+        // the letter of a literal escape (`\n`, `\r`, `\t` written as a backslash and a letter, as
+        // in JSON or a shell string) is no char of X there: a token after it is one after a break
+        let re = Regex::new(&format!("(?:\\A|[^{x_inner}]|\\\\[nrt])(?:{core})"))
             .expect("redact pattern compiles");
         Guarded { re, in_x, in_y }
     }
@@ -100,8 +108,11 @@ impl Guarded {
         loop {
             let m = self.re.find_at(t, from)?;
             let first = char_at(t, m.start())?;
+            // no core starts with `n`, `r` or `t`, so a match that starts with an escape took it whole
             let s = if m.start() == 0 && (self.in_x)(first) {
                 0
+            } else if escape_at(t, m.start()) {
+                m.start() + 2
             } else {
                 m.start() + first.len_utf8()
             };
@@ -136,6 +147,14 @@ impl Matcher {
         let mut pos = 0;
         // no pattern matches empty, so the next search starts at the end of the last match
         while let Some((s, e)) = find(pos) {
+            // a match that starts on the letter of a literal escape (a key run, a URL scheme) is
+            // the match a search past the letter finds inside it, so the escape stays in the text
+            // as a line break would; with none there it is kept as found
+            let (s, e) = if s > 0 && escape_at(t, s - 1) {
+                find(s + 1).filter(|&(s2, _)| s2 < e).unwrap_or((s, e))
+            } else {
+                (s, e)
+            };
             out.push((s, e));
             pos = e;
         }
@@ -284,13 +303,14 @@ fn ends_with_any(seg: &str, tails: &[Vec<Vec<char>>]) -> bool {
 }
 
 /// After an access key name's `:`, at `i`: a bare 40-char value of the AWS secret alphabet, which
-/// `kv_bare` refuses when it holds a `/`. The end of the match.
+/// `kv_bare` refuses when it holds a `/`, followed by no V char or by a literal escape (a line
+/// break there). The end of the match.
 fn kv_aws_secret(t: &str, i: usize) -> Option<usize> {
     let w = run(t, i, |c| c == ' ' || c == '\t').0;
     let (end, n) = run(t, w, |c| {
         c.is_ascii_alphanumeric() || matches!(c, '/' | '+' | '=')
     });
-    (n == 40 && !char_at(t, end).is_some_and(is_v)).then_some(end)
+    (n == 40 && (escape_at(t, end) || !char_at(t, end).is_some_and(is_v))).then_some(end)
 }
 
 /// Does the value at `w` start with a marker an earlier pattern left, with more of the value
@@ -351,9 +371,20 @@ fn kv_bare(t: &str, i: usize) -> Option<usize> {
     if b.get(w) == Some(&b'`') {
         w += 1;
     }
+    // a marker that a literal escape or no value char ends is no value, as a line break after it
+    // would end it, and so are literal escapes before it: else a second pass takes
+    // `key:\n[REDACTED:...]` as a new value
+    let mut m = w;
+    while escape_at(t, m) {
+        m += 2;
+    }
+    if marker_end(t, m).is_some_and(|e| escape_at(t, e) || !char_at(t, e).is_some_and(is_v)) {
+        return None;
+    }
     // a value that starts with a marker is a token: it goes on over `:` and `/` as `kv_value` does
     if ci_at(t, w, &REDACTED_SEQ).is_some() {
-        return marker_then_more(t, w).then(|| past_markers(t, w, run(t, w, is_v).0));
+        let close = run(t, w, is_v).0;
+        return marker_then_more(t, w).then(|| past_markers(t, w, close));
     }
     // `(?!m_[0-9A-Z]{26}(?!V))`, case-sensitive
     if b[w..].starts_with(b"m_")
@@ -370,12 +401,26 @@ fn kv_bare(t: &str, i: usize) -> Option<usize> {
     // of it, as the token it stands for was, and holds all three, as a token does
     let (mut digit, mut upper, mut lower, mut n) = (false, false, false, 0usize);
     let mut end = w;
+    let mut first_escape = true;
     while let Some(c) = char_at(t, end) {
         if let Some(m) = marker_end(t, end) {
             (digit, upper, lower) = (true, true, true);
             n += m - end;
             end = m;
             continue;
+        }
+        // the first literal escape (`\n`, `\r`, `\t` as a backslash and a letter) after the value
+        // starts is a line break here when the text before it is a value: the value ends there;
+        // else it is read as before
+        if escape_at(t, end)
+            && n > 0
+            && std::mem::take(&mut first_escape)
+            && n >= 12
+            && digit
+            && upper
+            && lower
+        {
+            break;
         }
         if !is_bare_v(c) {
             break;
@@ -661,6 +706,10 @@ fn redact_passes(text: &str, mut each: impl FnMut(&str, &str, &[(usize, usize)])
             _ if end > e => taken.push((e, end)),
             _ => {}
         }
+    }
+    // with no marker that took text in, the last pass keeps no match
+    if taken.is_empty() {
+        return out;
     }
     each("", &out, &taken);
     let out = replace_spans(&out, &taken, "");
@@ -2270,6 +2319,153 @@ mod tests {
         assert_eq!(r("<privateaaaaaaaaaa"), "<privateaaaaaaaaaa");
     }
 
+    /// A token of each pattern that refuses a match after a word char, with its marker's kind.
+    const GUARDED_TOKENS: [(&str, &str); 10] = [
+        ("AKIAIOSFODNN7EXAMPLE", "aws_key"),
+        ("ghp_EXAMPLEexampleEXAMPLEexampleEXAMPLE01", "github_token"),
+        ("xoxb-EXAMPLE-example-01", "slack_token"),
+        ("AIzaEXAMPLEexampleEXAMPLEexampleEXAMPLE", "google_api_key"),
+        ("sk-EXAMPLEexampleEXAMPLEexampleEXAMPLE", "sk_key"),
+        ("eyJEXAMPLE.eyJexample.EXAMPLEsig", "jwt"),
+        ("Bearer Hunter2-example-Zz9", "bearer"),
+        ("sig=EXAMPLEexampleEXAMPLE01", "azure_sas"),
+        ("X-Amz-Signature=EXAMPLEexampleEXAMPLE01", "signed_url"),
+        ("AccountKey=EXAMPLEexampleEXAMPLE01==", "azure_key"),
+    ];
+
+    /// Each `(raw, want)` through `redact_text` twice and, with `TKT-1 <raw>` as refs, through
+    /// `redact_for_store` three times: the body is `want` each time, the refs are `refs` each time.
+    fn check_body_and_refs(
+        rows: &[(String, String)],
+        refs: impl Fn(&str) -> String,
+    ) -> Vec<String> {
+        let mut wrong = Vec::new();
+        for (raw, want) in rows {
+            let once = redact_text(raw, None, None);
+            let twice = redact_text(&once, None, None);
+            let item = Item {
+                refs: format!("TKT-1 {raw}"),
+                ..Item::bare("m_r", "a", "fact", "T", raw, "assumed")
+            };
+            let s1 = redact_for_store(&item, None);
+            let s2 = redact_for_store(&s1, None);
+            let s3 = redact_for_store(&s2, None);
+            let want_refs = refs(raw);
+            if (&once, &twice, &s1.body, &s2.body, &s3.body) != (want, want, want, want, want)
+                || (&s1.refs, &s2.refs, &s3.refs) != (&want_refs, &want_refs, &want_refs)
+            {
+                wrong.push(format!(
+                    "{raw:?}: {once:?} then {twice:?}; stored {:?} then {:?} then {:?}, refs {:?} then {:?} then {:?}; want {want:?}, refs {want_refs:?}",
+                    s1.body, s2.body, s3.body, s1.refs, s2.refs, s3.refs
+                ));
+            }
+        }
+        wrong
+    }
+
+    /// `check_body_and_refs` over `(raw, body, refs)` rows, with `{v}` in each raw replaced by `v`.
+    fn check_rows(rows: &[(&str, &str, &str)], v: &str) -> Vec<String> {
+        let rows: Vec<(String, String, String)> = rows
+            .iter()
+            .map(|(r, b, f)| (r.replace("{v}", v), b.to_string(), f.to_string()))
+            .collect();
+        let pairs: Vec<(String, String)> = rows
+            .iter()
+            .map(|(r, b, _)| (r.clone(), b.clone()))
+            .collect();
+        check_body_and_refs(&pairs, |raw| {
+            rows.iter()
+                .find(|(r, _, _)| r == raw)
+                .map(|(_, _, f)| f.clone())
+                .unwrap_or_default()
+        })
+    }
+
+    #[test]
+    fn a_token_right_after_a_literal_escape_is_redacted_in_the_body_and_the_refs() {
+        let mut rows = Vec::new();
+        for (tok, kind) in GUARDED_TOKENS {
+            // `\r\n` is two escapes; a doubled backslash before the letter is still a backslash
+            // then the letter, so the rule, which reads one backslash back, takes the token too
+            for esc in ["\\n", "\\r", "\\t", "\\r\\n", "\\\\n"] {
+                for before in ["note", "", "\"line one"] {
+                    rows.push((
+                        format!("{before}{esc}{tok}"),
+                        format!("{before}{esc}[REDACTED:{kind}]"),
+                    ));
+                }
+            }
+        }
+        let wrong = check_body_and_refs(&rows, |raw| {
+            let quoted = raw.starts_with('"');
+            if quoted { "TKT-1 \"line" } else { "TKT-1" }.to_string()
+        });
+        assert!(
+            wrong.is_empty(),
+            "{} of {} rows:\n{}",
+            wrong.len(),
+            rows.len(),
+            wrong.join("\n")
+        );
+    }
+
+    #[test]
+    fn a_token_glued_to_a_word_char_that_is_no_escape_letter_stays_as_it_was() {
+        let mut rows = Vec::new();
+        for (tok, _) in GUARDED_TOKENS {
+            // a plain word, a letter that ends no escape, a backslash then a letter of no escape
+            for before in ["noten", "x", "note\\x", "note\\a", "\\N", "C:\\temp\\nt"] {
+                let raw = format!("{before}{tok}");
+                rows.push((raw.clone(), raw));
+            }
+        }
+        let wrong = check_body_and_refs(&rows, |raw| format!("TKT-1 {raw}"));
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+
+    #[test]
+    fn honest_text_with_escapes_and_no_token_stays_as_it_is() {
+        let rows: Vec<(String, String)> = [
+            "C:\\new\\temp\\report.txt",
+            "C:\\tools\\next-app",
+            "split on \\n\\t\\r and \\r\\n",
+            "printf 'a\\nBearer\\n'",
+            "\\nBearer short",
+            "\\nabla \\tau \\rho",
+        ]
+        .iter()
+        .map(|t| (t.to_string(), t.to_string()))
+        .collect();
+        let wrong = check_body_and_refs(&rows, |raw| format!("TKT-1 {raw}"));
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+
+    #[test]
+    fn a_key_with_an_empty_value_then_an_escaped_bearer_leaves_no_value_in_clear() {
+        let v = "Hunter2-example-Zz9";
+        // the bearer pass takes `Bearer <v>` first; key_value then reads `TOKEN=\n[REDACTED:bearer]`,
+        // whose value is the marker, and takes it all
+        let rows: Vec<(String, String)> = [
+            ("TOKEN=\\nBearer {v}", "[REDACTED:key_value]"),
+            ("TOKEN=\\r\\nBearer {v}", "[REDACTED:key_value]"),
+            (
+                "note TOKEN=\\tBearer {v} done",
+                "note [REDACTED:key_value] done",
+            ),
+        ]
+        .iter()
+        .map(|(raw, want)| (raw.replace("{v}", v), want.to_string()))
+        .collect();
+        let wrong = check_body_and_refs(&rows, |raw| {
+            if raw.starts_with("note") {
+                "TKT-1 note done".to_string()
+            } else {
+                "TKT-1".to_string()
+            }
+        });
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+
     #[test]
     fn redact_for_store_drops_private_and_secret_refs_and_rehashes() {
         let item = Item {
@@ -2313,5 +2509,281 @@ mod tests {
             (out.title.as_str(), out.content_hash.as_str()),
             ("[REDACTED:key_value]", t.content_hash.as_str())
         );
+    }
+
+    #[test]
+    fn a_bare_colon_value_ends_at_a_literal_escape_after_a_whole_value() {
+        let v = "Hunter2-example-Zz9";
+        // (raw, body, refs): the marker ends at the escape, the text after it stays; a key word
+        // glued to an escape's letter (`\npassword`) starts after the letter, so the escape stays
+        let rows: [(&str, &str, &str); 15] = [
+            (
+                "user: bob\\npassword: {v}\\nhost: db.example.com",
+                "user: bob\\n[REDACTED:key_value]\\nhost: db.example.com",
+                "TKT-1 user: db.example.com",
+            ),
+            (
+                "{\"config\": \"user: bob\\npassword: {v}\\nhost: db\"}",
+                "{\"config\": \"user: bob\\n[REDACTED:key_value]\\nhost: db\"}",
+                "TKT-1 {\"config\": \"user: db\"}",
+            ),
+            (
+                "password: {v}\\thost: db",
+                "[REDACTED:key_value]\\thost: db",
+                "TKT-1 db",
+            ),
+            (
+                "password: {v}\\r\\nhost: db",
+                "[REDACTED:key_value]\\r\\nhost: db",
+                "TKT-1 db",
+            ),
+            (
+                "api_key: {v}\\nregion: us-east-1",
+                "[REDACTED:key_value]\\nregion: us-east-1",
+                "TKT-1 us-east-1",
+            ),
+            (
+                "password: {v}\\nurl: https://example.com/x",
+                "[REDACTED:key_value]\\nurl: https://example.com/x",
+                "TKT-1 https://example.com/x",
+            ),
+            (
+                "password: {v}\\nBearer abcdefghij: x",
+                "[REDACTED:key_value]\\n[REDACTED:bearer]: x",
+                "TKT-1 x",
+            ),
+            (
+                "password: {v}\\ndone",
+                "[REDACTED:key_value]\\ndone",
+                "TKT-1",
+            ),
+            // the head before the first escape is too short to be a value: the value is read on
+            // over it and over every later escape, as before (the second row stays in clear, as
+            // it does before this rule: its value runs on to `host:`)
+            (
+                "password: Hunter2\\nexample-Zz9 rest",
+                "[REDACTED:key_value] rest",
+                "TKT-1 rest",
+            ),
+            (
+                "password: Hunter2\\nexample-Zz9\\nhost: db",
+                "password: Hunter2\\nexample-Zz9\\nhost: db",
+                "TKT-1 password: Hunter2\\nexample-Zz9\\nhost: db",
+            ),
+            (
+                "password: AKIAIOSFODNN7EXAMPLETOKEN=\\n\\nexample-Zz9Hunter2",
+                "[REDACTED:key_value]",
+                "TKT-1",
+            ),
+            // a key whose value is that marker: the escape after the marker ends it there too, so
+            // a second pass leaves the text as the first left it
+            (
+                "secret: password: {v}\\nhost: db",
+                "secret: [REDACTED:key_value]\\nhost: db",
+                "TKT-1 secret: db",
+            ),
+            (
+                "secret: Bearer abcdefghij\\nhost: db",
+                "secret: [REDACTED:bearer]\\nhost: db",
+                "TKT-1 secret: db",
+            ),
+            // an escape at the start of the value is part of it: the first escape that counts is
+            // one after the value has started
+            (
+                "password: \\t{v}\\thost: db",
+                "[REDACTED:key_value]\\thost: db",
+                "TKT-1 db",
+            ),
+            // as before: a run that never makes a value is no match
+            (
+                "password: abc\\ndone",
+                "password: abc\\ndone",
+                "TKT-1 password: abc\\ndone",
+            ),
+        ];
+        let wrong = check_rows(&rows, v);
+        assert!(
+            wrong.is_empty(),
+            "{} of {} rows:\n{}",
+            wrong.len(),
+            rows.len(),
+            wrong.join("\n")
+        );
+    }
+
+    #[test]
+    fn honest_colon_text_with_escapes_stays_as_it_is() {
+        let rows: Vec<(String, String)> = [
+            "note: see C:\\new\\temp\\report.txt",
+            "path: src\\tools\\next",
+            "token: none\\nexpires: never",
+            "password: see\\nthe vault",
+        ]
+        .iter()
+        .map(|t| (t.to_string(), t.to_string()))
+        .collect();
+        let wrong = check_body_and_refs(&rows, |raw| format!("TKT-1 {raw}"));
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+
+    #[test]
+    fn a_match_that_would_start_on_the_letter_of_a_literal_escape_starts_after_it() {
+        // (raw, body, refs): a key run or a URL scheme glued to an escape's letter starts after
+        // the letter, so the escape stays in the text and a second pass reads it as the first did
+        let rows: [(&str, &str, &str); 17] = [
+            (
+                "token: ghp_EXAMPLEexampleEXAMPLEexampleEXAMPLE01\\npassword: {v}\\nhost: db",
+                "token: [REDACTED:github_token]\\n[REDACTED:key_value]\\nhost: db",
+                "TKT-1 token: db",
+            ),
+            (
+                "env: token: ghp_EXAMPLEexampleEXAMPLEexampleEXAMPLE01\\npassword: {v}\\nhost: db",
+                "env: token: [REDACTED:github_token]\\n[REDACTED:key_value]\\nhost: db",
+                "TKT-1 env: token: db",
+            ),
+            (
+                "secret:\\npassword: {v}\\nregion: x",
+                "secret:\\n[REDACTED:key_value]\\nregion: x",
+                "TKT-1 x",
+            ),
+            (
+                "secret:\\r\\npassword: {v}\\r\\nregion: x",
+                "secret:\\r\\n[REDACTED:key_value]\\r\\nregion: x",
+                "TKT-1 x",
+            ),
+            (
+                "secret:\\r\\npassword: {v}\\r\\ndone",
+                "secret:\\r\\n[REDACTED:key_value]\\r\\ndone",
+                "TKT-1",
+            ),
+            // a marker after the escapes that ends the text is no value either; with more value
+            // after it, it is a value as before
+            (
+                "secrets:\\ntoken: {v}",
+                "secrets:\\n[REDACTED:key_value]",
+                "TKT-1",
+            ),
+            (
+                "secret:\\nBearer abcdefghij",
+                "secret:\\n[REDACTED:bearer]",
+                "TKT-1",
+            ),
+            (
+                "secret:\\nBearer abcdefghij#x",
+                "[REDACTED:key_value]",
+                "TKT-1",
+            ),
+            (
+                "password: {v}\\nhttps://bob:Hunter2-example@h.example.com/p",
+                "[REDACTED:key_value]\\n[REDACTED:url_credentials]h.example.com/p",
+                "TKT-1",
+            ),
+            (
+                "login: admin\\npassword: {v}\\npostgres://bob:Pw0example@db.example.com",
+                "login: admin\\n[REDACTED:key_value]\\n[REDACTED:url_credentials]db.example.com",
+                "TKT-1 login:",
+            ),
+            (
+                "{\"log\": \"password: {v}\\r\\nhttps://bob:Hunter2-example@h.example.com/p\"}",
+                "{\"log\": [REDACTED:key_value]\\r\\n[REDACTED:url_credentials]h.example.com/p\"}",
+                "TKT-1 {\"log\":",
+            ),
+            // the search past the letter finds the match further in, where a line break would
+            (
+                "password: {v}\\n2postgres://bob:Hunter2-example@db.example.com",
+                "[REDACTED:key_value]\\n2[REDACTED:url_credentials]db.example.com",
+                "TKT-1",
+            ),
+            // past the letter there is no match (`oken` is no key word): the match is kept as found
+            ("C:\\token: {v}", "C:\\[REDACTED:key_value]", "TKT-1"),
+            // and a match that starts past its end is the next match, not this one
+            (
+                "C:\\token: {v}\\npassword: {v}",
+                "C:\\[REDACTED:key_value]\\n[REDACTED:key_value]",
+                "TKT-1",
+            ),
+            // a backslash before a letter of no escape: as before
+            ("\\password: {v}", "\\[REDACTED:key_value]", "TKT-1"),
+            // a backslash before a letter that starts no escape: the match is not moved
+            ("\\xtoken: {v}", "\\[REDACTED:key_value]", "TKT-1"),
+            // the next match starts right at the end of this one: this one is kept, then that one
+            (
+                "C:\\token: {v}\"password\": \"{v}\"",
+                "C:\\[REDACTED:key_value][REDACTED:key_value]",
+                "TKT-1",
+            ),
+        ];
+        let wrong = check_rows(&rows, "Hunter2-example-Zz9");
+        assert!(
+            wrong.is_empty(),
+            "{} of {} rows:\n{}",
+            wrong.len(),
+            rows.len(),
+            wrong.join("\n")
+        );
+    }
+
+    #[test]
+    fn the_aws_secret_in_the_colon_form_ends_at_a_literal_escape() {
+        let rows: [(&str, &str, &str); 4] = [
+            (
+                "AWS_SECRET_ACCESS_KEY: {v}\\nAWS_REGION: us-east-1",
+                "[REDACTED:key_value]\\nAWS_REGION: us-east-1",
+                "TKT-1 us-east-1",
+            ),
+            (
+                "AWS_SECRET_ACCESS_KEY: {v}\\r\\nAWS_REGION: us-east-1",
+                "[REDACTED:key_value]\\r\\nAWS_REGION: us-east-1",
+                "TKT-1 us-east-1",
+            ),
+            (
+                "{\"env\": \"AWS_ACCESS_KEY_ID: AKIAIOSFODNN7EXAMPLE\\naws_secret_access_key: {v}\\nregion: us-east-1\"}",
+                "{\"env\": \"AWS_ACCESS_KEY_ID: [REDACTED:aws_key]\\n[REDACTED:key_value]\\nregion: us-east-1\"}",
+                "TKT-1 {\"env\": \"AWS_ACCESS_KEY_ID: us-east-1\"}",
+            ),
+            (
+                "aws_secret_access_key: {v}\\tdone",
+                "[REDACTED:key_value]\\tdone",
+                "TKT-1",
+            ),
+        ];
+        let wrong = check_rows(&rows, "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY");
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+
+    #[test]
+    fn a_bare_colon_value_is_cut_at_an_escape_only_after_twelve_chars_with_a_digit_and_both_cases()
+    {
+        // a head that is no value is read on over the escape, as before: with more value after
+        // it the whole run is the value, and with a `:` after it there is no match
+        let rows: [(&str, &str, &str); 5] = [
+            (
+                "password: Hunter2-exam\\nhost: db",
+                "[REDACTED:key_value]\\nhost: db",
+                "TKT-1 db",
+            ),
+            (
+                "password: Hunter2-exa\\nhost: db",
+                "password: Hunter2-exa\\nhost: db",
+                "TKT-1 password: Hunter2-exa\\nhost: db",
+            ),
+            (
+                "password: Hunter2-exa\\nmple rest",
+                "[REDACTED:key_value] rest",
+                "TKT-1 rest",
+            ),
+            (
+                "password: Hunter-example\\nZz9 rest",
+                "[REDACTED:key_value] rest",
+                "TKT-1 rest",
+            ),
+            (
+                "password: hunter2-example\\nZz9 rest",
+                "[REDACTED:key_value] rest",
+                "TKT-1 rest",
+            ),
+        ];
+        let wrong = check_rows(&rows, "");
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
     }
 }
