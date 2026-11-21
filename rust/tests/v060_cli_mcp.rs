@@ -78,7 +78,7 @@ fn version_flags_print_060() {
     let fx = Fx::new();
     for flag in ["--version", "-v"] {
         let (code, out, err) = fx.sm(&[flag]);
-        assert_eq!((code, out.as_str(), err.as_str()), (0, "sm 0.6.0\n", ""));
+        assert_eq!((code, out.as_str(), err.as_str()), (0, "sm 0.6.1\n", ""));
     }
     let (code, _, err) = fx.sm(&["-v=1"]);
     assert_eq!(code, 2);
@@ -492,7 +492,7 @@ fn update_uses_curl_and_npm_stubs_writes_cache_and_handles_offline() {
     let curl_log_s = curl_log.to_str().unwrap();
     let npm_log_s = npm_log.to_str().unwrap();
 
-    // 1. Up to date (0.6.0): writes cache, does not call npm.
+    // 1. Up to date (0.6.1): writes cache, does not call npm.
     let (code, out, err) = fx.sm_env(
         &["update", "--check"],
         &[
@@ -502,19 +502,19 @@ fn update_uses_curl_and_npm_stubs_writes_cache_and_handles_offline() {
             ("STUB_NPM_LOG", npm_log_s),
             (
                 "STUB_CURL_BODY",
-                r#"{"name":"simple-memory","version":"0.6.0"}"#,
+                r#"{"name":"simple-memory","version":"0.6.1"}"#,
             ),
         ],
     );
     assert_eq!(
         (code, out.as_str(), err.as_str()),
-        (0, "simple-memory 0.6.0 is up to date (latest: 0.6.0)\n", "")
+        (0, "simple-memory 0.6.1 is up to date (latest: 0.6.1)\n", "")
     );
     let cache: Value = serde_json::from_str(
         &std::fs::read_to_string(fx.home().join("update-check.json")).unwrap(),
     )
     .unwrap();
-    assert_eq!(cache["latest"], "0.6.0");
+    assert_eq!(cache["latest"], "0.6.1");
     assert!(
         cache["checked_at"]
             .as_i64()
@@ -540,7 +540,7 @@ fn update_uses_curl_and_npm_stubs_writes_cache_and_handles_offline() {
     );
     assert_eq!((code, err.as_str()), (0, ""));
     assert!(
-        out.contains("update available: simple-memory 0.6.0 -> 0.7.0"),
+        out.contains("update available: simple-memory 0.6.1 -> 0.7.0"),
         "{out}"
     );
     assert!(out.contains("./scripts/install.sh"), "{out}");
@@ -655,7 +655,7 @@ fn update_uses_curl_and_npm_stubs_writes_cache_and_handles_offline() {
         ],
     );
     assert_eq!((code, err.as_str()), (0, ""));
-    assert!(out.contains("0.6.0 -> 0.8.0"), "{out}");
+    assert!(out.contains("0.6.1 -> 0.8.0"), "{out}");
     let cache: Value = serde_json::from_str(
         &std::fs::read_to_string(fx.home().join("update-check.json")).unwrap(),
     )

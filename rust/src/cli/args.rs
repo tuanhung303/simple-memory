@@ -689,7 +689,7 @@ mod tests {
                 Err(Exit(0))
             );
             out.finish(0);
-            assert_eq!(out.captured().0, "sm 0.6.0\n");
+            assert_eq!(out.captured().0, "sm 0.6.1\n");
         }
     }
 

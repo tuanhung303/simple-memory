@@ -1,6 +1,6 @@
 [package]
 name = "simple-memory"
-version = "0.6.0"
+version = "0.6.1"
 edition = "2024"
 description = "Local single-file SQLite + FTS5 memory store and MCP server for coding agents"
 license = "MIT"

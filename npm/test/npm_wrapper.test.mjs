@@ -18,6 +18,7 @@ const REPO_ROOT = path.resolve(__dirname, "..", "..");
 const BIN_SM = path.join(REPO_ROOT, "npm", "simple-memory", "bin", "sm.js");
 const CHECK_UPDATE_SCRIPT = path.join(REPO_ROOT, "npm", "simple-memory", "scripts", "check-update.js");
 const STAGE_SCRIPT = path.join(REPO_ROOT, "scripts", "stage_npm.sh");
+const PKG_VERSION = require(path.join(REPO_ROOT, "npm", "simple-memory", "package.json")).version;
 
 const {
   TARGETS,
@@ -154,7 +155,7 @@ function makeMachOHeader(cpuType, cpuSubtype, dylibPath = null, suffix = Buffer.
   return Buffer.concat([hdr, lc, suffix]);
 }
 
-function makeFixtureRepo(dir, cargoVersion = "0.6.0") {
+function makeFixtureRepo(dir, cargoVersion = PKG_VERSION) {
   fs.mkdirSync(path.join(dir, "rust"), { recursive: true });
   fs.writeFileSync(
     path.join(dir, "rust", "Cargo.toml"),
@@ -728,13 +729,13 @@ process.stdout.write(JSON.stringify({
         assert.deepEqual(JSON.parse(nonTtyRun.stdout), { installMethod: "npm", argv: ["list"] });
         assert.equal(reqs.length, 0);
 
-        // TTY run with fresh cache newer than 0.6.0 prints exact 1-line stderr notice and keeps stdout clean.
+        // TTY run with fresh cache newer than this package prints exact 1-line stderr notice and keeps stdout clean.
         const ttyRun = await runWithStderrPty([process.execPath, BIN_SM, "list"], nonTtyEnv);
         assert.equal(ttyRun.status, 0);
         assert.deepEqual(JSON.parse(ttyRun.stdout), { installMethod: "npm", argv: ["list"] });
         assert.equal(
           ttyRun.stderr,
-          "Update available: 0.6.0 -> 0.7.0. Run: sm update (or npm install -g simple-memory@latest; disable: SM_NO_UPDATE_CHECK=1)\n"
+          `Update available: ${PKG_VERSION} -> 0.7.0. Run: sm update (or npm install -g simple-memory@latest; disable: SM_NO_UPDATE_CHECK=1)\n`
         );
         assert.equal(reqs.length, 0);
 
@@ -792,7 +793,7 @@ process.stdout.write(JSON.stringify({
         assert.equal(secondTty.status, 0);
         assert.equal(
           secondTty.stderr,
-          "Update available: 0.6.0 -> 0.7.1. Run: sm update (or npm install -g simple-memory@latest; disable: SM_NO_UPDATE_CHECK=1)\n"
+          `Update available: ${PKG_VERSION} -> 0.7.1. Run: sm update (or npm install -g simple-memory@latest; disable: SM_NO_UPDATE_CHECK=1)\n`
         );
         assert.equal(reqs.length, 1);
       });
@@ -1626,7 +1627,7 @@ describe("scripts/stage_npm.sh", () => {
     withTempDir((dir) => {
       const repo = path.join(dir, "repo");
       const out = path.join(dir, "stage");
-      makeFixtureRepo(repo, "0.6.0");
+      makeFixtureRepo(repo);
 
       const linuxBin = path.join(dir, "sm-linux-x64");
       const darwinBin = path.join(dir, "sm-darwin-arm64");
@@ -1659,8 +1660,8 @@ describe("scripts/stage_npm.sh", () => {
         fs.readFileSync(path.join(out, "packages", "simple-memory", "package.json"), "utf8")
       );
       assert.deepEqual(stagedMainPkg.optionalDependencies, {
-        "simple-memory-darwin-arm64": "0.6.0",
-        "simple-memory-linux-x64": "0.6.0",
+        "simple-memory-darwin-arm64": PKG_VERSION,
+        "simple-memory-linux-x64": PKG_VERSION,
       });
       assert.equal(
         fs.statSync(path.join(out, "packages", "simple-memory-linux-x64", "bin", "sm")).mode & 0o777,
@@ -1685,7 +1686,7 @@ describe("scripts/stage_npm.sh", () => {
     withTempDir((dir) => {
       const repo = path.join(dir, "repo");
       const out = path.join(dir, "stage");
-      makeFixtureRepo(repo, "0.6.0");
+      makeFixtureRepo(repo);
 
       const linuxBin = path.join(dir, "sm-linux-x64");
       fs.writeFileSync(linuxBin, makeElfHeader(62));
@@ -1749,7 +1750,7 @@ describe("scripts/stage_npm.sh", () => {
 
       // Version mismatch: main package.json differs from Cargo.toml while platform matches.
       const mainMismatchRepo = path.join(dir, "main-mismatch-repo");
-      makeFixtureRepo(mainMismatchRepo, "0.6.0");
+      makeFixtureRepo(mainMismatchRepo);
       const mainPkgPath = path.join(mainMismatchRepo, "npm", "simple-memory", "package.json");
       const mainPkgData = JSON.parse(fs.readFileSync(mainPkgPath, "utf8"));
       mainPkgData.version = "0.9.9";
@@ -1764,7 +1765,7 @@ describe("scripts/stage_npm.sh", () => {
 
       // Version mismatch: platform package.json differs from Cargo.toml while main matches.
       const platMismatchRepo = path.join(dir, "plat-mismatch-repo");
-      makeFixtureRepo(platMismatchRepo, "0.6.0");
+      makeFixtureRepo(platMismatchRepo);
       const platPkgPath = path.join(
         platMismatchRepo,
         "npm",
@@ -2034,7 +2035,7 @@ describe("scripts/stage_npm.sh", () => {
     withTempDir((dir) => {
       const repo = path.join(dir, "repo");
       const out = path.join(dir, "stage");
-      makeFixtureRepo(repo, "0.6.0");
+      makeFixtureRepo(repo);
 
       const linuxBin = path.join(dir, "sm-linux-x64");
       fs.writeFileSync(linuxBin, makeElfHeader(62));
@@ -2113,10 +2114,10 @@ if (args[0] === "whoami") {
       assert.equal(dryCalls[0].args[0], "whoami");
       assert.equal(dryCalls[1].args[0], "publish");
       assert.ok(dryCalls[1].args.includes("--dry-run"));
-      assert.match(dryCalls[1].args.at(-1), /simple-memory-linux-x64-0\.6\.0\.tgz$/);
+      assert.equal(path.basename(dryCalls[1].args.at(-1)), `simple-memory-linux-x64-${PKG_VERSION}.tgz`);
       assert.equal(dryCalls[2].args[0], "publish");
       assert.ok(dryCalls[2].args.includes("--dry-run"));
-      assert.match(dryCalls[2].args.at(-1), /simple-memory-0\.6\.0\.tgz$/);
+      assert.equal(path.basename(dryCalls[2].args.at(-1)), `simple-memory-${PKG_VERSION}.tgz`);
       assert.equal(dryCalls[0].ucMode, 0o600);
       assert.equal(
         dryCalls[0].ucContent,
@@ -2145,9 +2146,9 @@ if (args[0] === "whoami") {
       assert.ok(liveCalls[1].args.includes("--dry-run"));
       assert.ok(liveCalls[2].args.includes("--dry-run"));
       assert.equal(liveCalls[3].args.includes("--dry-run"), false);
-      assert.match(liveCalls[3].args.at(-1), /simple-memory-linux-x64-0\.6\.0\.tgz$/);
+      assert.equal(path.basename(liveCalls[3].args.at(-1)), `simple-memory-linux-x64-${PKG_VERSION}.tgz`);
       assert.equal(liveCalls[4].args.includes("--dry-run"), false);
-      assert.match(liveCalls[4].args.at(-1), /simple-memory-0\.6\.0\.tgz$/);
+      assert.equal(path.basename(liveCalls[4].args.at(-1)), `simple-memory-${PKG_VERSION}.tgz`);
       assert.equal(fs.existsSync(liveCalls[0].ucPath), false);
 
       // Whitespace in token is refused.
