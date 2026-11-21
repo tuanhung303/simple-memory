@@ -1684,10 +1684,32 @@ fn missing_names_the_items_the_status_or_a_filter_hid_and_what_shows_them() {
     ]);
     let missing = footer.lines().find(|l| l.starts_with("missing: ")).unwrap();
     assert!(!missing.contains("->"), "{footer}");
-    // the JSON keeps its keys and its count
+    // the JSON keeps its keys and its count, and adds what the text line says
     let v: Value =
         serde_json::from_str(&q(&["fivetran", "--repo", "etl", "--format", "json"])).unwrap();
-    assert_eq!(v["missing"], json!([{"term": "fivetran", "in_scope": 0}]));
+    assert_eq!(
+        v["missing"],
+        json!([{"term": "fivetran", "in_scope": 0, "hidden": 1, "hidden_by": "retired or superseded"}])
+    );
+    let missing = |args: &[&str]| -> Value {
+        serde_json::from_str::<Value>(&q(args)).unwrap()["missing"].clone()
+    };
+    assert_eq!(
+        missing(&[
+            "snowflake",
+            "--repo",
+            "etl",
+            "--kind",
+            "fact",
+            "--format",
+            "json"
+        ]),
+        json!([{"term": "snowflake", "in_scope": 0, "hidden": 1, "hidden_by": "outside --kind fact"}])
+    );
+    assert_eq!(
+        missing(&["airbyte", "--repo", "etl", "--format", "json"]),
+        json!([{"term": "airbyte", "in_scope": 0}])
+    );
     let keys: Vec<&String> = v.as_object().unwrap().keys().collect();
     assert_eq!(
         keys,
@@ -1707,7 +1729,7 @@ fn a_hit_that_matched_only_filler_words_is_not_listed() {
             &["how do we handle stripe webhooks", "--repo", "etl"]
         ),
         "more: other repos billing=2 -> sm query \"how do we handle stripe webhooks\" --all\n\
-         missing: handle=0; stripe=0; webhooks=0\n"
+         missing: handle=0; stripe: 2 in other repos -> sm query \"stripe\" --all; webhooks: 1 in other repos -> sm query \"webhooks\" --all\n"
     );
     // the dag matches 3 of 4 words, the snowflake note 2, the filler note only "on"
     let ids = |args: &[&str]| -> Vec<String> {
@@ -1735,6 +1757,156 @@ fn a_hit_that_matched_only_filler_words_is_not_listed() {
     let mut want = vec![snowflake, dag, filler];
     want.sort();
     assert_eq!(all, want);
+}
+
+/// alpha: 110 notes and beta: 40 notes made of filler words, plus one refund note in each repo.
+fn filler_pool_store() -> (tempfile::TempDir, PathBuf) {
+    let (d, home) = scratch();
+    write(&home.join("config.toml"), "[catch_up]\nenabled = false\n");
+    let note = |id: String, repo: &str, body: String| {
+        seed_item(&home, &id, repo, "fact", "", &body, "verified", "", "", TS)
+    };
+    for i in 0..110 {
+        note(
+            format!("m_a{i}"),
+            "alpha",
+            format!("Note {i}: what is in the build cache for the lint step"),
+        );
+    }
+    for i in 0..40 {
+        note(
+            format!("m_b{i}"),
+            "beta",
+            format!("Note {i}: what is in the deploy queue for the web step"),
+        );
+    }
+    note(
+        "m_refund".into(),
+        "alpha",
+        "Refunds over 5000 USD need a second approver".into(),
+    );
+    note(
+        "m_brefund".into(),
+        "beta",
+        "Refunds in beta wait a day".into(),
+    );
+    (d, home)
+}
+
+#[test]
+fn a_pool_full_of_filler_hits_counts_only_the_hits_the_list_shows() {
+    let (_d, home) = filler_pool_store();
+    let q = "what is the rule for refunds that are over the limit";
+    let footer = |args: &[&str]| -> Vec<String> {
+        query_ok(&home, args)
+            .lines()
+            .filter(|l| !l.starts_with('['))
+            .map(String::from)
+            .collect()
+    };
+    // the pool of 100 is full only of filler notes: nothing lies beyond it, and beta shows 1 hit
+    assert_eq!(
+        footer(&["--repo", "alpha", "--format", "brief", "--", q]),
+        [
+            "missing: rule=0; limit=0".to_string(),
+            format!("more: other repos beta=1 -> sm query \"{q}\" --all"),
+            "next: sm show m_refund; sm related m_refund".to_string(),
+        ]
+    );
+    let more = |args: &[&str]| -> Value {
+        let v: Value = serde_json::from_str(&query_ok(&home, args)).unwrap();
+        v["more"].clone()
+    };
+    assert_eq!(
+        more(&["--repo", "alpha", "--format", "json", "--", q]),
+        json!({"beyond_limit": 0, "pool_full": false, "other_repos": {"beta": 1}, "other_repos_pool_full": false})
+    );
+    // --all lists the two refund notes and announces nothing more
+    assert_eq!(
+        footer(&["--all", "--format", "brief", "--", q])[1..],
+        ["next: sm show m_refund m_brefund; sm related m_refund"]
+    );
+    assert_eq!(
+        more(&["--all", "--format", "json", "--", q]),
+        json!({"beyond_limit": 0, "pool_full": false, "other_repos": {}, "other_repos_pool_full": false})
+    );
+}
+
+#[test]
+fn a_pool_full_of_topic_hits_still_counts_past_the_limit_when_filler_hits_drop() {
+    let (_d, home) = scratch();
+    write(&home.join("config.toml"), "[catch_up]\nenabled = false\n");
+    for i in 0..120 {
+        let body = format!("Refund case {i}");
+        seed_item(
+            &home,
+            &format!("m_r{i}"),
+            "alpha",
+            "fact",
+            "",
+            &body,
+            "verified",
+            "",
+            "",
+            TS,
+        );
+    }
+    for i in 0..10 {
+        let body = format!("what is in the cache {i}");
+        seed_item(
+            &home,
+            &format!("m_f{i}"),
+            "alpha",
+            "fact",
+            "",
+            &body,
+            "verified",
+            "",
+            "",
+            TS,
+        );
+    }
+    // the 10 filler notes rank inside the pool of 100 and drop out: 90 refund notes stay listed
+    // or counted, and 30 more refund notes lie past the pool
+    let out = query_ok(
+        &home,
+        &["what is the refund", "--repo", "alpha", "--format", "brief"],
+    );
+    let more: Vec<&str> = out.lines().filter(|l| l.starts_with("more:")).collect();
+    assert_eq!(
+        more,
+        [
+            "more: 86+ beyond --limit 4 (pool of 100 full) -> sm query \"what is the refund\" --repo alpha --limit 14"
+        ]
+    );
+}
+
+#[test]
+fn missing_names_a_term_that_only_other_repos_hold_after_the_other_repos_line() {
+    let (_d, home, _) = etl_store();
+    let q = |args: &[&str]| query_ok(&home, args);
+    assert_eq!(
+        q(&["stripe webhook", "--repo", "etl"]),
+        "more: other repos billing=2 -> sm query \"stripe webhook\" --all\n\
+         missing: stripe: 2 in other repos -> sm query \"stripe\" --all; webhook: 2 in other repos -> sm query \"webhook\" --all\n"
+    );
+    // the filters go along to the other repos
+    assert_eq!(
+        q(&["stripe", "--repo", "etl", "--kind", "fact"]),
+        "more: other repos billing=2 -> sm query \"stripe\" --all --kind fact\n\
+         missing: stripe: 2 in other repos -> sm query \"stripe\" --all --kind fact\n"
+    );
+    // held nowhere: term=0 stays, and --all names no other repo
+    assert_eq!(q(&["airbyte", "--all"]), "missing: airbyte=0\n");
+    let v: Value =
+        serde_json::from_str(&q(&["stripe webhook", "--repo", "etl", "--format", "json"])).unwrap();
+    assert_eq!(
+        v["missing"],
+        json!([
+            {"term": "stripe", "in_scope": 0, "in_other_repos": 2},
+            {"term": "webhook", "in_scope": 0, "in_other_repos": 2}
+        ])
+    );
 }
 
 #[test]

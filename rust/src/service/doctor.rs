@@ -59,17 +59,44 @@ fn tasklog_files(root: &PyPath) -> Result<Vec<PyPath>, SmError> {
     Ok(files)
 }
 
-/// `Path(raw).expanduser().resolve()` of a config list entry, which must be a folder.
-fn config_dir(raw: &PyValue, what: &str) -> Result<PyPath, SmError> {
+/// The fix a missing `[upkeep]` folder entry names; see `is_missing_entry`.
+pub const FIX_ENTRY: &str = "; fix or remove it in [upkeep] ";
+
+/// `Path(raw).expanduser().resolve()` of an `[upkeep] <key>` entry, which must be a folder; a
+/// missing one names the key and the config file to fix.
+fn config_dir(raw: &PyValue, key: &str, home: Option<&str>) -> Result<PyPath, SmError> {
     let root = path_of(raw)?.expanduser()?.resolve()?;
     if !root.is_dir() {
+        let cfg = get_home(home)?.join("config.toml");
         return Err(SmError::new(
-            crate::error::Base::Os,
+            Base::Os,
             "FileNotFoundError",
-            format!("{what} entry not found: {root}"),
+            format!("upkeep.{key} entry not found: {root}{FIX_ENTRY}{key} in {cfg}"),
         ));
     }
     Ok(root)
+}
+
+/// Is this a missing `[upkeep]` folder entry? Its message says what to fix, so catch-up shows
+/// it without the class name.
+pub fn is_missing_entry(e: &SmError) -> bool {
+    e.is(Base::Os) && e.msg.contains(FIX_ENTRY)
+}
+
+/// One line for each `tasklog_roots` entry that holds `docs/tasklog` itself: the scan looks for
+/// `docs/tasklog` one to three folders below a root, so it finds none of that repo's task logs.
+pub fn repo_folder_roots(cfg: &PyValue) -> Result<Vec<String>, SmError> {
+    let mut lines = Vec::new();
+    for raw in iterate(cfg_get(cfg_get(cfg, "upkeep")?, "tasklog_roots")?)? {
+        let root = path_of(&raw)?.expanduser()?.resolve()?;
+        if root.join("docs/tasklog").is_dir() {
+            lines.push(format!(
+                "{root} is a repo folder: tasklog_roots takes the folder above it (set \"{}\")",
+                root.parent()
+            ));
+        }
+    }
+    Ok(lines)
 }
 
 /// `tasklog_repo_dirs(roots, repo_aliases)`: repo key -> main checkout for each `docs/tasklog`
@@ -77,10 +104,11 @@ fn config_dir(raw: &PyValue, what: &str) -> Result<PyPath, SmError> {
 pub fn tasklog_repo_dirs(
     roots: &PyValue,
     repo_aliases: &crate::config::Aliases,
+    home: Option<&str>,
 ) -> Result<IndexMap<String, PyPath>, SmError> {
     let mut found: IndexMap<String, PyPath> = IndexMap::new();
     for raw_root in iterate(roots)? {
-        let root = config_dir(&raw_root, "upkeep.tasklog_roots")?;
+        let root = config_dir(&raw_root, "tasklog_roots", home)?;
         for pattern in TASKLOG_GLOBS {
             for d in root.glob(pattern)? {
                 let checkout = d.parent().parent();
@@ -123,8 +151,12 @@ fn unreadable_row(f: &PyPath, e: &SmError) -> String {
 }
 
 /// `import_lag(conn, full_cfg)`: task logs and handoffs on disk with no stored item.
-pub fn import_lag(conn: &Connection, full_cfg: &PyValue) -> Result<ImportLag, SmError> {
-    Ok(import_lag_by_repo(conn, full_cfg)?.0)
+pub fn import_lag(
+    conn: &Connection,
+    full_cfg: &PyValue,
+    home: Option<&str>,
+) -> Result<ImportLag, SmError> {
+    Ok(import_lag_by_repo(conn, full_cfg, home)?.0)
 }
 
 /// `import_lag`, and the (repo, source) of each active task item whose repo has no file with
@@ -133,6 +165,7 @@ pub fn import_lag(conn: &Connection, full_cfg: &PyValue) -> Result<ImportLag, Sm
 pub(crate) fn import_lag_by_repo(
     conn: &Connection,
     full_cfg: &PyValue,
+    home: Option<&str>,
 ) -> Result<(ImportLag, Vec<(String, String)>), SmError> {
     let cfg = cfg_get(full_cfg, "upkeep")?;
     cfg_get(full_cfg, "repo_aliases")?;
@@ -211,7 +244,7 @@ pub(crate) fn import_lag_by_repo(
     let mut seen_tasks: HashSet<(String, String)> = HashSet::new();
     let mut tl_files = Vec::new();
     for raw_root in iterate(cfg_get(cfg, "tasklog_roots")?)? {
-        let root = config_dir(&raw_root, "upkeep.tasklog_roots")?;
+        let root = config_dir(&raw_root, "tasklog_roots", home)?;
         tl_files.extend(tasklog_files(&root)?);
     }
     let tl_files = sorted_unique(tl_files);
@@ -240,7 +273,7 @@ pub(crate) fn import_lag_by_repo(
     }
     let mut ho_files = Vec::new();
     for raw_dir in iterate(cfg_get(cfg, "handoff_dirs")?)? {
-        let hdir = config_dir(&raw_dir, "upkeep.handoff_dirs")?;
+        let hdir = config_dir(&raw_dir, "handoff_dirs", home)?;
         ho_files.extend(hdir.rglob("*.md")?);
     }
     let ho_files = sorted_unique(ho_files);
@@ -367,7 +400,7 @@ pub fn run_doctor(
         IndexMap::new()
     };
     let lag = if imports {
-        let il = import_lag(&conn, &cfg)?;
+        let il = import_lag(&conn, &cfg, home)?;
         let am = automemory_lag(&conn, &cfg)?;
         Some((il, am, last_catchup(home)?))
     } else {
@@ -391,33 +424,52 @@ pub fn is_damaged(e: &SmError) -> bool {
             .any(|w| e.msg.contains(w))
 }
 
-/// What to do after an `is_damaged` error: the newest backup and the two steps that put it in
-/// place, or that there is none. Nothing when memory.db passes `quick_check`, since the error then
-/// came from another file (`sm import legacy <db>`).
+fn passes_quick_check(db: impl AsRef<std::path::Path>, flags: OpenFlags) -> bool {
+    Connection::open_with_flags(db, flags)
+        .and_then(|c| c.query_row("PRAGMA quick_check", [], |r| r.get::<_, String>(0)))
+        .is_ok_and(|v| v == "ok")
+}
+
+/// What to do after an `is_damaged` error: the newest backup that passes `quick_check` and the
+/// two steps that put it in place, or that there is none. Nothing when memory.db passes
+/// `quick_check`, since the error then came from another file (`sm import legacy <db>`).
 pub fn restore_steps(home: Option<&str>) -> Result<Vec<String>, SmError> {
     let h = get_home(home)?;
     let db = h.join("memory.db");
-    let check = Connection::open_with_flags(db.to_os(), OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .and_then(|c| c.query_row("PRAGMA quick_check", [], |r| r.get::<_, String>(0)));
-    if check.is_ok_and(|v| v == "ok") {
+    if passes_quick_check(db.to_os(), OpenFlags::SQLITE_OPEN_READ_ONLY) {
         return Ok(Vec::new());
     }
-    let Some(backup) = auto_backups(home)?.pop() else {
-        return Ok(vec![format!(
-            "{db} looks damaged and {} holds no backup to restore",
-            h.join("backups")
-        )]);
+    let (found, bdir) = (auto_backups(home)?, h.join("backups"));
+    // A copy is in WAL mode, so a plain read-only open leaves -wal and -shm files beside it;
+    // `immutable=1` reads the file alone and writes nothing.
+    let ro = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI;
+    let uri = |p: &PyPath| {
+        let path = p
+            .as_str()
+            .replace('%', "%25")
+            .replace('?', "%3f")
+            .replace('#', "%23");
+        format!("file:{path}?mode=ro&immutable=1")
+    };
+    let Some(backup) = found.iter().rev().find(|p| passes_quick_check(uri(p), ro)) else {
+        return Ok(vec![if found.is_empty() {
+            format!("{db} looks damaged and {bdir} holds no backup to restore")
+        } else {
+            format!("{db} looks damaged and no backup in {bdir} passes quick_check")
+        }]);
     };
     let (q, aside) = (|p: &PyPath| shlex_quote(p.as_str()), h.join("damaged"));
     Ok(vec![
-        format!("{db} looks damaged; to restore the newest backup, {backup}:"),
+        format!(
+            "{db} looks damaged; to restore the newest backup that passes quick_check, {backup}:"
+        ),
         format!(
             "  1. mkdir -p {} && mv {}/memory.db* {}/",
             q(&aside),
             q(&h),
             q(&aside)
         ),
-        format!("  2. cp {} {}", q(&backup), q(&db)),
+        format!("  2. cp {} {}", q(backup), q(&db)),
     ])
 }
 

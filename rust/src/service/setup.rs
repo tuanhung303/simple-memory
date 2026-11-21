@@ -22,7 +22,7 @@ pub const HOOK_TARGETS: [(&str, &str); 3] = [
     ("agy", "~/.gemini/config/hooks.json"),
     (
         "mcp",
-        "the \"mcpServers\" object of a project's .mcp.json, or of another MCP client's config",
+        "the top level of a project's .mcp.json (or of another MCP client's config): the fragment already holds the \"mcpServers\" key",
     ),
 ];
 

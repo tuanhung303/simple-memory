@@ -7,6 +7,7 @@ use crate::py::argparse::Namespace;
 use crate::py::io::Out;
 use crate::service::capture::capture_sessions;
 use crate::service::catchup::run_catchup;
+use crate::service::doctor::repo_folder_roots;
 use crate::service::import_::{ImportResult, run_automemory_import, run_import};
 
 use super::upkeep::manual_run_lock;
@@ -103,6 +104,14 @@ fn catch_up(ns: &Namespace, out: &mut Out) -> Result<i32, SmError> {
         for line in crate::config::unknown_keys(None).unwrap_or_default() {
             out.eprint(&line)?;
         }
+        let cfg = load_config(None).ok();
+        for line in cfg
+            .map(|c| repo_folder_roots(&c))
+            .and_then(Result::ok)
+            .unwrap_or_default()
+        {
+            out.eprint(&line)?;
+        }
     }
     let Some(row) = run_catchup(None)? else {
         if !quiet {
@@ -131,9 +140,11 @@ fn catch_up(ns: &Namespace, out: &mut Out) -> Result<i32, SmError> {
             .sum();
         match failed {
             0 => {}
-            1 => out.eprint("catch-up: 1 file not imported; sm doctor --imports lists it")?,
+            1 => out.eprint(
+                "catch-up: 1 task log or handoff not imported; sm doctor --imports lists it",
+            )?,
             n => out.eprint(&format!(
-                "catch-up: {n} files not imported; sm doctor --imports lists them"
+                "catch-up: {n} task logs or handoffs not imported; sm doctor --imports lists them"
             ))?,
         }
     }

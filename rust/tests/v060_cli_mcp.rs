@@ -764,6 +764,12 @@ fn put_refuses_a_dash_body_and_an_empty_body_says_stdin_is_not_read() {
             format!("{STDIN_HINT}\nerror: Item body cannot be empty\n")
         )
     );
+    // An empty body argument was given, so the stdin hint does not apply.
+    let (code, out, err) = fx.sm(&["put", "--repo", "anvil", "--tag", "prior", ""]);
+    assert_eq!(
+        (code, out.as_str(), err.as_str()),
+        (1, "", "error: Item body cannot be empty\n")
+    );
     // A dash inside a longer body is text, not a stdin marker.
     let id = fx.put(&["--repo", "anvil", "--tag", "prior", "a", "-", "b"]);
     let (_, out, _) = fx.sm(&["show", &id]);
@@ -813,6 +819,30 @@ fn help_names_defaults_separators_stdin_and_what_apply_writes() {
         (
             &["put", "--help"][..],
             "Old item id(s) this item supersedes, separated by commas or spaces",
+        ),
+        (
+            &["--help"][..],
+            "Browse stored memory items, newest first, with filters and pagination",
+        ),
+        (
+            &["put", "--help"][..],
+            "Item kind (fact, decision, learning, episode, task, handoff; default: fact)",
+        ),
+        (
+            &["amend", "--help"][..],
+            "References to add, separated by commas or spaces",
+        ),
+        (
+            &["amend", "--help"][..],
+            "References to remove, separated by commas or spaces",
+        ),
+        (
+            &["amend", "--help"][..],
+            "Freeform tags to add, separated by commas (a space stays inside a tag)",
+        ),
+        (
+            &["amend", "--help"][..],
+            "Freeform tags to remove, separated by commas (a space stays inside a tag)",
         ),
         (
             &["amend", "--help"][..],
@@ -950,7 +980,7 @@ fn value_errors_name_fields_and_the_forms_that_work() {
     for (args, msg) in [
         (
             vec!["put", "--repo", "anvil", "--tag", "verified", "x"],
-            "error: Tag 'verified' needs non-empty evidence\n",
+            "error: Tag 'verified' needs non-empty evidence: a command, a sha, a file:line or a quote\n",
         ),
         (
             vec!["amend", id.as_str()],
@@ -958,17 +988,21 @@ fn value_errors_name_fields_and_the_forms_that_work() {
         ),
         (
             vec!["list", "--since", "7x"],
-            "error: Invalid ISO 8601 timestamp '7x'; a relative form (30m, 24h, 7d, 2w) also works\n",
+            "error: Invalid ISO 8601 timestamp '7x', for example 2026-11-21T09:30:00Z; a relative form (30m, 24h, 7d, 2w) also works\n",
         ),
         (
             vec!["query", "pool", "--until", "7x"],
-            "error: Invalid ISO 8601 timestamp '7x'; a relative form (30m, 24h, 7d, 2w) also works\n",
+            "error: Invalid ISO 8601 timestamp '7x', for example 2026-11-21T09:30:00Z; a relative form (30m, 24h, 7d, 2w) also works\n",
         ),
         (
             vec![
                 "put", "--repo", "anvil", "--tag", "prior", "--as-of", "7d", "y",
             ],
-            "error: Invalid ISO 8601 timestamp '7d'\n",
+            "error: Invalid ISO 8601 timestamp '7d', for example 2026-11-21T09:30:00Z\n",
+        ),
+        (
+            vec!["amend", id.as_str(), "--as-of", "7d"],
+            "error: Invalid ISO 8601 timestamp '7d', for example 2026-11-21T09:30:00Z\n",
         ),
         (
             vec!["stats", "--days", "0"],

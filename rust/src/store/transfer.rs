@@ -197,7 +197,7 @@ mod tests {
         let e = import_items(&conn, &[item("m_3", "b3", "decided", "2026-02-30")]).unwrap_err();
         assert_eq!(
             e.python_text(),
-            "ValueError: m_3: Invalid ISO 8601 timestamp '2026-02-30'"
+            "ValueError: m_3: Invalid ISO 8601 timestamp '2026-02-30', for example 2026-11-21T09:30:00Z"
         );
     }
 

@@ -659,6 +659,57 @@ fn query_and_related_give_the_cli_json() {
 }
 
 #[test]
+fn query_json_names_what_hid_a_missing_term() {
+    let fx = Fx::new();
+    let repo = fx.repo_dir();
+    let cli = |args: &[&str]| {
+        let o = fx.cli(args, &repo);
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        String::from_utf8(o.stdout).unwrap().trim().to_string()
+    };
+    cli(&[
+        "put",
+        "--tag",
+        "decided",
+        "--kind",
+        "decision",
+        "Kafka lag alert threshold is 5000",
+    ]);
+    let zebra = cli(&["put", "--tag", "decided", "Zebra rollout plan moved to Q3"]);
+    cli(&["retire", &zebra, "--reason", "plan dropped"]);
+    cli(&[
+        "put",
+        "--tag",
+        "decided",
+        "--repo",
+        "beta",
+        "Stripe webhooks are signed",
+    ]);
+    let (out, _) = fx.conv(
+        vec![
+            init(),
+            call(1, "memory_query", json!({"query": "zebra"})),
+            call(2, "memory_query", json!({"query": "kafka", "tag": "n/a"})),
+            call(3, "memory_query", json!({"query": "stripe"})),
+            call(4, "memory_query", json!({"query": "airbyte"})),
+        ],
+        &repo,
+    );
+    let missing: Vec<Value> = (1..=4)
+        .map(|i| payload(&out[i])["missing"].clone())
+        .collect();
+    assert_eq!(
+        missing,
+        [
+            json!([{"term": "zebra", "in_scope": 0, "hidden": 1, "hidden_by": "retired or superseded"}]),
+            json!([{"term": "kafka", "in_scope": 0, "hidden": 1, "hidden_by": "outside --tag n/a"}]),
+            json!([{"term": "stripe", "in_scope": 0, "in_other_repos": 1}]),
+            json!([{"term": "airbyte", "in_scope": 0}]),
+        ]
+    );
+}
+
+#[test]
 fn query_json_names_no_1_letter_or_operator_word_as_missing() {
     let fx = Fx::new();
     let repo = fx.repo_dir();
@@ -948,7 +999,7 @@ fn a_failing_tool_answers_is_error() {
         (
             "memory_put",
             json!({"text": "Ran the B suite", "tag": "executed"}),
-            "error: Tag 'executed' needs non-empty evidence",
+            "error: Tag 'executed' needs non-empty evidence: a command, a sha, a file:line or a quote",
         ),
         (
             "memory_put",

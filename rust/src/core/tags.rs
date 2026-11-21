@@ -81,7 +81,7 @@ pub fn validate_tag(
         && strip(evidence.unwrap_or("")).is_empty()
     {
         return Err(SmError::value(format!(
-            "Tag {} needs non-empty evidence",
+            "Tag {} needs non-empty evidence: a command, a sha, a file:line or a quote",
             repr(&cleaned)
         )));
     }
@@ -213,15 +213,15 @@ mod tests {
         );
         assert_eq!(
             err("verified", "   ", false),
-            "ValueError: Tag 'verified' needs non-empty evidence"
+            "ValueError: Tag 'verified' needs non-empty evidence: a command, a sha, a file:line or a quote"
         );
         assert_eq!(
             err(" EXECUTED ", "", false),
-            "ValueError: Tag 'executed' needs non-empty evidence"
+            "ValueError: Tag 'executed' needs non-empty evidence: a command, a sha, a file:line or a quote"
         );
         assert_eq!(
             validate_tag(Some("executed"), None, false).unwrap_err().msg,
-            "Tag 'executed' needs non-empty evidence"
+            "Tag 'executed' needs non-empty evidence: a command, a sha, a file:line or a quote"
         );
 
         assert_eq!(map_legacy_tag(Some("inferred")), ("derived".into(), None));

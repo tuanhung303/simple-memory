@@ -11,8 +11,8 @@ use crate::py::argparse::{Namespace, Value};
 use crate::py::io::Out;
 use crate::py::value::PyValue;
 use crate::service::query::{
-    Lookup, QueryArgs, StrList, item_text, item_tokens, lookup_json, next_cmds, run_lookup,
-    split_list,
+    Lookup, QueryArgs, StrList, item_text, item_tokens, lookup_json, narrowing_flags, next_cmds,
+    run_lookup, split_list,
 };
 use crate::service::recall::is_stopword;
 use crate::service::usage::log_usage;
@@ -158,7 +158,7 @@ fn query_flags(ns: &Namespace) -> (Vec<String>, Vec<String>) {
     } else {
         vec![]
     };
-    let mut filters = narrowing_flags(ns);
+    let mut filters = narrowing_flags(&query_args(ns, None));
     if ns.get_bool("include_history") {
         filters.push(s("--include-history"));
     }
@@ -171,27 +171,25 @@ fn query_flags(ns: &Namespace) -> (Vec<String>, Vec<String>) {
     (scope, filters)
 }
 
-/// The flags that leave items out: `--tag`, `--kind`, `--source`, `--since`, `--until`.
-fn narrowing_flags(ns: &Namespace) -> Vec<String> {
-    let s = |v: &str| v.to_string();
-    let mut filters = Vec::new();
-    for (flag, dest) in [("--tag", "tag"), ("--kind", "kind")] {
-        let vals = split_list(StrList::Str(ns.get_str(dest)));
-        if !vals.is_empty() {
-            filters.extend([s(flag), vals.join(",")]);
-        }
+fn query_args<'a>(ns: &'a Namespace, bias: Option<&'a [String]>) -> QueryArgs<'a> {
+    QueryArgs {
+        // a limit past i64 saturates: the same slices, and the same ValueError when negative
+        limit: ns.get_int("limit"),
+        recent: ns.get_bool("recent"),
+        tags: StrList::Str(ns.get_str("tag")),
+        kinds: StrList::Str(ns.get_str("kind")),
+        sources: StrList::Str(ns.get_str("source")),
+        since: ns.get_str("since"),
+        until: ns.get_str("until"),
+        bias: bias.map_or(StrList::None, StrList::List),
+        all_repos: ns.get_bool("all_repos"),
+        repo: ns.get_str("repo"),
+        include_history: ns.get_bool("include_history"),
+        scopes: StrList::Str(ns.get_str("in")),
+        extra_scopes: StrList::None,
+        home: None,
+        cwd: None,
     }
-    let sources = split_list(StrList::Str(ns.get_str("source")));
-    if !sources.is_empty() {
-        filters.extend([s("--source"), shlex_quote(&sources.join(","))]);
-    }
-    for (flag, dest) in [("--since", "since"), ("--until", "until")] {
-        let val = ns.get_str(dest);
-        if !val.is_empty() {
-            filters.extend([s(flag), shlex_quote(val)]);
-        }
-    }
-    filters
 }
 
 /// `str(limit)` and `str(limit + n)` for the --limit flag, which may lie past i64.
@@ -235,7 +233,7 @@ impl LimitText {
 fn footer_lines(lk: &Lookup, ns: &Namespace, limit: &LimitText) -> Vec<String> {
     let (scope, filters) = query_flags(ns);
     let with = |a: &[String], b: &[String]| -> Vec<String> { a.iter().chain(b).cloned().collect() };
-    let narrow = narrowing_flags(ns);
+    let narrow = narrowing_flags(&query_args(ns, None));
     let mut lines = Vec::new();
     if !lk.missing.is_empty() {
         let parts: Vec<String> = lk
@@ -251,22 +249,17 @@ fn footer_lines(lk: &Lookup, ns: &Namespace, limit: &LimitText) -> Vec<String> {
                     }
                 };
                 if let Some(h) = lk.hidden.get(term) {
-                    let outside = format!("outside {}", narrow.join(" "));
-                    let what = match (h.retired, h.filtered) {
-                        (true, false) => "retired or superseded".to_string(),
-                        (false, _) => outside,
-                        (true, true) => format!("retired or superseded, {outside}"),
-                    };
-                    let kept = if h.filtered {
-                        &filters[narrow.len()..]
+                    let mut flags = if h.other_repos {
+                        with(&["--all".to_string()], &filters)
+                    } else if h.filtered {
+                        with(&scope, &filters[narrow.len()..])
                     } else {
-                        &filters[..]
+                        with(&scope, &filters)
                     };
-                    let mut flags = with(&scope, kept);
                     if h.retired {
                         flags.push("--include-history".into());
                     }
-                    format!("{term}: {} {what}{}", h.n, cmd(&flags))
+                    format!("{term}: {} {}{}", h.n, h.by, cmd(&flags))
                 } else if *n != 0 {
                     format!("{term}={n}{}", cmd(&with(&scope, &filters)))
                 } else {
@@ -281,9 +274,8 @@ fn footer_lines(lk: &Lookup, ns: &Namespace, limit: &LimitText) -> Vec<String> {
     if lk.beyond_limit == 0 && full {
         // --limit took the whole pool: a wider limit shows no more, so the hint narrows the query
         more.push(format!(
-            "matches may exist beyond the full pool of {} -> narrow the query: {}",
+            "matches may exist beyond the full pool of {} -> narrow the query: add a word, --kind, --tag or --since",
             lk.pool_cap.unwrap_or(0),
-            query_cmd(&lk.query, &with(&scope, &filters))
         ));
     }
     if lk.beyond_limit != 0 {
@@ -324,8 +316,8 @@ fn footer_lines(lk: &Lookup, ns: &Namespace, limit: &LimitText) -> Vec<String> {
     }
     if !more.is_empty() {
         let line = format!("more: {}", more.join("; "));
-        // only filler hits matched here: the other repos are the lead
-        if lk.hits.is_empty() && lk.filler_dropped && !lk.other_repos.is_empty() {
+        // no hit here: the other repos line comes first
+        if lk.hits.is_empty() {
             lines.insert(0, line);
         } else {
             lines.push(line);
@@ -486,22 +478,6 @@ fn print_query(
     out.print(&text)
 }
 
-/// The unknown-scope error, or with no `[scopes]` table at all, where to add one.
-fn unknown_scope_text(msg: &str, paths: &str) -> Result<String, SmError> {
-    let cfg = crate::config::load_config(None)?;
-    if !crate::config::scopes(&cfg)?.is_empty() {
-        return Ok(msg.to_string());
-    }
-    let first = split_list(StrList::Str(paths))
-        .into_iter()
-        .next()
-        .unwrap_or_default();
-    Ok(format!(
-        "unknown scope: {first}; {} has no [scopes] table (README: Multi-repo scopes and maintenance)",
-        crate::config::get_home(None)?.join("config.toml").as_str()
-    ))
-}
-
 fn s(v: &str) -> PyValue {
     PyValue::Str(v.to_string())
 }
@@ -529,24 +505,7 @@ fn join_query_tokens(parts: &[String]) -> String {
 pub fn run(ns: &Namespace, out: &mut Out) -> Result<i32, SmError> {
     let limit_text = LimitText::of(ns.get("limit"));
     let bias = bias_of(ns);
-    let a = QueryArgs {
-        // a limit past i64 saturates: the same slices, and the same ValueError when negative
-        limit: ns.get_int("limit"),
-        recent: ns.get_bool("recent"),
-        tags: StrList::Str(ns.get_str("tag")),
-        kinds: StrList::Str(ns.get_str("kind")),
-        sources: StrList::Str(ns.get_str("source")),
-        since: ns.get_str("since"),
-        until: ns.get_str("until"),
-        bias: bias.as_deref().map_or(StrList::None, StrList::List),
-        all_repos: ns.get_bool("all_repos"),
-        repo: ns.get_str("repo"),
-        include_history: ns.get_bool("include_history"),
-        scopes: StrList::Str(ns.get_str("in")),
-        extra_scopes: StrList::None,
-        home: None,
-        cwd: None,
-    };
+    let a = query_args(ns, bias.as_deref());
     let query = join_query_tokens(&ns.get_str_list("query"));
     let repo = py::str::strip(a.repo);
     if a.all_repos && !repo.is_empty() {
@@ -556,7 +515,7 @@ pub fn run(ns: &Namespace, out: &mut Out) -> Result<i32, SmError> {
     }
     let lookup = match run_lookup(&query, &a) {
         Err(e) if e.class == crate::config::UNKNOWN_SCOPE => {
-            out.eprint(&unknown_scope_text(&e.msg, ns.get_str("in"))?)?;
+            out.eprint(&e.msg)?;
             return Ok(2);
         }
         r => r?,
@@ -624,7 +583,6 @@ mod tests {
             other_repos_cap: None,
             shared_refs: vec![],
             hidden: IndexMap::new(),
-            filler_dropped: false,
         }
     }
 

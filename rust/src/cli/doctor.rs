@@ -4,7 +4,7 @@ use crate::error::SmError;
 use crate::py::argparse::Namespace;
 use crate::py::io::Out;
 use crate::py::value::PyValue;
-use crate::service::doctor::run_doctor;
+use crate::service::doctor::{repo_folder_roots, run_doctor};
 use crate::sources::{dict_get, get_attr, truthy};
 
 pub fn run(ns: &Namespace, out: &mut Out) -> Result<i32, SmError> {
@@ -16,6 +16,11 @@ pub fn run(ns: &Namespace, out: &mut Out) -> Result<i32, SmError> {
     let doc = run_doctor(ns.get_bool("rebuild_fts"), backfill, dry_run, imports, None)?;
     for line in crate::config::unknown_keys(None)? {
         out.eprint(&line)?;
+    }
+    if imports {
+        for line in repo_folder_roots(&crate::config::load_config(None)?)? {
+            out.eprint(&line)?;
+        }
     }
     let c = &doc.check;
     out.print(&format!(

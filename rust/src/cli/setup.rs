@@ -19,7 +19,7 @@ pub fn run(ns: &Namespace, out: &mut Out) -> Result<i32, SmError> {
                     "next: if you have task logs or handoffs, set [upkeep] tasklog_roots and handoff_dirs in {}, then run sm import catch-up",
                     get_home(None)?.join("config.toml")
                 ))?,
-                Err(e) => out.eprint(&format!("error: {}", super::one_line(&e.msg)))?,
+                Err(e) => out.eprint(&format!("warning: {}", super::one_line(&e.msg)))?,
             }
         }
         "config" => {
@@ -100,7 +100,7 @@ mod tests {
         );
         assert_eq!(
             stderr,
-            "merge into the \"mcpServers\" object of a project's .mcp.json, or of another MCP client's config\n"
+            "merge into the top level of a project's .mcp.json (or of another MCP client's config): the fragment already holds the \"mcpServers\" key\n"
         );
         let (code, _, stderr) = run(&["hooks", "print", "vim"]);
         assert_eq!(code, 2);

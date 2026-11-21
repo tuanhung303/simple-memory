@@ -486,3 +486,140 @@ fn a_git_that_cannot_start_near_the_deadline_is_no_budget() {
         )
     );
 }
+
+/// The hook's context in the Claude Code shape and in the agy shape, each run checked for exit 0.
+fn contexts(env: &Env, prompt: &str) -> (serde_json::Value, serde_json::Value, String) {
+    let (code, out, err) = env.run(&["hook", "prompt"], &payload(prompt), &[]);
+    assert_eq!(code, 0);
+    let claude = serde_json::from_str::<serde_json::Value>(&out).unwrap();
+    let agy_payload = serde_json::json!({"lastUserInput": prompt}).to_string();
+    let (code, out, _) = env.run(&["hook", "prompt", "--agy"], &agy_payload, &[]);
+    assert_eq!(code, 0);
+    (claude, serde_json::from_str(&out).unwrap(), err)
+}
+
+fn claude_context(text: &str) -> serde_json::Value {
+    serde_json::json!({"hookSpecificOutput": {
+        "hookEventName": "UserPromptSubmit", "additionalContext": text}})
+}
+
+#[test]
+fn a_config_that_does_not_load_turns_recall_off_with_one_line_in_both_shapes() {
+    let env = Env::new("");
+    let cfg = format!("{}/config.toml", env.home());
+    for (config, why) in [
+        (
+            "[upkeep]\ntasklog_roots = 5\n",
+            "upkeep.tasklog_roots must be a list, for example []",
+        ),
+        (
+            "[prompt_hook]\n[prompt_hook]\n",
+            "line 2, column 13: [prompt_hook] is declared twice; keep one header and put the keys under it; fix the line, then run sm config",
+        ),
+        (
+            "[prompt_hook]\nlimit = 4x\n",
+            "line 2, column 10: Expected newline or end of document after a statement; fix the line, then run sm config",
+        ),
+    ] {
+        std::fs::write(&cfg, config).unwrap();
+        let line = format!("sm recall is off: {cfg}: {why}");
+        let (claude, agy, err) = contexts(&env, "is R6 reverted yet");
+        assert_eq!(err, format!("sm hook: {cfg}: {why}\n"));
+        assert_eq!(claude, claude_context(&line));
+        assert_eq!(
+            agy,
+            serde_json::json!({"injectSteps": [{"ephemeralMessage": line}]})
+        );
+    }
+}
+
+/// A `scope:` word in the default bias must name a `[scopes]` path, as a query resolves it: one
+/// that names none turns recall off with one line; a known path, a parent path the table implies,
+/// and no scope word at all leave recall on.
+#[test]
+fn a_default_bias_scope_that_names_no_scopes_path_turns_recall_off() {
+    let base = format!("{OFF}[prompt_hook]\nmodel = \"none\"\nlocal_min_idf = 0.0\n");
+    let env = Env::new(&format!(
+        "{base}[scopes]\nacme = [\"GLX\"]\n[query]\ndefault_bias = [\"recency\", \"scope:acmee\"]\n"
+    ));
+    env.put("Redis eviction policy is allkeys-lru on the cluster");
+    let prompt = "what redis eviction policy do we use on the cluster";
+    let line = format!(
+        "sm recall is off: {}/config.toml: [query] default_bias: unknown scope: acmee; known: acme",
+        env.home()
+    );
+    let (claude, agy, _) = contexts(&env, prompt);
+    assert_eq!(claude, claude_context(&line));
+    assert_eq!(
+        agy,
+        serde_json::json!({"injectSteps": [{"ephemeralMessage": line}]})
+    );
+    let log = std::fs::read_to_string(format!("{}/hook.log", env.home())).unwrap();
+    let rows: Vec<serde_json::Value> = log
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(rows.len(), 2);
+    assert!(
+        rows[0]["local_error"]
+            .as_str()
+            .unwrap()
+            .contains("unknown scope: acmee; known: acme"),
+        "{log}"
+    );
+    for config in [
+        "[scopes]\nacme = [\"GLX\"]\n[query]\ndefault_bias = [\"recency\", \"scope:acme\"]\n",
+        "[scopes]\n\"acme/web\" = [\"GLX\"]\n[query]\ndefault_bias = \"recency, scope:acme\"\n",
+        "[query]\ndefault_bias = [\"recency\", \"decided\"]\n",
+    ] {
+        std::fs::write(
+            format!("{}/config.toml", env.home()),
+            format!("{base}{config}"),
+        )
+        .unwrap();
+        let (claude, agy, err) = contexts(&env, prompt);
+        let text = claude["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap();
+        assert!(
+            text.contains("allkeys-lru") && !text.contains("recall is off"),
+            "{config}: {text}"
+        );
+        assert!(
+            !agy.to_string().contains("recall is off"),
+            "{config}: {agy}"
+        );
+        assert_eq!(err, "", "{config}");
+    }
+}
+
+#[test]
+fn a_refused_default_bias_turns_recall_off_with_one_line_and_keeps_the_log_row() {
+    let env = Env::new(&format!(
+        "{OFF}[prompt_hook]\nmodel = \"none\"\n[query]\ndefault_bias = [\"recency\", \"decisions\"]\n"
+    ));
+    env.put("Kafka consumer lag alert threshold is 5000 messages");
+    let line = format!(
+        "sm recall is off: {}/config.toml: [query] default_bias: Invalid bias 'decisions'; expected one of recency, relevance, executed, verified, decided, client-stated, derived, assumed, prior, planned, fact, decision, learning, episode, task, handoff, or scope:<path>",
+        env.home()
+    );
+    let (claude, agy, _) = contexts(&env, "what is the kafka consumer lag alert threshold");
+    assert_eq!(claude, claude_context(&line));
+    assert_eq!(
+        agy,
+        serde_json::json!({"injectSteps": [{"ephemeralMessage": line}]})
+    );
+    let log = std::fs::read_to_string(format!("{}/hook.log", env.home())).unwrap();
+    let rows: Vec<serde_json::Value> = log
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(rows.len(), 2);
+    assert!(
+        rows[0]["local_error"]
+            .as_str()
+            .unwrap()
+            .starts_with("ValueError: [query] default_bias: Invalid bias 'decisions'"),
+        "{log}"
+    );
+}

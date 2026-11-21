@@ -563,8 +563,8 @@ fn query_with_no_hit_in_scope_prints_only_where_the_matches_are() {
     assert_eq!(
         o.lines(),
         [
-            "missing: another=0",
-            "more: other repos b=1 -> sm query \"another\" --all"
+            "more: other repos b=1 -> sm query \"another\" --all",
+            "missing: another: 1 in other repos -> sm query \"another\" --all"
         ]
     );
     assert_eq!(
@@ -1017,7 +1017,7 @@ fn query_more_says_a_full_pool_also_when_limit_takes_the_whole_pool() {
         c.put(&format!("Pulsar note {i}"), &["--tag", "derived"]);
     }
     let want = [
-        "more: matches may exist beyond the full pool of 50 -> narrow the query: sm query \"nebula\" --repo a --bias recency",
+        "more: matches may exist beyond the full pool of 50 -> narrow the query: add a word, --kind, --tag or --since",
     ];
     for limit in ["50", "100"] {
         let o = c.ok(&[

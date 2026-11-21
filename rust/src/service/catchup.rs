@@ -16,7 +16,7 @@ use crate::py::str::{isdecimal, slice, split, splitlines};
 use crate::py::value::PyValue;
 use crate::service::backup::{backup_age_hours, run_backup};
 use crate::service::capture::{Run, run_process};
-use crate::service::doctor::{import_lag, import_lag_by_repo, tasklog_repo_dirs};
+use crate::service::doctor::{import_lag, import_lag_by_repo, is_missing_entry, tasklog_repo_dirs};
 use crate::service::import_::{cfg_on, cfg2, float_of, run_automemory_import, run_import};
 use crate::store::connect::connect;
 use crate::store::items::retire_item;
@@ -51,7 +51,7 @@ fn automemory(home: &PyPath, cfg: &PyValue, dry_run: bool) -> Result<Counts, SmE
 /// `unreadable:` counts as a failed row.
 fn imports(home: &PyPath, cfg: &PyValue, dry_run: bool) -> Result<Counts, SmError> {
     let conn = connect(get_db_path(Some(home.as_str()))?.as_str(), None)?;
-    let lag = import_lag(&conn, cfg)?;
+    let lag = import_lag(&conn, cfg, Some(home.as_str()))?;
     drop(conn);
     let mut c = counts(&[
         ("not_stored", lag.not_stored.len() as i64),
@@ -177,7 +177,11 @@ pub fn task_id_match(s: &str) -> Option<(String, String, String, String)> {
 /// `_retire_missing`: retire each active task item whose file is gone from every checkout and
 /// branch of its repo.
 fn retire_missing(home: &PyPath, cfg: &PyValue, dry_run: bool) -> Result<Counts, SmError> {
-    let repo_dirs = tasklog_repo_dirs(cfg2(cfg, "upkeep", "tasklog_roots")?, &aliases(cfg))?;
+    let repo_dirs = tasklog_repo_dirs(
+        cfg2(cfg, "upkeep", "tasklog_roots")?,
+        &aliases(cfg),
+        Some(home.as_str()),
+    )?;
     let mut wts: IndexMap<String, Vec<PyPath>> = IndexMap::new();
     let mut refs: IndexMap<String, Vec<String>> = IndexMap::new();
     let mut c = counts(&[
@@ -188,7 +192,7 @@ fn retire_missing(home: &PyPath, cfg: &PyValue, dry_run: bool) -> Result<Counts,
         ("no_folder", 0),
     ]);
     let conn = connect(get_db_path(Some(home.as_str()))?.as_str(), None)?;
-    let (_, missing) = import_lag_by_repo(&conn, cfg)?;
+    let (_, missing) = import_lag_by_repo(&conn, cfg, Some(home.as_str()))?;
     for (repo, source) in &missing {
         let mut stmt = conn
             .prepare("SELECT id FROM items WHERE repo = ? AND source = ? AND status = 'active'")?;
@@ -429,14 +433,12 @@ pub fn run_catchup(home: Option<&str>) -> Result<Option<CatchupRow>, SmError> {
                 Err(e) => {
                     row.ok = false;
                     let msg = split(&e.msg).join(" ");
-                    (
-                        Counts::new(),
-                        Some(format!(
-                            "{}: {}",
-                            e.python_name(),
-                            slice(&msg, None, Some(300))
-                        )),
-                    )
+                    let shown = if is_missing_entry(&e) {
+                        msg
+                    } else {
+                        format!("{}: {}", e.python_name(), slice(&msg, None, Some(300)))
+                    };
+                    (Counts::new(), Some(shown))
                 }
             }
         };

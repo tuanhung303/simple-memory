@@ -1387,12 +1387,12 @@ pub fn catch_up_failure_line(home: &PyPath) -> Result<String, SmError> {
         .first()
         .cloned()
         .unwrap_or_else(|| "no error text".into());
-    let error = slice(
-        &split(&first).join(" "),
-        None,
-        Some(CATCH_UP_ERROR_CHARS as isize),
-    )
-    .to_string();
+    let error = split(&first).join(" ");
+    let error = if error.contains(crate::service::doctor::FIX_ENTRY) {
+        error
+    } else {
+        slice(&error, None, Some(CATCH_UP_ERROR_CHARS as isize)).to_string()
+    };
     let ts = str_of(get_or_none(&row, "ts"));
     let ts = if ts.is_empty() {
         "unknown time".to_string()
@@ -1605,6 +1605,19 @@ pub fn run_prompt_hook(
     } else {
         String::new()
     }];
+    // Every store query reads this value and resolves its scope words, so a refused one turns
+    // recall off.
+    let bias = default_bias_from_cfg(&cfg).and_then(|b| {
+        resolve_scope_biases(&cfg, &b, &[])
+            .map_err(|e| SmError::value(format!("[query] default_bias: {}", e.msg)))
+    });
+    if let Err(e) = bias {
+        notices.push(format!(
+            "sm recall is off: {}: {}",
+            home_path.join("config.toml"),
+            e.msg
+        ));
+    }
     let mut row = Row::new();
     row.insert("harness".into(), s(harness));
     let short = slice(&session_id, None, Some(8));

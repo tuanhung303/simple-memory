@@ -267,7 +267,12 @@ pub fn validate_as_of(
         Some(v) if !strip(v).is_empty() => v,
         _ => return Err(SmError::value("Invalid ISO 8601 timestamp: empty value")),
     };
-    let invalid = || SmError::value(format!("Invalid ISO 8601 timestamp {}", repr(value)));
+    let invalid = || {
+        SmError::value(format!(
+            "Invalid ISO 8601 timestamp {}, for example 2026-11-21T09:30:00Z",
+            repr(value)
+        ))
+    };
     let s0 = strip(value);
     let replaced = AS_OF_WORD_RE.replace(s0, "");
     let mut s: String = strip(&replaced).to_string();
@@ -757,7 +762,9 @@ mod tests {
             let e = validate_as_of(Some(bad), false, false).unwrap_err();
             assert_eq!(
                 e.python_text(),
-                format!("ValueError: Invalid ISO 8601 timestamp '{bad}'")
+                format!(
+                    "ValueError: Invalid ISO 8601 timestamp '{bad}', for example 2026-11-21T09:30:00Z"
+                )
             );
         }
         assert!(validate_as_of(Some("2026-10-18T10:10:00Z (extra)"), false, false).is_err());
@@ -785,7 +792,7 @@ mod tests {
         assert!(v("2026-02-29", false).is_err());
         assert_eq!(
             v("0000-01-01", false).unwrap_err(),
-            "ValueError: Invalid ISO 8601 timestamp '0000-01-01'"
+            "ValueError: Invalid ISO 8601 timestamp '0000-01-01', for example 2026-11-21T09:30:00Z"
         );
         assert_eq!(
             v("2024-02-29", false).unwrap(),

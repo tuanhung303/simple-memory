@@ -1807,7 +1807,10 @@ fn service_doctor_imports_fails_on_missing_root() {
     assert!(
         err.msg
             .starts_with("upkeep.tasklog_roots entry not found: ")
-            && err.msg.ends_with("nope"),
+            && err.msg.ends_with(&format!(
+                "nope; fix or remove it in [upkeep] tasklog_roots in {}/config.toml",
+                tmp.display()
+            )),
         "{err}"
     );
     write(
@@ -1820,7 +1823,11 @@ fn service_doctor_imports_fails_on_missing_root() {
     let err = run_doctor(false, false, false, true, h).unwrap_err();
     assert!(err.class == "FileNotFoundError", "{err}");
     assert!(
-        err.msg.starts_with("upkeep.handoff_dirs entry not found: ") && err.msg.ends_with("gone"),
+        err.msg.starts_with("upkeep.handoff_dirs entry not found: ")
+            && err.msg.ends_with(&format!(
+                "gone; fix or remove it in [upkeep] handoff_dirs in {}/config.toml",
+                tmp.display()
+            )),
         "{err}"
     );
 }
@@ -2247,6 +2254,7 @@ fn imports_and_doctor_alias_the_repo_a_key_or_folder_names() {
     let dirs = tasklog_repo_dirs(
         &PyValue::List(vec![PyValue::Str(s(code.to_str().unwrap()))]),
         &aliases,
+        home.to_str(),
     )
     .unwrap();
     assert_eq!(dirs.len(), 1);
@@ -2484,7 +2492,7 @@ fn refused_yaml_and_the_next_file_imported(yaml: &str, problem: &str) {
         (code, err.as_str()),
         (
             0,
-            "catch-up: 1 file not imported; sm doctor --imports lists it\n"
+            "catch-up: 1 task log or handoff not imported; sm doctor --imports lists it\n"
         )
     );
     assert!(
@@ -2679,7 +2687,7 @@ fn task_log_in_year_zero_utc_is_named_and_the_rest_imported(as_of: &str) {
         (code, err.as_str()),
         (
             0,
-            "catch-up: 1 file not imported; sm doctor --imports lists it\n"
+            "catch-up: 1 task log or handoff not imported; sm doctor --imports lists it\n"
         ),
         "{out}"
     );
@@ -2755,6 +2763,31 @@ fn note_with_a_field_that_cannot_convert_is_unreadable(note_extra: &str) {
     );
 }
 
+/// Catch-up's closing count covers the task logs and handoffs it could not import and says so;
+/// an unreadable memory note is counted on the `automemory:` line, and doctor lists both.
+#[test]
+fn catch_up_names_the_kinds_its_not_imported_count_covers() {
+    let f = odd_files("results:\n\t- tab\n", "modified: 0001-01-01\n");
+    let (_, out, _) = sm_east(&f, &["doctor", "--imports"]);
+    assert_eq!(
+        out.lines()
+            .filter(|l| l.starts_with("unreadable: "))
+            .count(),
+        2,
+        "{out}"
+    );
+    let (code, out, err) = sm_east(&f, &["import", "catch-up"]);
+    assert_eq!(
+        (code, err.as_str()),
+        (
+            0,
+            "catch-up: 1 task log or handoff not imported; sm doctor --imports lists it\n"
+        ),
+        "{out}"
+    );
+    assert!(out.contains(" unreadable=1 "), "{out}");
+}
+
 #[test]
 fn a_note_modified_in_year_one_local_time_is_unreadable() {
     note_with_a_field_that_cannot_convert_is_unreadable("modified: 0001-01-01\n");
@@ -2801,7 +2834,7 @@ fn a_named_import_of_a_folder_skips_each_bad_file_and_stores_the_rest() {
         (code, err.as_str()),
         (
             0,
-            "catch-up: 2 files not imported; sm doctor --imports lists them\n"
+            "catch-up: 2 task logs or handoffs not imported; sm doctor --imports lists them\n"
         ),
         "{out}"
     );
@@ -3012,7 +3045,7 @@ fn a_handoff_written_in_year_one_local_time_is_named_and_the_rest_imported() {
         (code, err.as_str()),
         (
             0,
-            "catch-up: 1 file not imported; sm doctor --imports lists it\n"
+            "catch-up: 1 task log or handoff not imported; sm doctor --imports lists it\n"
         ),
         "{out}"
     );

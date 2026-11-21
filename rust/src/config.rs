@@ -246,8 +246,8 @@ fn read_config(home: Option<&str>) -> Result<Option<(PyPath, PyValue)>, SmError>
 
 /// `load_config(home)`: DEFAULTS, each section updated by the file's table of that name (a key
 /// the file sets keeps the default's place; a new key goes last). Other sections are dropped. A
-/// key whose default is a list refuses any other value, except the comma-separated string that
-/// `[query] default_bias` has always taken.
+/// key whose default is a list reads a string as a list of that one string (`[query] default_bias`
+/// keeps the comma-separated string it has always taken) and refuses any other value.
 pub fn load_config(home: Option<&str>) -> Result<PyValue, SmError> {
     let mut default = defaults();
     let Some((cfg_path, raw)) = read_config(home)? else {
@@ -262,18 +262,17 @@ pub fn load_config(home: Option<&str>) -> Result<PyValue, SmError> {
             };
             for (k, v) in over {
                 match base.iter_mut().find(|(bk, _)| bk.key_eq(k)) {
-                    Some((_, PyValue::List(_)))
-                        if !matches!(v, PyValue::List(_))
-                            && !(name == "query"
-                                && k.key_eq(&s("default_bias"))
-                                && matches!(v, PyValue::Str(_))) =>
+                    Some((_, slot @ PyValue::List(_)))
+                        if matches!(v, PyValue::Str(_))
+                            && !(name == "query" && k.key_eq(&s("default_bias"))) =>
                     {
-                        let example = match v {
-                            PyValue::Str(_) => toml_value(&PyValue::List(vec![v.clone()]))?,
-                            _ => "[]".into(),
-                        };
+                        *slot = PyValue::List(vec![v.clone()]);
+                    }
+                    Some((_, PyValue::List(_)))
+                        if !matches!(v, PyValue::List(_) | PyValue::Str(_)) =>
+                    {
                         return Err(SmError::value(format!(
-                            "{cfg_path}: {name}.{} must be a list, for example {example}",
+                            "{cfg_path}: {name}.{} must be a list, for example []",
                             k.py_str()
                         )));
                     }
@@ -286,18 +285,44 @@ pub fn load_config(home: Option<&str>) -> Result<PyValue, SmError> {
     Ok(default)
 }
 
-/// One warning line per section or key config.toml sets that DEFAULTS does not name. A table whose
-/// default is empty (`[repo_aliases]`, `[scopes]`, `[prompt_hook.projects]`) takes any key.
+/// One warning line per section or key config.toml sets that DEFAULTS does not name, and per
+/// `[query] default_bias` word that a query would refuse. A table whose default is empty
+/// (`[repo_aliases]`, `[scopes]`, `[prompt_hook.projects]`) takes any key.
 pub fn unknown_keys(home: Option<&str>) -> Result<Vec<String>, SmError> {
     let Some((path, raw)) = read_config(home)? else {
         return Ok(Vec::new());
     };
     let mut found = Vec::new();
     unknown_in(&raw, &defaults(), "", &mut found);
-    Ok(found
+    let mut lines: Vec<String> = found
         .into_iter()
         .map(|what| format!("warning: {path}: unknown {what}; sm config prints the keys in effect"))
-        .collect())
+        .collect();
+    let words = match get(&raw, "query").and_then(|q| get(q, "default_bias")) {
+        Some(PyValue::Str(v)) => v.split(',').map(|w| s(w.trim())).collect(),
+        Some(PyValue::List(items)) => items.clone(),
+        _ => Vec::new(),
+    };
+    for word in words {
+        let bias = match &word {
+            PyValue::Str(w) => crate::core::rank::parse_bias(w).ok(),
+            _ => None,
+        };
+        match bias {
+            // A scope word must name a [scopes] path, as a query resolves it.
+            Some(b) => {
+                if let Err(e) = crate::service::query::resolve_scope_biases(&raw, &b, &[]) {
+                    lines.push(format!("warning: {path}: query.default_bias: {}", e.msg));
+                }
+            }
+            None => lines.push(format!(
+                "warning: {path}: query.default_bias: {} is not a bias; use {}, or scope:<path>",
+                toml_value(&word).unwrap_or_else(|_| word.py_str()),
+                crate::core::rank::bias_values().join(", ")
+            )),
+        }
+    }
+    Ok(lines)
 }
 
 fn unknown_in(set: &PyValue, known: &PyValue, prefix: &str, found: &mut Vec<String>) {
@@ -495,18 +520,23 @@ pub fn scopes(cfg: &PyValue) -> Result<Scopes, SmError> {
 }
 
 /// The matchers of each path and of every path below it, deduplicated in first-seen order; an
-/// unknown path is an `UNKNOWN_SCOPE` error that lists the known ones.
+/// unknown path is an `UNKNOWN_SCOPE` error that lists the known ones, or with no `[scopes]`
+/// table, names the config.toml to add one to.
 pub fn scope_matchers<S: AsRef<str>>(scopes: &Scopes, paths: &[S]) -> Result<Vec<String>, SmError> {
     let mut out = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for p in paths.iter().map(AsRef::as_ref) {
         if !scopes.iter().any(|(k, _)| k == p) {
             let known: Vec<&str> = scopes.iter().map(|(k, _)| k.as_str()).collect();
-            return Err(SmError::new(
-                Base::Value,
-                UNKNOWN_SCOPE,
-                format!("unknown scope: {p}; known: {}", known.join(", ")),
-            ));
+            let msg = if known.is_empty() {
+                format!(
+                    "unknown scope: {p}; {} has no [scopes] table (README: Multi-repo scopes and maintenance)",
+                    get_home(None)?.join("config.toml")
+                )
+            } else {
+                format!("unknown scope: {p}; known: {}", known.join(", "))
+            };
+            return Err(SmError::new(Base::Value, UNKNOWN_SCOPE, msg));
         }
         let below = format!("{p}/");
         for (k, m) in scopes {
@@ -1231,7 +1261,8 @@ mod tests {
         // A value that is not a list stops at load, so it is never walked as an iterable.
         assert_eq!(got("07:32"), not_a_list("[]"));
         assert_eq!(got("5"), not_a_list("[]"));
-        assert_eq!(got("\"ab\""), not_a_list("[\"ab\"]"));
+        // a string for a list key is read as a one-item list
+        assert_eq!(got("\"ab\""), Ok(vec!["ab".to_string()]));
         assert_eq!(got("{ \"/r\" = 1 }"), not_a_list("[]"));
     }
 
@@ -1298,7 +1329,7 @@ mod tests {
     }
 
     #[test]
-    fn every_list_key_refuses_another_type_at_load() {
+    fn every_list_key_reads_a_string_as_one_item_and_refuses_another_type_at_load() {
         let PyValue::Dict(sections) = defaults() else {
             panic!("defaults is a dict")
         };
@@ -1326,19 +1357,29 @@ mod tests {
                         Some(&s("/a b"))
                     );
                 } else {
+                    // a string for a list key is read as a one-item list; the refusal of a string
+                    // stopped every command for a config that loaded before
+                    let got = load_config(h.path().to_str()).unwrap();
+                    let got = get(get(&got, &section.py_str()).unwrap(), &key.py_str());
+                    assert_eq!(got, Some(&PyValue::List(vec![s("/a b")])), "{cfg}");
+                }
+                for other in ["5", "true", "{ a = 1 }"] {
+                    let h = home_with(&format!(
+                        "[{}]\n{} = {other}\n",
+                        section.py_str(),
+                        key.py_str()
+                    ));
                     assert_eq!(
-                        load_config(h.path().to_str()).unwrap_err().python_text(),
-                        format!("ValueError: {cfg}: {name} must be a list, for example [\"/a b\"]")
+                        load_config(h.path().to_str()).unwrap_err().msg,
+                        format!(
+                            "{}/config.toml: {name} must be a list, for example []",
+                            h.path().display()
+                        )
                     );
                 }
-                let h = home_with(&format!("[{}]\n{} = 5\n", section.py_str(), key.py_str()));
-                assert_eq!(
-                    load_config(h.path().to_str()).unwrap_err().msg,
-                    format!(
-                        "{}/config.toml: {name} must be a list, for example []",
-                        h.path().display()
-                    )
-                );
+                // the example in the message loads when pasted
+                let h = home_with(&format!("[{}]\n{} = []\n", section.py_str(), key.py_str()));
+                assert!(load_config(h.path().to_str()).is_ok(), "{name}");
                 checked.push(name);
             }
         }

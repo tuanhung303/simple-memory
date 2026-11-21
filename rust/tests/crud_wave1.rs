@@ -501,7 +501,7 @@ fn catchup_does_not_resurrect_manually_retired_tasklog_handoff_or_automemory() {
     )
     .unwrap();
     let cfg = simple_memory::config::load_config(Some(h)).unwrap();
-    let lag_fp = import_lag(&conn, &cfg).unwrap();
+    let lag_fp = import_lag(&conn, &cfg, Some(h)).unwrap();
     assert_eq!(
         lag_fp.not_stored,
         vec![tl_file.to_str().unwrap().to_string()]
@@ -798,7 +798,12 @@ fn amend_handles_task_handoff_automemory_legacy_and_turn_sources() {
 
     // Neither tasklog re-import nor automemory re-sync reverts the amendments.
     let cfg = simple_memory::config::load_config(Some(h)).unwrap();
-    assert!(import_lag(&conn, &cfg).unwrap().not_stored.is_empty());
+    assert!(
+        import_lag(&conn, &cfg, Some(h))
+            .unwrap()
+            .not_stored
+            .is_empty()
+    );
     let tl_re = run_import("tasklog", tl_file.to_str().unwrap(), false, false, Some(h)).unwrap();
     assert_eq!((tl_re.inserted, tl_re.deduped), (0, 1));
     let am_re = run_automemory_import(None, false, Some(h)).unwrap();
@@ -1037,7 +1042,7 @@ fn amend_dedupe_collision_noop_formatting_preservation_and_errors() {
             )
             .unwrap_err()
         ),
-        "ValueError: Tag 'verified' needs non-empty evidence"
+        "ValueError: Tag 'verified' needs non-empty evidence: a command, a sha, a file:line or a quote"
     );
 
     // 8) Blank repo / title / body rejected

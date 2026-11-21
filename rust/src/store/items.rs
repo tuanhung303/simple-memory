@@ -1744,7 +1744,7 @@ mod tests {
         };
         assert_eq!(
             err_text(put_item(&conn, &no_ev, None)),
-            "ValueError: Tag 'verified' needs non-empty evidence"
+            "ValueError: Tag 'verified' needs non-empty evidence: a command, a sha, a file:line or a quote"
         );
         assert!(
             err_text(put_item(&conn, &it("m_3", "r", "b3", "n/a"), None))
@@ -1763,7 +1763,7 @@ mod tests {
         };
         assert_eq!(
             err_text(put_item(&conn, &date, None)),
-            "ValueError: Invalid ISO 8601 timestamp '2026-02-30'"
+            "ValueError: Invalid ISO 8601 timestamp '2026-02-30', for example 2026-11-21T09:30:00Z"
         );
         assert_eq!(
             put_item(&conn, &it("legacy:memories:1", "r", "b6", "n/a"), None).unwrap(),
@@ -1827,7 +1827,7 @@ mod tests {
             vec![
                 "m_bad_tag: Invalid tag 'n/a'; expected one of executed, verified, decided, client-stated, derived, assumed, prior, planned",
                 "m_bad_kind: Invalid kind 'not_a_kind'; expected one of fact, decision, learning, episode, task, handoff",
-                "m_bad_as_of: Invalid ISO 8601 timestamp 'not-an-iso-timestamp'",
+                "m_bad_as_of: Invalid ISO 8601 timestamp 'not-an-iso-timestamp', for example 2026-11-21T09:30:00Z",
             ]
         );
         assert_eq!(get_item(&conn, "m_bad_tag").unwrap(), None);

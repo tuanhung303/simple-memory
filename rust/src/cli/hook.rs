@@ -5,6 +5,7 @@ use std::io::Read;
 use crate::cli::query::{
     HOOK_REFS_CHARS, HOOK_TITLE_CHARS, compact_refs, refs_without_source, shlex_quote,
 };
+use crate::config::load_config;
 use crate::core::item::Item;
 use crate::error::SmError;
 use crate::py;
@@ -104,11 +105,18 @@ pub fn hook_prompt(agy: bool, out: &mut Out) -> Result<i32, SmError> {
         match read_stdin().and_then(|text| hook_context(&text, agy, None, &subprocess_run)) {
             Ok(c) => c,
             Err(e) => {
-                out.eprint(&format!(
-                    "sm hook: {}",
-                    py::str::slice(&py::str::split(&e.msg).join(" "), None, Some(200))
-                ))?;
-                String::new()
+                let msg = py::str::split(&e.msg).join(" ");
+                // A config.toml that does not load turns recall off: say so where the agent reads.
+                if load_config(None).err().as_ref() == Some(&e) {
+                    out.eprint(&format!("sm hook: {msg}"))?;
+                    format!("sm recall is off: {msg}")
+                } else {
+                    out.eprint(&format!(
+                        "sm hook: {}",
+                        py::str::slice(&msg, None, Some(200))
+                    ))?;
+                    String::new()
+                }
             }
         };
     let s = |v: &str| PyValue::Str(v.to_string());

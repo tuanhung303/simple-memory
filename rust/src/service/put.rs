@@ -137,7 +137,7 @@ mod tests {
         );
         assert_eq!(
             err("Verified without evidence", &put(h, "verified", |_| {})),
-            "ValueError: Tag 'verified' needs non-empty evidence"
+            "ValueError: Tag 'verified' needs non-empty evidence: a command, a sha, a file:line or a quote"
         );
         assert_eq!(
             err(" \n ", &put(h, "decided", |_| {})),
@@ -149,7 +149,7 @@ mod tests {
         );
         assert_eq!(
             err("Body", &put(h, "decided", |a| a.as_of = "not-a-date")),
-            "ValueError: Invalid ISO 8601 timestamp 'not-a-date'"
+            "ValueError: Invalid ISO 8601 timestamp 'not-a-date', for example 2026-11-21T09:30:00Z"
         );
 
         let body = "R5 queue lag café schema sync";

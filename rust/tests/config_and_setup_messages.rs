@@ -54,10 +54,12 @@ fn a_config_that_does_not_parse_gives_the_same_message_on_every_surface() {
         assert_eq!(err, format!("error: {want}\n"), "{args:?}");
     }
     let (code, out, err) = sm_stdin(&home, &["hook", "prompt"], PROMPT);
-    assert_eq!((code, out.as_str()), (0, ""));
-    // The hook keeps the first 200 chars of a message (cli/hook.rs).
-    let cut: String = want.chars().take(200).collect();
-    assert_eq!(err, format!("sm hook: {cut}\n"));
+    let hook: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(
+        (code, &hook["hookSpecificOutput"]["additionalContext"]),
+        (0, &serde_json::json!(format!("sm recall is off: {want}")))
+    );
+    assert_eq!(err, format!("sm hook: {want}\n"));
     let rpc = [
         r#"{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}"#,
         r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
@@ -76,15 +78,220 @@ fn a_config_that_does_not_parse_gives_the_same_message_on_every_surface() {
 fn doctor_refuses_a_list_key_of_another_type() {
     let (_d, home) = scratch();
     let cfg = home.join("config.toml");
-    write(&cfg, "[upkeep]\ntasklog_roots = \"/x/work\"\n");
+    write(&cfg, "[upkeep]\ntasklog_roots = 5\n");
     let (code, out, err) = sm(&home, &["doctor"]);
     assert_eq!((code, out.as_str()), (1, ""));
     assert_eq!(
         err,
         format!(
-            "error: {}: upkeep.tasklog_roots must be a list, for example [\"/x/work\"]\n",
+            "error: {}: upkeep.tasklog_roots must be a list, for example []\n",
             cfg.display()
         )
+    );
+}
+
+#[test]
+fn a_string_for_a_list_key_is_read_as_a_one_item_list_by_every_command() {
+    let (d, home) = scratch();
+    std::fs::create_dir_all(d.path().join(".claude/projects")).unwrap();
+    let (logs, notes) = (d.path().join("logs"), d.path().join("notes"));
+    std::fs::create_dir_all(&notes).unwrap();
+    write(
+        &logs.join("anvil/docs/tasklog/2026-11-01/090000-aaaa-t.yaml"),
+        "id: 20261101-090000-aaaa-t\ntitle: Walrus rollout plan\nas_of: 2026-11-01T09:00:00+00:00\nresults:\n  - done walrus rollout\n",
+    );
+    write(
+        &home.join("config.toml"),
+        &format!(
+            "[repos]\nroots = \"~/code\"\n[prompt_hook]\nmodel = \"none\"\nextra_stopwords = \"pool\"\n\
+             [catch_up]\nenabled = false\n[upkeep]\ntasklog_roots = \"{}\"\nhandoff_dirs = \"{}\"\n",
+            logs.display(),
+            notes.display()
+        ),
+    );
+    let (code, out, err) = sm(&home, &["config"]);
+    assert_eq!((code, err.as_str()), (0, ""));
+    for line in [
+        "roots = [\"~/code\"]".to_string(),
+        "extra_stopwords = [\"pool\"]".to_string(),
+        format!("tasklog_roots = [\"{}\"]", logs.display()),
+        format!("handoff_dirs = [\"{}\"]", notes.display()),
+    ] {
+        assert!(out.lines().any(|l| l == line), "{line}\n{out}");
+    }
+    let (code, out, err) = sm(&home, &["import", "catch-up"]);
+    assert_eq!(code, 0, "{out}{err}");
+    assert!(
+        out.contains("imports: ok not_stored=1 inserted=1 "),
+        "{out}"
+    );
+    common::put(
+        &home,
+        &[
+            "--tag",
+            "decided",
+            "--repo",
+            "global",
+            "Pool size is 16 sockets",
+        ],
+    );
+    let (code, out, _) = sm(&home, &["query", "walrus", "--all"]);
+    assert_eq!(code, 0);
+    assert!(out.contains("Walrus rollout plan"), "{out}");
+    let (code, _, err) = sm_stdin(
+        &home,
+        &["hook", "prompt"],
+        r#"{"prompt":"what pool size do the workers use","session_id":"s1","cwd":"/tmp","hook_event_name":"UserPromptSubmit"}"#,
+    );
+    assert_eq!((code, err.as_str()), (0, ""));
+    let log = std::fs::read_to_string(home.join("hook.log")).unwrap();
+    let row: serde_json::Value = serde_json::from_str(log.lines().last().unwrap()).unwrap();
+    assert_eq!(row["query"], "size", "{row}");
+}
+
+#[test]
+fn a_bad_default_bias_word_is_named_by_config_doctor_and_catch_up_and_put_still_works() {
+    let (d, home) = scratch();
+    std::fs::create_dir_all(d.path().join(".claude/projects")).unwrap();
+    let cfg = home.join("config.toml");
+    let want = format!(
+        "warning: {}: query.default_bias: \"decisions\" is not a bias; use recency, relevance, executed, verified, \
+         decided, client-stated, derived, assumed, prior, planned, fact, decision, learning, episode, task, handoff, \
+         or scope:<path>\n",
+        cfg.display()
+    );
+    for (value, body) in [
+        ("[\"recency\", \"decisions\"]", "Pool size is 16 sockets"),
+        ("\"recency, decisions\"", "Queue lag alert at 5000"),
+    ] {
+        write(
+            &cfg,
+            &format!("[catch_up]\nenabled = false\n[query]\ndefault_bias = {value}\n"),
+        );
+        for args in [&["config"][..], &["doctor"], &["import", "catch-up"]] {
+            let (code, _, err) = sm(&home, args);
+            assert_eq!((code, err.as_str()), (0, want.as_str()), "{value} {args:?}");
+        }
+        let (code, _, err) = sm(
+            &home,
+            &["put", "--tag", "decided", "--repo", "global", body],
+        );
+        assert_eq!((code, err.as_str()), (0, ""), "{value}");
+    }
+    write(
+        &cfg,
+        "[scopes]\n\"acme/web\" = [\"GLX\"]\n[query]\ndefault_bias = [\"Recency\", \"scope:acme/web\"]\n",
+    );
+    assert_eq!(sm(&home, &["config"]).2, "");
+    write(&cfg, "[query]\ndefault_bias = [\"recency\", 5]\n");
+    assert_eq!(sm(&home, &["config"]).2, want.replace("\"decisions\"", "5"));
+}
+
+/// A `scope:` word in the default bias that names no `[scopes]` path stops every query, so
+/// config, doctor and catch-up warn with the query's own message; a path the table holds or
+/// implies gets no warning, and the query runs.
+#[test]
+fn a_default_bias_scope_the_query_refuses_is_named_by_config_doctor_and_catch_up() {
+    let (d, home) = scratch();
+    std::fs::create_dir_all(d.path().join(".claude/projects")).unwrap();
+    common::put(
+        &home,
+        &[
+            "--tag",
+            "decided",
+            "--repo",
+            "global",
+            "Pool size is 16 sockets",
+        ],
+    );
+    let cfg = home.join("config.toml");
+    let no_table = format!(
+        "unknown scope: acmee; {} has no [scopes] table (README: Multi-repo scopes and maintenance)",
+        cfg.display()
+    );
+    for (scopes, value, why) in [
+        (
+            "[scopes]\nacme = [\"GLX\"]\n",
+            "[\"recency\", \"scope:acmee\"]",
+            "unknown scope: acmee; known: acme",
+        ),
+        (
+            "[scopes]\nacme = [\"GLX\"]\n",
+            "\"recency, scope:acmee\"",
+            "unknown scope: acmee; known: acme",
+        ),
+        ("", "[\"recency\", \"scope:acmee\"]", no_table.as_str()),
+    ] {
+        write(
+            &cfg,
+            &format!("[catch_up]\nenabled = false\n{scopes}[query]\ndefault_bias = {value}\n"),
+        );
+        let (code, _, err) = sm(&home, &["query", "pool", "--all"]);
+        assert_eq!(
+            (code, err.as_str()),
+            (2, format!("{why}\n").as_str()),
+            "{value}"
+        );
+        let want = format!("warning: {}: query.default_bias: {why}\n", cfg.display());
+        for args in [&["config"][..], &["doctor"], &["import", "catch-up"]] {
+            let (code, _, err) = sm(&home, args);
+            assert_eq!((code, err.as_str()), (0, want.as_str()), "{value} {args:?}");
+        }
+    }
+    for (scopes, value) in [
+        (
+            "[scopes]\nacme = [\"GLX\"]\n",
+            "[\"recency\", \"scope:acme\"]",
+        ),
+        (
+            "[scopes]\n\"acme/web\" = [\"GLX\"]\n",
+            "\"recency, scope:acme\"",
+        ),
+        ("", "[\"recency\", \"decided\"]"),
+    ] {
+        write(
+            &cfg,
+            &format!("[catch_up]\nenabled = false\n{scopes}[query]\ndefault_bias = {value}\n"),
+        );
+        let (code, out, err) = sm(&home, &["query", "pool", "--all"]);
+        assert_eq!((code, err.as_str()), (0, ""), "{value}");
+        assert!(out.contains("Pool size is 16 sockets"), "{value}: {out}");
+        for args in [&["config"][..], &["doctor"], &["import", "catch-up"]] {
+            let (code, _, err) = sm(&home, args);
+            assert_eq!((code, err.as_str()), (0, ""), "{value} {args:?}");
+        }
+    }
+}
+
+#[test]
+fn every_scope_reader_names_the_config_file_when_it_has_no_scopes_table() {
+    let (_d, home) = scratch();
+    let want = format!(
+        "unknown scope: acme; {}/config.toml has no [scopes] table (README: Multi-repo scopes and maintenance)",
+        home.display()
+    );
+    for args in [
+        &["query", "pool", "--in", "acme"][..],
+        &["list", "--in", "acme"],
+    ] {
+        let (code, out, err) = sm(&home, args);
+        assert_eq!(
+            (code, out.as_str(), err),
+            (2, "", format!("{want}\n")),
+            "{args:?}"
+        );
+    }
+    let rpc = [
+        r#"{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}"#,
+        r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"memory_query","arguments":{"query":"pool","in":"acme"}}}"#,
+    ]
+    .join("\n");
+    let (_, out, _) = sm_stdin(&home, &["mcp"], &format!("{rpc}\n"));
+    let reply: serde_json::Value = serde_json::from_str(out.lines().nth(1).unwrap()).unwrap();
+    assert_eq!(
+        reply["result"]["content"][0]["text"],
+        format!("error: {want}")
     );
 }
 
@@ -229,7 +436,7 @@ fn a_damaged_store_names_the_newest_backup_and_how_to_restore_it() {
             lines[1..],
             [
                 format!(
-                    "{h}/memory.db looks damaged; to restore the newest backup, {}:",
+                    "{h}/memory.db looks damaged; to restore the newest backup that passes quick_check, {}:",
                     backup.display()
                 ),
                 format!("  1. mkdir -p {h}/damaged && mv {h}/memory.db* {h}/damaged/"),
@@ -290,6 +497,320 @@ fn a_damaged_file_that_is_not_the_store_gives_no_restore_steps() {
     write(&old, "not a database at all, only some text");
     let (code, _, err) = sm(&home, &["import", "legacy", old.to_str().unwrap()]);
     assert_eq!((code, err.as_str()), (1, "error: file is not a database\n"));
+}
+
+/// The names in `<home>/backups`, sorted.
+fn backup_names(home: &Path) -> Vec<String> {
+    let mut v: Vec<String> = std::fs::read_dir(home.join("backups"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    v.sort();
+    v
+}
+
+/// A store with 30 items and one good backup under an old name, so no new copy can share it.
+fn store_with_a_good_backup() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+    let (d, home) = scratch();
+    for i in 0..30 {
+        let body = format!("pool limit {i} is the item body with some words in it");
+        common::put(&home, &["--kind", "fact", "--tag", "derived", &body]);
+    }
+    let (code, out, _) = sm(&home, &["backup"]);
+    assert_eq!(code, 0, "{out}");
+    let made = home.join("backups").join(&backup_names(&home)[0]);
+    let good = home.join("backups/memory-20200101-000000-auto.db");
+    std::fs::rename(made, &good).unwrap();
+    (d, home, good)
+}
+
+#[test]
+fn a_backup_of_a_damaged_store_keeps_no_copy_and_doctor_names_a_backup_that_passes() {
+    let (_d, home, good) = store_with_a_good_backup();
+    let db = home.join("memory.db");
+    damage(&db);
+    let (code, _, err) = sm(&home, &["backup", "--keep", "1"]);
+    assert_eq!(code, 1, "{err}");
+    assert_eq!(backup_names(&home), ["memory-20200101-000000-auto.db"]);
+    let h = home.display();
+    let steps = |backup: &Path| {
+        vec![
+            format!(
+                "{h}/memory.db looks damaged; to restore the newest backup that passes quick_check, {}:",
+                backup.display()
+            ),
+            format!("  1. mkdir -p {h}/damaged && mv {h}/memory.db* {h}/damaged/"),
+            format!("  2. cp {} {h}/memory.db", backup.display()),
+        ]
+    };
+    let (code, _, err) = sm(&home, &["doctor"]);
+    assert_eq!(code, 1);
+    assert_eq!(
+        err.lines().skip(1).collect::<Vec<_>>(),
+        steps(&good),
+        "{err}"
+    );
+    // A damaged copy that an older build left under the normal name is passed over.
+    std::fs::copy(&db, home.join("backups/memory-20990101-000000-auto.db")).unwrap();
+    let (_, _, err) = sm(&home, &["doctor"]);
+    assert_eq!(
+        err.lines().skip(1).collect::<Vec<_>>(),
+        steps(&good),
+        "{err}"
+    );
+    std::fs::copy(&db, &good).unwrap();
+    let (code, _, err) = sm(&home, &["doctor"]);
+    assert_eq!(code, 1);
+    assert_eq!(
+        err.lines().skip(1).collect::<Vec<_>>(),
+        [format!(
+            "{h}/memory.db looks damaged and no backup in {h}/backups passes quick_check"
+        )],
+        "{err}"
+    );
+}
+
+/// Name, size and modified time of each file in `<home>/backups`.
+fn backup_listing(home: &Path) -> Vec<(String, u64, std::time::SystemTime)> {
+    let mut v: Vec<_> = std::fs::read_dir(home.join("backups"))
+        .unwrap()
+        .map(|e| {
+            let e = e.unwrap();
+            let m = e.metadata().unwrap();
+            let name = e.file_name().into_string().unwrap();
+            (name, m.len(), m.modified().unwrap())
+        })
+        .collect();
+    v.sort();
+    v
+}
+
+#[test]
+fn doctor_checks_a_backup_copy_without_writing_to_it() {
+    use std::os::unix::fs::PermissionsExt;
+    let (d, home, _) = store_with_a_good_backup();
+    // SQLite reads `%`, `?` and `#` in a file URI as escapes, a query and a fragment.
+    let home = {
+        let moved = d.path().join("h#1%41?x");
+        std::fs::rename(&home, &moved).unwrap();
+        moved
+    };
+    let good = home.join("backups/memory-20200101-000000-auto.db");
+    damage(&home.join("memory.db"));
+    let h = home.display();
+    let want = format!(
+        "{h}/memory.db looks damaged; to restore the newest backup that passes quick_check, {}:",
+        good.display()
+    );
+    for mode in [0o644, 0o444] {
+        std::fs::set_permissions(&good, std::fs::Permissions::from_mode(mode)).unwrap();
+        let before = backup_listing(&home);
+        let (code, _, err) = sm(&home, &["doctor"]);
+        assert_eq!(code, 1);
+        assert_eq!(err.lines().nth(1), Some(want.as_str()), "{mode:o}: {err}");
+        assert_eq!(backup_listing(&home), before, "{mode:o}");
+    }
+}
+
+/// An index whose root page holds no cells: every SQL statement still runs, and only
+/// `quick_check` finds the rows missing from the index.
+#[test]
+fn a_backup_whose_copy_fails_quick_check_prints_two_plain_lines() {
+    let (_d, home, _good) = store_with_a_good_backup();
+    let db = home.join("memory.db");
+    let root: i64 = {
+        let c = common::open(&home);
+        c.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        c.query_row(
+            "SELECT rootpage FROM sqlite_master WHERE type = 'index' AND tbl_name = 'items' LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+    let mut bytes = std::fs::read(&db).unwrap();
+    let at = (root as usize - 1) * 4096;
+    bytes[at + 3] = 0;
+    bytes[at + 4] = 0;
+    std::fs::write(&db, bytes).unwrap();
+    let (code, out, err) = sm(&home, &["backup"]);
+    let h = home.display();
+    assert_eq!(
+        (code, out.as_str(), err),
+        (
+            1,
+            "",
+            format!(
+                "error: the backup copy of {h}/memory.db does not pass quick_check, so it was not kept\n\
+                 {h}/memory.db looks damaged; run sm doctor\n"
+            )
+        )
+    );
+    assert_eq!(backup_names(&home), ["memory-20200101-000000-auto.db"]);
+}
+
+/// Two `sm backup --keep 1` runs on one store with the clock pinned to one second: each run
+/// copies to a file of its own, so both pass, and `backups/` holds only that second's copy. Both
+/// runs rotate out the same 200 older copies, so one finds some of them already gone.
+#[cfg(feature = "parity")]
+#[test]
+fn two_backups_in_one_second_both_pass_and_leave_one_copy() {
+    let (d, home, good) = store_with_a_good_backup();
+    let seed = d.path().join("seed.db");
+    std::fs::rename(&good, &seed).unwrap();
+    for now in 1_700_000_000..1_700_000_005_i64 {
+        for i in 0..200 {
+            let old = format!(
+                "memory-2019{:02}{:02}-000000-auto.db",
+                i / 28 + 1,
+                i % 28 + 1
+            );
+            std::fs::copy(&seed, home.join("backups").join(old)).unwrap();
+        }
+        let runs: Vec<_> = (0..2)
+            .map(|_| {
+                Command::new(env!("CARGO_BIN_EXE_sm"))
+                    .args(["backup", "--keep", "1"])
+                    .env("HOME", home.parent().unwrap())
+                    .env("SIMPLE_MEMORY_HOME", &home)
+                    .env("SM_NO_UPDATE_CHECK", "1")
+                    .env("SM_PARITY_NOW", now.to_string())
+                    .env("SM_UTC_OFFSET", "+00:00")
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .unwrap()
+            })
+            .collect();
+        let stamp = chrono::DateTime::from_timestamp(now, 0)
+            .unwrap()
+            .format("%Y%m%d-%H%M%S");
+        let name = format!("memory-{stamp}-auto.db");
+        for run in runs {
+            let out = run.wait_with_output().unwrap();
+            let err = String::from_utf8(out.stderr).unwrap();
+            assert_eq!((out.status.code(), err.as_str()), (Some(0), ""), "{now}");
+            let out = String::from_utf8(out.stdout).unwrap();
+            let first = out.lines().next().unwrap();
+            let want = format!(
+                "backup: {} quick_check=ok items=30",
+                home.join("backups").join(&name).display()
+            );
+            assert_eq!(first, want, "{now}");
+        }
+        assert_eq!(backup_names(&home), [name.as_str()], "{now}");
+    }
+}
+
+/// `<scratch>/<name>` with symlinks resolved, as the import resolves a config entry.
+fn real_dir(d: &tempfile::TempDir, name: &str) -> std::path::PathBuf {
+    let p = d.path().join(name);
+    std::fs::create_dir_all(&p).unwrap();
+    p.canonicalize().unwrap()
+}
+
+#[test]
+fn a_missing_task_log_root_or_handoff_dir_names_the_key_and_the_file_to_fix() {
+    let (d, home) = scratch();
+    std::fs::create_dir_all(d.path().join(".claude/projects")).unwrap();
+    let gone = real_dir(&d, "work").join("gone");
+    let h = home.display();
+    for (key, list) in [
+        (
+            "tasklog_roots",
+            "tasklog_roots = [\"{}\"]\nhandoff_dirs = []",
+        ),
+        (
+            "handoff_dirs",
+            "tasklog_roots = []\nhandoff_dirs = [\"{}\"]",
+        ),
+    ] {
+        let list = list.replace("{}", gone.to_str().unwrap());
+        write(&home.join("config.toml"), &format!("[upkeep]\n{list}\n"));
+        let want = format!(
+            "upkeep.{key} entry not found: {}; fix or remove it in [upkeep] {key} in {h}/config.toml",
+            gone.display()
+        );
+        let (code, out, _) = sm(&home, &["import", "catch-up"]);
+        assert_eq!(code, 1, "{out}");
+        assert!(
+            out.lines().any(|l| l == format!("imports: error: {want}")),
+            "{out}"
+        );
+        let (code, _, err) = sm(&home, &["doctor", "--imports"]);
+        assert_eq!((code, err), (1, format!("error: {want}\n")));
+    }
+}
+
+#[test]
+fn the_hook_shows_a_long_missing_entry_message_whole() {
+    let (d, home) = scratch();
+    std::fs::create_dir_all(d.path().join(".claude/projects")).unwrap();
+    let gone = real_dir(&d, "work").join("g".repeat(200));
+    write(
+        &home.join("config.toml"),
+        &format!(
+            "[prompt_hook]\nmodel = \"none\"\n[catch_up]\nenabled = false\n[upkeep]\ntasklog_roots = [\"{}\"]\n",
+            gone.display()
+        ),
+    );
+    let want = format!(
+        "upkeep.tasklog_roots entry not found: {}; fix or remove it in [upkeep] tasklog_roots in {}/config.toml",
+        gone.display(),
+        home.display()
+    );
+    let (code, out, _) = sm(&home, &["import", "catch-up"]);
+    assert_eq!(code, 1, "{out}");
+    assert!(
+        out.lines().any(|l| l == format!("imports: error: {want}")),
+        "{out}"
+    );
+    let (code, out, _) = sm_stdin(&home, &["hook", "prompt"], PROMPT);
+    let hook: serde_json::Value = serde_json::from_str(&out).unwrap();
+    let context = hook["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap();
+    assert_eq!(code, 0);
+    assert!(
+        context
+            .lines()
+            .any(|l| l.starts_with("sm catch-up failed at ")
+                && l.ends_with(&format!(": {want}; run sm doctor --imports"))),
+        "{context}"
+    );
+}
+
+#[test]
+fn a_repo_folder_given_as_a_task_log_root_gets_a_hint() {
+    let (d, home) = scratch();
+    std::fs::create_dir_all(d.path().join(".claude/projects")).unwrap();
+    let code_dir = real_dir(&d, "code");
+    let repo = code_dir.join("myrepo");
+    write(
+        &repo.join("docs/tasklog/2026-11-20/t1.yaml"),
+        "id: t1\ntitle: pool sizing\nresults:\n  - pool size 16 works\n",
+    );
+    write(
+        &home.join("config.toml"),
+        &format!(
+            "[upkeep]\ntasklog_roots = [\"{}\"]\nhandoff_dirs = []\n",
+            repo.display()
+        ),
+    );
+    let hint = format!(
+        "{} is a repo folder: tasklog_roots takes the folder above it (set \"{}\")\n",
+        repo.display(),
+        code_dir.display()
+    );
+    let (code, out, err) = sm(&home, &["doctor", "--imports"]);
+    assert_eq!((code, err.as_str()), (0, hint.as_str()), "{out}");
+    assert!(out.contains("imports: tasklog_files=0 "), "{out}");
+    let (code, out, err) = sm(&home, &["import", "catch-up"]);
+    assert_eq!((code, err.as_str()), (0, hint.as_str()), "{out}");
+    assert_eq!(
+        sm(&home, &["import", "catch-up", "--quiet"]),
+        (0, String::new(), String::new())
+    );
 }
 
 /// Copy the built binary to `<dir>/sm`.
@@ -410,7 +931,7 @@ fn hooks_print_names_this_binary_without_an_sm_on_path_and_the_sm_on_path_withou
     // Another sm on PATH (an npm wrapper that starts this binary, say): no note.
     assert_eq!(
         err,
-        "merge into the \"mcpServers\" object of a project's .mcp.json, or of another MCP client's config\n"
+        "merge into the top level of a project's .mcp.json (or of another MCP client's config): the fragment already holds the \"mcpServers\" key\n"
     );
     // The sm on PATH is this binary: no note.
     let (_, _, err) = hooks_print(
@@ -461,7 +982,7 @@ fn init_tells_a_user_with_work_to_set_the_roots_and_names_the_key_that_turns_aut
 }
 
 #[test]
-fn init_with_a_config_that_does_not_parse_prints_its_lines_and_names_the_error() {
+fn init_with_a_config_that_does_not_parse_prints_its_lines_and_warns_of_the_error() {
     let (d, home) = scratch();
     std::fs::create_dir_all(d.path().join(".claude/projects")).unwrap();
     let cfg = home.join("config.toml");
@@ -482,7 +1003,7 @@ fn init_with_a_config_that_does_not_parse_prints_its_lines_and_names_the_error()
     assert_eq!(
         err,
         format!(
-            "error: {h}/config.toml: line 1, column 8: Expected ']' at the end of a table declaration; fix the line, then run sm config\n"
+            "warning: {h}/config.toml: line 1, column 8: Expected ']' at the end of a table declaration; fix the line, then run sm config\n"
         )
     );
 }

@@ -12,14 +12,15 @@ const STDIN_HINT: &str =
     "sm put does not read stdin: give the text as an argument, as in sm put --tag <tag> \"<text>\"";
 
 pub fn run(ns: &Namespace, out: &mut Out) -> Result<i32, SmError> {
-    let body_text = ns.get_str_list("body").join(" ");
+    let body_args = ns.get_str_list("body");
+    let body_text = body_args.join(" ");
     let body = strip(&body_text);
     if body == "-" {
         return Err(SmError::value(format!(
             "the body is \"-\", but {STDIN_HINT}"
         )));
     }
-    if body.is_empty() {
+    if body_args.is_empty() {
         out.eprint(STDIN_HINT)?;
     }
     let (item_id, created) = run_put(

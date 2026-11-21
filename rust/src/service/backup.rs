@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use rusqlite::Connection;
@@ -114,18 +115,36 @@ pub fn run_backup(keep: &Int, home: Option<&str>) -> Result<BackupResult, SmErro
     bdir.mkdir(true, true)?;
     let stamp = clock::now_local().format("%Y%m%d-%H%M%S");
     let dest = bdir.join(&format!("memory-{stamp}-auto.db"));
-    let src = open(&db)?;
-    let mut out = open(&dest)?;
-    let res = copy_and_check(&src, &mut out);
-    drop(out);
-    drop(src);
-    let (check, items) = res?;
-    if check != "ok" {
-        return Err(SmError::runtime(format!(
-            "backup quick_check failed on {}: {check}",
-            dest.as_str()
-        )));
-    }
+    // The copy takes a name `auto_backups` matches only once it passes its check: a failed copy
+    // must never be the backup doctor tells the user to restore, nor replace a copy of this second.
+    // The part name is this run's own, so two runs in one second never write one file; the
+    // rename then puts a checked copy under the second's name, over any copy kept there before.
+    static RUNS: AtomicU64 = AtomicU64::new(0);
+    let run = RUNS.fetch_add(1, Ordering::Relaxed);
+    let part = format!("memory-{stamp}-auto.db.{}-{run}.part", std::process::id());
+    let part = bdir.join(&part);
+    let res = open(&db).and_then(|src| {
+        let mut out = open(&part)?;
+        copy_and_check(&src, &mut out)
+    });
+    let res = res.and_then(|(check, items)| match check.as_str() {
+        "ok" => Ok((check, items)),
+        _ => Err(SmError::runtime(format!(
+            "the backup copy of {db} does not pass quick_check: {check}"
+        ))),
+    });
+    let os = dest.to_os();
+    let res = res.and_then(|r| {
+        std::fs::rename(part.to_os(), &os).map_err(|e| SmError::from_io(&e, Some(&os)))?;
+        Ok(r)
+    });
+    let (check, items) = match res {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = std::fs::remove_file(part.to_os());
+            return Err(e);
+        }
+    };
     let found = auto_backups(home)?;
     let cut = match keep {
         Int::I64(k) => found
@@ -136,8 +155,13 @@ pub fn run_backup(keep: &Int, home: Option<&str>) -> Result<BackupResult, SmErro
     let mut deleted = Vec::new();
     for old in &found[..cut] {
         let os = old.to_os();
-        std::fs::remove_file(&os).map_err(|e| SmError::from_io(&e, Some(&os)))?;
-        deleted.push(old.as_str().to_string());
+        // A run of the same second may have deleted it first.
+        match std::fs::remove_file(&os) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                return Err(SmError::from_io(&e, Some(&os)));
+            }
+            _ => deleted.push(old.as_str().to_string()),
+        }
     }
     Ok(BackupResult {
         path: dest.as_str().to_string(),
@@ -256,11 +280,11 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_copy_that_fails_quick_check_is_a_runtime_error() {
-        let (_t, h) = home();
+    /// A store whose index root page holds no cells: the copy runs and counts, and only
+    /// `quick_check` finds the rows missing from the index.
+    fn index_without_rows(h: &str) {
         store(
-            &h,
+            h,
             "PRAGMA page_size=1024; CREATE TABLE items(title); INSERT INTO items VALUES ('a');
              CREATE TABLE t(x); CREATE INDEX tx ON t(x);
              WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<200) INSERT INTO t SELECT i FROM n;",
@@ -280,11 +304,48 @@ mod tests {
         bytes[at + 3] = 0;
         bytes[at + 4] = 0;
         std::fs::write(&path, bytes).unwrap();
+    }
+
+    #[test]
+    fn a_copy_that_fails_quick_check_is_a_runtime_error() {
+        let (_t, h) = home();
+        index_without_rows(&h);
         let e = run_backup(&Int::I64(7), Some(&h)).unwrap_err();
         assert_eq!(e.python_name(), "RuntimeError");
-        let prefix = format!("backup quick_check failed on {h}/backups/memory-");
+        let prefix = format!("the backup copy of {h}/memory.db does not pass quick_check: ");
         assert!(e.msg.starts_with(&prefix), "{}", e.msg);
         assert!(!e.msg.ends_with(": ok"), "{}", e.msg);
+    }
+
+    /// With keep = 1 a passing copy would rotate the older ones out; a failing copy leaves the
+    /// folder as it was. The copies named for this second and the next stand for a good backup
+    /// made in the same second as the failing one, which shares its name.
+    #[test]
+    fn a_copy_that_fails_quick_check_leaves_no_file_and_deletes_no_copy() {
+        let (_t, h) = home();
+        index_without_rows(&h);
+        std::fs::create_dir(format!("{h}/backups")).unwrap();
+        let now = clock::now_local();
+        let mut olds: Vec<String> = [
+            now - chrono::Duration::days(1),
+            now,
+            now + chrono::Duration::seconds(1),
+        ]
+        .iter()
+        .map(|t| format!("memory-{}-auto.db", t.format("%Y%m%d-%H%M%S")))
+        .collect();
+        olds.sort();
+        for n in &olds {
+            std::fs::write(format!("{h}/backups/{n}"), b"older copy").unwrap();
+        }
+        run_backup(&Int::I64(1), Some(&h)).unwrap_err();
+        assert_eq!(names(&h), olds);
+        for n in &olds {
+            assert_eq!(
+                std::fs::read(format!("{h}/backups/{n}")).unwrap(),
+                b"older copy"
+            );
+        }
     }
 
     #[test]

@@ -5,6 +5,7 @@ use indexmap::IndexMap;
 use rusqlite::Connection;
 use serde_json::{Value, json};
 
+use crate::cli::query::shlex_quote;
 use crate::config::{
     aliases, get_db_path, load_config, resolve_repo_until, roots, scope_matchers, scopes,
 };
@@ -56,20 +57,23 @@ pub struct Lookup {
     pub other_repos: IndexMap<String, i64>,
     pub other_repos_cap: Option<i64>,
     pub shared_refs: Vec<(String, i64)>,
-    /// Per missing term with no item in scope: the items its status or a filter hid.
+    /// Per missing term with no item in scope: the items its status, a filter or the repo
+    /// scope hid.
     pub hidden: IndexMap<String, Hidden>,
-    /// Hits were left out because they matched only stopwords.
-    pub filler_dropped: bool,
 }
 
-/// Items in scope that hold a missing term but that the query's status or filters hid.
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// Items that hold a missing term but that the query's status, filters or repo scope hid.
+#[derive(Clone, Debug, PartialEq)]
 pub struct Hidden {
     pub n: i64,
     /// Retired or superseded: `--include-history` shows them.
     pub retired: bool,
     /// Outside `--tag`, `--kind`, `--source`, `--since` or `--until`.
     pub filtered: bool,
+    /// Active items in other repos that pass the filters: `--all` shows them.
+    pub other_repos: bool,
+    /// What hid them, as the footer says it: `retired or superseded`, `outside --kind fact`.
+    pub by: String,
 }
 
 /// A `Sequence[str] | str | None` flag value.
@@ -597,6 +601,54 @@ fn local_query_at<S: AsRef<str>>(
     })
 }
 
+/// The flags that leave items out, as a footer command carries them: `--tag`, `--kind`,
+/// `--source`, `--since`, `--until`.
+pub fn narrowing_flags(a: &QueryArgs) -> Vec<String> {
+    let s = |v: &str| v.to_string();
+    let mut flags = Vec::new();
+    for (flag, vals) in [("--tag", a.tags), ("--kind", a.kinds)] {
+        let vals = split_list(vals);
+        if !vals.is_empty() {
+            flags.extend([s(flag), vals.join(",")]);
+        }
+    }
+    let sources = split_list(a.sources);
+    if !sources.is_empty() {
+        flags.extend([s("--source"), shlex_quote(&sources.join(","))]);
+    }
+    for (flag, val) in [("--since", a.since), ("--until", a.until)] {
+        if !val.is_empty() {
+            flags.extend([s(flag), shlex_quote(val)]);
+        }
+    }
+    flags
+}
+
+/// Drops the hits that matched only stopwords; (the pool size when the pool still counts as
+/// full: more items in `f` match a topic word of `topic_fts` than the hits kept).
+fn drop_filler_hits(
+    conn: &Connection,
+    scored: &mut Vec<Scored>,
+    cap: Option<i64>,
+    topic_fts: &str,
+    f: &Filters,
+) -> Result<Option<i64>, SmError> {
+    let n = scored.len();
+    scored.retain(|s| {
+        !s.why.ref_hits.is_empty()
+            || s.why.terms_matched.is_empty()
+            || !s.why.terms_matched.iter().all(|t| is_stopword(t))
+    });
+    Ok(match cap {
+        Some(_)
+            if scored.len() < n && count_matches(conn, topic_fts, f)? <= scored.len() as i64 =>
+        {
+            None
+        }
+        _ => cap,
+    })
+}
+
 /// `_shared_refs`: refs that 2 or more hits hold and the query does not name, most shared first.
 pub fn shared_refs(hits: &[Scored], query_text: &str) -> Vec<(String, i64)> {
     let q_folded = fold(Some(query_text));
@@ -620,18 +672,31 @@ pub fn shared_refs(hits: &[Scored], query_text: &str) -> Vec<(String, i64)> {
 }
 
 /// `_other_repos`: (hits per repo outside the scope among the best matches across all repos,
-/// top 3; the pool cap when the pool was full, so the counts are lower bounds).
+/// top 3; the pool cap when the pool was full, so the counts are lower bounds). With
+/// `topic_fts`, the hits that matched only stopwords do not count.
 fn other_repos(
     conn: &Connection,
     query_text: &str,
     f: &Filters,
     o: &SearchOpts,
+    topic_fts: Option<&str>,
 ) -> Result<(IndexMap<String, i64>, Option<i64>), SmError> {
     let all = Filters {
         include_all_repos: true,
         ..f.clone()
     };
-    let (pool, cap) = search_pool(conn, query_text, &all, o)?;
+    let (pool, cap) = match topic_fts {
+        None => search_pool(conn, query_text, &all, o)?,
+        Some(topic) => {
+            let (mut scored, cap) = search_scored(conn, query_text, &all, o, None)?;
+            let cap = drop_filler_hits(conn, &mut scored, cap, topic, &all)?;
+            let items: Vec<Item> = scored.into_iter().map(|s| s.item).collect();
+            match cap {
+                Some(c) if c != 0 => (head(items, c), cap),
+                _ => (items, cap),
+            }
+        }
+    };
     let in_scope = |r: &str| f.repo.as_deref() == Some(r) || r == "global" || r == "unassigned";
     let mut counts: IndexMap<String, i64> = IndexMap::new();
     for item in pool.iter().filter(|it| !in_scope(&it.repo)) {
@@ -665,19 +730,31 @@ pub fn run_lookup(query_text: &str, a: &QueryArgs) -> Result<Lookup, SmError> {
     // its terms, not only the first `limit`
     let drop_filler = has_content && terms.iter().any(|t| is_stopword(t));
     let explain = if drop_filler { None } else { Some(a.limit) };
-    let (mut scored, pool_cap) = search_scored(&conn, query_text, &f, &o, explain)?;
-    let n_before = scored.len();
-    if drop_filler {
-        scored.retain(|s| {
-            !s.why.ref_hits.is_empty()
-                || s.why.terms_matched.is_empty()
-                || !s.why.terms_matched.iter().all(|t| is_stopword(t))
-        });
+    let alias_map = term_alias_targets(&positive_query, ka.as_ref())?;
+    let term_fts = |t: &str| {
+        let mut fts_parts = vec![quote_fts_term(t)];
+        for w in alias_map.get(t).into_iter().flatten() {
+            let q = quote_fts_term(w);
+            if !fts_parts.contains(&q) {
+                fts_parts.push(q);
+            }
+        }
+        fts_parts.join(" OR ")
+    };
+    let topic_fts = drop_filler.then(|| {
+        terms
+            .iter()
+            .filter(|t| is_hint_term(t) && !is_stopword(t))
+            .map(|t| term_fts(t))
+            .collect::<Vec<_>>()
+            .join(" OR ")
+    });
+    let (mut scored, mut pool_cap) = search_scored(&conn, query_text, &f, &o, explain)?;
+    if let Some(topic) = &topic_fts {
+        pool_cap = drop_filler_hits(&conn, &mut scored, pool_cap, topic, &f)?;
     }
-    let filler_dropped = scored.len() < n_before;
     let n_scored = scored.len() as i64;
     let hits = head(scored, a.limit);
-    let alias_map = term_alias_targets(&positive_query, ka.as_ref())?;
     let full_folded = fold(Some(py::str::strip(query_text)));
     let pos_folded = fold(Some(py::str::strip(&positive_query)));
     let held: HashSet<&String> = hits
@@ -687,16 +764,7 @@ pub fn run_lookup(query_text: &str, a: &QueryArgs) -> Result<Lookup, SmError> {
     let mut missing = Vec::new();
     for t in terms {
         if !held.contains(&t) && is_hint_term(&t) && !(has_content && is_stopword(&t)) {
-            let mut fts_parts = vec![quote_fts_term(&t)];
-            if let Some(targets) = alias_map.get(t.as_str()) {
-                for w in targets {
-                    let q = quote_fts_term(w);
-                    if !fts_parts.contains(&q) {
-                        fts_parts.push(q);
-                    }
-                }
-            }
-            let fts = fts_parts.join(" OR ");
+            let fts = term_fts(&t);
             let n = count_matches(&conn, &fts, &f)?;
             if n > 0 && (t == full_folded || t == pos_folded) {
                 continue;
@@ -705,18 +773,21 @@ pub fn run_lookup(query_text: &str, a: &QueryArgs) -> Result<Lookup, SmError> {
         }
     }
     missing.truncate(MAX_MISSING_TERMS);
+    let other_scope = f.repo.as_deref().is_some_and(|r| !r.is_empty()) && !f.include_all_repos;
+    let narrow = narrowing_flags(a);
     let mut hidden = IndexMap::new();
     for (t, n, fts) in &missing {
         if *n == 0
-            && let Some(h) = hidden_in_scope(&conn, fts, &f)?
+            && let Some(h) = hidden_matches(&conn, fts, &f, &narrow, other_scope)?
         {
             hidden.insert(t.clone(), h);
         }
     }
     let missing = missing.into_iter().map(|(t, n, _)| (t, n)).collect();
-    let (other, other_cap) = match f.repo.as_deref() {
-        Some(r) if !r.is_empty() && !f.include_all_repos => other_repos(&conn, query_text, &f, &o)?,
-        _ => (IndexMap::new(), None),
+    let (other, other_cap) = if other_scope {
+        other_repos(&conn, query_text, &f, &o, topic_fts.as_deref())?
+    } else {
+        (IndexMap::new(), None)
     };
     drop(conn);
     let shared = shared_refs(&hits, query_text);
@@ -735,13 +806,18 @@ pub fn run_lookup(query_text: &str, a: &QueryArgs) -> Result<Lookup, SmError> {
         other_repos_cap: other_cap,
         shared_refs: shared,
         hidden,
-        filler_dropped,
     })
 }
 
-/// The items in scope that match `fts` but that the status or the filters of `f` hid, when no
-/// item `f` keeps matches it.
-fn hidden_in_scope(conn: &Connection, fts: &str, f: &Filters) -> Result<Option<Hidden>, SmError> {
+/// The items that match `fts` but that the status or the filters `narrow` of `f` hid, when no
+/// item `f` keeps matches it; else, with `other_scope`, the ones in other repos.
+fn hidden_matches(
+    conn: &Connection,
+    fts: &str,
+    f: &Filters,
+    narrow: &[String],
+    other_scope: bool,
+) -> Result<Option<Hidden>, SmError> {
     let unfiltered = Filters {
         tags_filter: None,
         kinds_filter: None,
@@ -763,14 +839,37 @@ fn hidden_in_scope(conn: &Connection, fts: &str, f: &Filters) -> Result<Option<H
     for (g, retired, filtered) in wider.into_iter().flatten() {
         let n = count_matches(conn, fts, &g)?;
         if n > 0 {
+            let outside = format!("outside {}", narrow.join(" "));
+            let by = match (retired, filtered) {
+                (true, false) => "retired or superseded".to_string(),
+                (false, _) => outside,
+                (true, true) => format!("retired or superseded, {outside}"),
+            };
             return Ok(Some(Hidden {
                 n,
                 retired,
                 filtered,
+                other_repos: false,
+                by,
             }));
         }
     }
-    Ok(None)
+    let all = Filters {
+        include_all_repos: true,
+        ..f.clone()
+    };
+    let n = if other_scope {
+        count_matches(conn, fts, &all)?
+    } else {
+        0
+    };
+    Ok((n > 0).then(|| Hidden {
+        n,
+        retired: false,
+        filtered: false,
+        other_repos: true,
+        by: "in other repos".to_string(),
+    }))
 }
 
 /// `item_tokens`: title and body characters / 4, rounded up.
@@ -847,7 +946,18 @@ pub fn lookup_json(lk: &Lookup) -> Value {
         "bias": lk.bias,
         "scope": scope,
         "results": results,
-        "missing": lk.missing.iter().map(|(t, n)| json!({"term": t, "in_scope": n})).collect::<Vec<_>>(),
+        "missing": lk.missing.iter().map(|(t, n)| {
+            let mut entry = json!({"term": t, "in_scope": n});
+            match lk.hidden.get(t) {
+                Some(h) if h.other_repos => entry["in_other_repos"] = json!(h.n),
+                Some(h) => {
+                    entry["hidden"] = json!(h.n);
+                    entry["hidden_by"] = json!(h.by);
+                }
+                None => {}
+            }
+            entry
+        }).collect::<Vec<_>>(),
         "more": {
             "beyond_limit": lk.beyond_limit,
             "pool_full": lk.pool_cap.is_some(),
@@ -1004,7 +1114,6 @@ mod tests {
             hits: vec![],
             missing: vec![],
             hidden: IndexMap::new(),
-            filler_dropped: false,
             beyond_limit: 0,
             pool_cap: None,
             other_repos: IndexMap::new(),

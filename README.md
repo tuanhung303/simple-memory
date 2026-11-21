@@ -47,7 +47,7 @@ sm update --check   # check npm for a newer version and refresh the local cache
 sm update           # run npm install -g simple-memory@latest for npm installs, or print the source-upgrade command
 ```
 
-The first command after an update that opens the store (`sm stats` does) moves `memory.db` to the new schema (version 3 now); the released 0.6.0 still reads and writes it. Copy `memory.db` first if you want the old file. The first catch-up can also store a new version of an imported file that an older build stored with a secret in clear (`inserted` counts it); the old version stays as a superseded item, secret included, and the next catch-up stores nothing.
+The first command after an update that opens the store (`sm stats` does) moves `memory.db` to the new schema (version 3 now); the released 0.6.0 still reads and writes it. Copy `memory.db` first if you want the old file. The first catch-up can also store a new version of an imported file in two cases: an older build stored it with a secret in clear, or it is a task log with a one-key list line such as `- pool: 16`, which 0.6.0 stored as `{'pool': 16}` and this build stores as `pool: 16`. `inserted` counts each one; the old version stays as a superseded item (a secret included), and the next catch-up stores nothing.
 
 Interactive npm CLI runs also read `$SIMPLE_MEMORY_HOME/update-check.json` (refreshed in the background at most once every 24 hours) and print a one-line notice to stderr when a newer release exists. The reminder stays silent on non-TTY streams, CI, `mcp`, `hook`/`hooks`, `update`, `--format json`, `--version`/`-v`, `--help`/`-h`, or when `SM_NO_UPDATE_CHECK=1` is set.
 
@@ -133,9 +133,9 @@ Print ready-to-merge JSON for each harness (`sm hooks print` writes no files):
 
 | Harness | Command | Merge target |
 |---|---|---|
-| Claude Code | `sm hooks print claude-code` | `"hooks"` in `~/.claude/settings.json` |
+| Claude Code | `sm hooks print claude-code` | Top level of `~/.claude/settings.json`: the fragment already holds the `"hooks"` key; when `hooks` exists, add the `UserPromptSubmit` entry to it and keep the entries it holds |
 | Antigravity CLI (`agy`) | `sm hooks print agy` | `~/.gemini/config/hooks.json` |
-| Any MCP client | `sm hooks print mcp` | `"mcpServers"` in `.mcp.json` or client MCP config |
+| Any MCP client | `sm hooks print mcp` | Top level of `.mcp.json` or client MCP config: the fragment already holds the `"mcpServers"` key; when `mcpServers` exists, add the `simple-memory` entry to it |
 
 Example output of `sm hooks print claude-code` (a binary path that holds a space is quoted):
 
@@ -259,7 +259,7 @@ Modules follow a downward architecture (`cli` -> `service` -> `store` / `sources
 <details>
 <summary>Import file formats and catch-up counters</summary>
 
-- **Task log**: a YAML file under `docs/tasklog/<folder>/` in a `[upkeep] tasklog_roots` entry (`sm import tasklog PATH` takes a file, or a folder and every `.yaml` below it). Fields: `id` (default: file name), `title`, `repo` (default: the folder above `docs`), `state` (kept as a tag), `as_of` (default: file time), `results`, `directions`, `open` and `next` (a list or text; they make the body), `commits` (tag `executed`, the commits as evidence; with none the tag is `derived`), `continues`, `superseded_by`. A named import stores the good files, names each bad file and exits 1.
+- **Task log**: a YAML file under `<root>/<repo>/docs/tasklog/<folder>/`, where `<root>` is a `[upkeep] tasklog_roots` entry and `<repo>` is one to three folders below it (`sm import tasklog PATH` takes a file, or a folder and every `.yaml` below it). Fields: `id` (default: file name), `title`, `repo` (default: the folder above `docs`), `state` (kept as a tag), `as_of` (default: file time), `results`, `directions`, `open` and `next` (a list or text; they make the body), `commits` (tag `executed`, the commits as evidence; with none the tag is `derived`), `continues`, `superseded_by`. A named import stores the good files, names each bad file and exits 1.
 - **Handoff**: every `.md` file in or below a `[upkeep] handoff_dirs` entry is stored as a handoff. The title is the first `# ` line of the first 20 lines (a `HANDOFF:` prefix is dropped; none: the file name). A `Written: <ISO time>` line there sets `as_of` (missing or invalid: file time). The repo comes from the folder that holds the file (a Claude Code project folder or scratchpad) or from a `CWD: <path>` line, matched against `[repos] roots` (no match: `unassigned`); a `Repo:` line is not read. The body keeps only the `##` and `###` sections headed Request, Done, Recap, Decision(s), Accomplished, What changed, Results, Open or Next (a heading that starts with one of these words counts); other sections, `### State` included, are dropped. With no such heading the whole file is the body.
 
 Counters that `sm import catch-up` (one line per part), `sm doctor --imports` and `sm upkeep` print:

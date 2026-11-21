@@ -263,7 +263,7 @@ pub fn build_parser() -> Parser {
         &["--kind"],
         default_str(
             "fact",
-            "Item kind (fact, decision, learning, episode, task, handoff)",
+            "Item kind (fact, decision, learning, episode, task, handoff; default: fact)",
         ),
     );
     p_put.add_argument(
@@ -380,18 +380,27 @@ pub fn build_parser() -> Parser {
     p_am.add_argument(&["--evidence"], opt("Replace evidence text"));
     p_am.add_argument(&["--title"], opt("Replace title"));
     p_am.add_argument(&["--body"], opt("Replace body text"));
-    p_am.add_argument(&["--add-refs"], opt_comma("Add comma-separated references"));
+    p_am.add_argument(
+        &["--add-refs"],
+        opt_comma("References to add, separated by commas or spaces"),
+    );
     p_am.add_argument(
         &["--remove-refs"],
-        opt_comma("Remove comma-separated references"),
+        opt_comma("References to remove, separated by commas or spaces"),
     );
-    p_am.add_argument(&["--add-tags"], opt_comma("Add comma-separated tags"));
-    p_am.add_argument(&["--remove-tags"], opt_comma("Remove comma-separated tags"));
+    p_am.add_argument(
+        &["--add-tags"],
+        opt_comma("Freeform tags to add, separated by commas (a space stays inside a tag)"),
+    );
+    p_am.add_argument(
+        &["--remove-tags"],
+        opt_comma("Freeform tags to remove, separated by commas (a space stays inside a tag)"),
+    );
     p_am.add_argument(&["--as-of"], opt("Replace ISO 8601 timestamp"));
 
     let p_list = sub.add_parser(
         "list",
-        "Browse stored memory items chronologically with filters and pagination",
+        "Browse stored memory items, newest first, with filters and pagination",
     );
     p_list.add_argument(
         &["--limit"],

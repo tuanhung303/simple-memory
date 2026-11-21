@@ -55,7 +55,7 @@ fn tools_json() -> Value {
         {
             "name": "memory_query",
             "title": "Search memory",
-            "description": "Search memory items in the current repo plus global and unassigned ones. Returns the JSON of `sm query --format json`: ranked results with id, kind, tag, as_of, snippet and why, then missing words, more matches and next steps.",
+            "description": "Search memory items in the current repo plus global and unassigned ones. Returns the JSON of `sm query --format json`: ranked results with id, kind, tag, as_of, snippet and why, then missing words (with how many items a status, a filter or the repo scope hid), more matches and next steps.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
