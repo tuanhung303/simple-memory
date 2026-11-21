@@ -81,7 +81,7 @@ pub fn validate_tag(
         && strip(evidence.unwrap_or("")).is_empty()
     {
         return Err(SmError::value(format!(
-            "Tag {} requires non-empty --evidence",
+            "Tag {} needs non-empty evidence",
             repr(&cleaned)
         )));
     }
@@ -213,15 +213,15 @@ mod tests {
         );
         assert_eq!(
             err("verified", "   ", false),
-            "ValueError: Tag 'verified' requires non-empty --evidence"
+            "ValueError: Tag 'verified' needs non-empty evidence"
         );
         assert_eq!(
             err(" EXECUTED ", "", false),
-            "ValueError: Tag 'executed' requires non-empty --evidence"
+            "ValueError: Tag 'executed' needs non-empty evidence"
         );
         assert_eq!(
             validate_tag(Some("executed"), None, false).unwrap_err().msg,
-            "Tag 'executed' requires non-empty --evidence"
+            "Tag 'executed' needs non-empty evidence"
         );
 
         assert_eq!(map_legacy_tag(Some("inferred")), ("derived".into(), None));

@@ -6,6 +6,7 @@ const path = require("node:path");
 const zlib = require("node:zlib");
 const { isRegularFile, resolveBinary, resolveTarget } = require("../lib/platform");
 
+const BUILD_HINT = `build from source (git clone ${require("../package.json").repository.url.replace(/^git\+/, "")}, cd simple-memory, then run ./scripts/install.sh)`;
 const DEFAULT_TIMEOUT_MS = 15000;
 const MAX_SUMS_BYTES = 1024 * 1024;
 const MAX_DOWNLOAD_BYTES = 50 * 1024 * 1024;
@@ -278,7 +279,7 @@ async function runPostinstall(options = {}) {
   const target = resolveTarget(platform, arch);
   if (!target) {
     stderr.write(
-      `simple-memory: no prebuilt binary for ${platform}-${arch}; build from source with ./scripts/install.sh or set SM_BINARY_PATH.\n`
+      `simple-memory: no prebuilt binary for ${platform}-${arch}; ${BUILD_HINT} or set SM_BINARY_PATH.\n`
     );
     return 0;
   }
@@ -313,7 +314,7 @@ async function runPostinstall(options = {}) {
     });
     if (!sumsRes.ok) {
       stderr.write(
-        `simple-memory: skipped binary download (${sumsUrl} returned HTTP ${sumsRes.status}); build from source with ./scripts/install.sh or set SM_BINARY_PATH.\n`
+        `simple-memory: skipped binary download (${sumsUrl} returned HTTP ${sumsRes.status}); ${BUILD_HINT} or set SM_BINARY_PATH.\n`
       );
       return 0;
     }
@@ -325,7 +326,7 @@ async function runPostinstall(options = {}) {
       return 1;
     }
     stderr.write(
-      `simple-memory: skipped binary download (${err && err.message ? err.message : String(err)}); build from source with ./scripts/install.sh or set SM_BINARY_PATH.\n`
+      `simple-memory: skipped binary download (${err && err.message ? err.message : String(err)}); ${BUILD_HINT} or set SM_BINARY_PATH.\n`
     );
     return 0;
   }
@@ -352,7 +353,7 @@ async function runPostinstall(options = {}) {
     });
     if (!assetRes.ok) {
       stderr.write(
-        `simple-memory: skipped binary download (${assetUrl} returned HTTP ${assetRes.status}); build from source with ./scripts/install.sh or set SM_BINARY_PATH.\n`
+        `simple-memory: skipped binary download (${assetUrl} returned HTTP ${assetRes.status}); ${BUILD_HINT} or set SM_BINARY_PATH.\n`
       );
       return 0;
     }
@@ -376,7 +377,7 @@ async function runPostinstall(options = {}) {
       return 1;
     }
     stderr.write(
-      `simple-memory: skipped binary download (${err && err.message ? err.message : String(err)}); build from source with ./scripts/install.sh or set SM_BINARY_PATH.\n`
+      `simple-memory: skipped binary download (${err && err.message ? err.message : String(err)}); ${BUILD_HINT} or set SM_BINARY_PATH.\n`
     );
     return 0;
   }

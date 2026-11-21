@@ -137,7 +137,7 @@ mod tests {
         );
         assert_eq!(
             err("Verified without evidence", &put(h, "verified", |_| {})),
-            "ValueError: Tag 'verified' requires non-empty --evidence"
+            "ValueError: Tag 'verified' needs non-empty evidence"
         );
         assert_eq!(
             err(" \n ", &put(h, "decided", |_| {})),
@@ -174,7 +174,7 @@ mod tests {
         assert_eq!(run_show(&format!(" {id1} "), Some(h)).unwrap().id, id1);
         assert_eq!(
             run_show("m_nope", Some(h)).unwrap_err().python_text(),
-            "KeyError: 'Item not found: m_nope'"
+            "KeyError: item m_nope not found (ids are case-sensitive and must be given in full)"
         );
 
         let (id2, _) = run_put(

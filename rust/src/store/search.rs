@@ -767,6 +767,17 @@ pub fn ids_matching(
     rows.collect::<Result<HashSet<_>, _>>().map_err(sql_err)
 }
 
+/// Every repo an item of any status names, most items first, then by name.
+pub fn repo_names(conn: &Connection) -> Result<Vec<String>, SmError> {
+    let mut stmt = conn
+        .prepare("SELECT repo FROM items GROUP BY repo ORDER BY count(*) DESC, repo")
+        .map_err(sql_err)?;
+    let rows = stmt
+        .query_map([], |r| r.get::<_, String>(0))
+        .map_err(sql_err)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(sql_err)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

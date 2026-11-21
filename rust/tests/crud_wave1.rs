@@ -266,7 +266,11 @@ fn cli_retire_error_paths_and_stale_retired_tag_replacement() {
     let (code, out, err) = sm(&home, &["retire", "m_nonexistent"]);
     assert_eq!(
         (code, out.as_str(), err.as_str()),
-        (1, "", "error: 'Item not found: m_nonexistent'\n")
+        (
+            1,
+            "",
+            "error: item m_nonexistent not found (ids are case-sensitive and must be given in full)\n"
+        )
     );
 
     // Comma in reason fails before mutating DB
@@ -704,11 +708,7 @@ fn cli_amend_metadata_body_title_refs_tags_and_redaction() {
     let (code, out, err) = sm(&home, &["amend", &secret_item_id]);
     assert_eq!(
         (code, out.as_str(), err.as_str()),
-        (
-            1,
-            "",
-            "error: sm amend requires at least one field to change\n"
-        )
+        (1, "", "error: amend needs at least one field to change\n")
     );
 }
 
@@ -918,7 +918,7 @@ fn amend_dedupe_collision_noop_formatting_preservation_and_errors() {
     // 1) No flags -> rejected
     assert_eq!(
         err_text(amend_item(&conn, "m_a", &AmendPatch::default()).unwrap_err()),
-        "ValueError: sm amend requires at least one field to change"
+        "ValueError: amend needs at least one field to change"
     );
 
     // 2) Missing id -> KeyError
@@ -934,7 +934,7 @@ fn amend_dedupe_collision_noop_formatting_preservation_and_errors() {
             )
             .unwrap_err()
         ),
-        "KeyError: 'Item not found: m_missing'"
+        "KeyError: item m_missing not found (ids are case-sensitive and must be given in full)"
     );
 
     // 3) No-op checks (unchanged values, no-op add/remove refs & tags, same as_of)
@@ -1037,7 +1037,7 @@ fn amend_dedupe_collision_noop_formatting_preservation_and_errors() {
             )
             .unwrap_err()
         ),
-        "ValueError: Tag 'verified' requires non-empty --evidence"
+        "ValueError: Tag 'verified' needs non-empty evidence"
     );
 
     // 8) Blank repo / title / body rejected

@@ -96,7 +96,7 @@ fn last_stderr(out: &Out) -> String {
 fn assert_err(argv: Vec<Arg>, expected_code: i32, expected_stderr: &str) {
     let argv_strs: Vec<String> = argv.into_iter().map(Arg::into_string).collect();
     let mut out = Out::capture();
-    let res = build_parser().parse_args(&argv_strs, &mut out);
+    let res = parse_args(&argv_strs, &mut out);
     let code = match res {
         Ok(ns) => panic!("expected exit {expected_code} for {argv_strs:?}, got Ok({ns:?})"),
         Err(Exit(c)) => c,
@@ -541,7 +541,7 @@ fn argparse_put_cases() {
             Arg::Text("--version".to_string()),
         ],
         2,
-        "sm: error: unrecognized arguments: --version",
+        "sm put: error: unrecognized arguments: --version; see sm put --help",
     );
     // case 24
     assert_ok_fields(
@@ -590,7 +590,7 @@ fn argparse_put_cases() {
             Arg::Text("b".to_string()),
         ],
         2,
-        "sm: error: unrecognized arguments: b",
+        "sm put: error: unrecognized arguments: b; see sm put --help",
     );
     // case 45
     assert_ok_fields(
@@ -870,7 +870,7 @@ fn argparse_put_cases() {
             Arg::Text("x".to_string()),
         ],
         2,
-        "sm: error: unrecognized arguments: --nope",
+        "sm put: error: unrecognized arguments: --nope; see sm put --help",
     );
     // case 69
     assert_ok_fields(
@@ -892,7 +892,7 @@ fn argparse_put_cases() {
             Arg::Text("x".to_string()),
         ],
         2,
-        "sm: error: unrecognized arguments: -k",
+        "sm put: error: unrecognized arguments: -k; see sm put --help",
     );
     // case 71
     assert_err(
@@ -1020,7 +1020,7 @@ fn argparse_put_cases() {
             Arg::Text("d".to_string()),
         ],
         2,
-        "sm: error: unrecognized arguments: d",
+        "sm put: error: unrecognized arguments: d; see sm put --help",
     );
     // case 84
     assert_ok_fields(
@@ -1042,7 +1042,7 @@ fn argparse_put_cases() {
             Arg::Text("--dry-run".to_string()),
         ],
         2,
-        "sm: error: unrecognized arguments: --dry-run",
+        "sm put: error: unrecognized arguments: --dry-run; see sm put --help",
     );
     // case 86
     assert_ok_fields(
@@ -2985,7 +2985,7 @@ fn argparse_query_cases() {
             Arg::Text("--zz=1".to_string()),
         ],
         2,
-        "sm: error: unrecognized arguments: --zz=1",
+        "sm query: error: unrecognized arguments: --zz=1; see sm query --help",
     );
     // case 195 (query accepts nargs="+")
     assert_ok_fields(
@@ -3136,7 +3136,7 @@ fn argparse_show_cases() {
             Arg::Text("--x".to_string()),
         ],
         2,
-        "sm: error: unrecognized arguments: --x",
+        "sm show: error: unrecognized arguments: --x; see sm show --help",
     );
     // case 202
     assert_ok_fields(
@@ -3222,7 +3222,7 @@ fn argparse_update_cases() {
             Arg::Text("--bogus".to_string()),
         ],
         2,
-        "sm: error: unrecognized arguments: --bogus",
+        "sm update: error: unrecognized arguments: --bogus; see sm update --help",
     );
 }
 
@@ -3286,7 +3286,7 @@ fn argparse_related_cases() {
             Arg::Text("b".to_string()),
         ],
         2,
-        "sm: error: unrecognized arguments: b",
+        "sm related: error: unrecognized arguments: b; see sm related --help",
     );
     // case 212
     assert_err(
@@ -3359,7 +3359,7 @@ fn argparse_supersede_cases() {
             Arg::Text("c".to_string()),
         ],
         2,
-        "sm: error: unrecognized arguments: c",
+        "sm supersede: error: unrecognized arguments: c; see sm supersede --help",
     );
     // case 219
     assert_ok_fields(
@@ -3384,7 +3384,7 @@ fn argparse_supersede_cases() {
             Arg::Text("b".to_string()),
         ],
         2,
-        "sm: error: unrecognized arguments: --x",
+        "sm supersede: error: unrecognized arguments: --x; see sm supersede --help",
     );
 }
 
@@ -3587,7 +3587,7 @@ fn argparse_import_cases() {
             Arg::Text("x".to_string()),
         ],
         2,
-        "sm: error: unrecognized arguments: x",
+        "sm import automemory: error: unrecognized arguments: x; see sm import automemory --help",
     );
     // case 235
     assert_ok_fields(
@@ -4023,7 +4023,7 @@ fn argparse_import_cases() {
             Arg::Text("x".to_string()),
         ],
         2,
-        "sm: error: unrecognized arguments: x",
+        "sm import catch-up: error: unrecognized arguments: x; see sm import catch-up --help",
     );
     // case 263
     assert_err(
@@ -4059,7 +4059,7 @@ fn argparse_import_cases() {
             Arg::Text("p".to_string()),
         ],
         2,
-        "sm: error: unrecognized arguments: --dry-run",
+        "sm import tasklog: error: unrecognized arguments: --dry-run; see sm import tasklog --help",
     );
     // case 267
     assert_err(
@@ -4070,7 +4070,7 @@ fn argparse_import_cases() {
             Arg::Text("--zz".to_string()),
         ],
         2,
-        "sm: error: unrecognized arguments: --zz",
+        "sm import tasklog: error: unrecognized arguments: --zz; see sm import tasklog --help",
     );
     // case 269
     assert_ok_fields(
@@ -4198,7 +4198,7 @@ fn argparse_export_cases() {
     assert_err(
         vec![Arg::Text("export".to_string()), Arg::Text("x".to_string())],
         2,
-        "sm: error: unrecognized arguments: x",
+        "sm export: error: unrecognized arguments: x; see sm export --help",
     );
     // case 280
     assert_ok_fields(
@@ -4352,7 +4352,7 @@ fn argparse_hook_cases() {
             Arg::Text("prompt".to_string()),
         ],
         2,
-        "sm: error: unrecognized arguments: prompt",
+        "sm hook: error: unrecognized arguments: prompt; see sm hook --help",
     );
 }
 
@@ -4426,7 +4426,7 @@ fn argparse_doctor_cases() {
     assert_err(
         vec![Arg::Text("doctor".to_string()), Arg::Text("x".to_string())],
         2,
-        "sm: error: unrecognized arguments: x",
+        "sm doctor: error: unrecognized arguments: x; see sm doctor --help",
     );
 }
 
@@ -4648,7 +4648,7 @@ fn argparse_init_cases() {
     assert_err(
         vec![Arg::Text("init".to_string()), Arg::Text("x".to_string())],
         2,
-        "sm: error: unrecognized arguments: x",
+        "sm init: error: unrecognized arguments: x; see sm init --help",
     );
     // case 344
     assert_err(
@@ -4669,7 +4669,7 @@ fn argparse_config_cases() {
             Arg::Text("--x".to_string()),
         ],
         2,
-        "sm: error: unrecognized arguments: --x",
+        "sm config: error: unrecognized arguments: --x; see sm config --help",
     );
     // case 345
     assert_err(
@@ -4688,7 +4688,7 @@ fn argparse_hooks_cases() {
     assert_err(
         vec![Arg::Text("hooks".to_string())],
         2,
-        "sm hooks: error: the following arguments are required: hooks_action",
+        "sm hooks: error: the following arguments are required: {print}",
     );
     // case 331
     assert_err(
@@ -4697,7 +4697,7 @@ fn argparse_hooks_cases() {
             Arg::Text("print".to_string()),
         ],
         2,
-        "sm hooks print: error: the following arguments are required: harness",
+        "sm hooks print: error: the following arguments are required: {claude-code,agy,mcp}",
     );
     // case 332
     assert_ok_fields(
@@ -4737,7 +4737,7 @@ fn argparse_hooks_cases() {
             Arg::Text("claude".to_string()),
         ],
         2,
-        "sm hooks print: error: argument harness: invalid choice: 'claude', maybe you meant 'claude-code'? (choose from 'claude-code', 'agy', 'mcp')",
+        "sm hooks print: error: argument {claude-code,agy,mcp}: invalid choice: 'claude', maybe you meant 'claude-code'? (choose from 'claude-code', 'agy', 'mcp')",
     );
     // case 336
     assert_err(
@@ -4747,7 +4747,7 @@ fn argparse_hooks_cases() {
             Arg::Text("agy".to_string()),
         ],
         2,
-        "sm hooks: error: argument hooks_action: invalid choice: 'prnt', maybe you meant 'print'? (choose from 'print')",
+        "sm hooks: error: argument {print}: invalid choice: 'prnt', maybe you meant 'print'? (choose from 'print')",
     );
     // case 337
     assert_err(
@@ -4758,7 +4758,7 @@ fn argparse_hooks_cases() {
             Arg::Text("x".to_string()),
         ],
         2,
-        "sm: error: unrecognized arguments: x",
+        "sm hooks print: error: unrecognized arguments: x; see sm hooks print --help",
     );
     // case 338
     assert_err(
@@ -4784,7 +4784,7 @@ fn argparse_hooks_cases() {
             Arg::Text("editor".to_string()),
         ],
         2,
-        "sm hooks print: error: argument harness: invalid choice: 'editor' (choose from 'claude-code', 'agy', 'mcp')",
+        "sm hooks print: error: argument {claude-code,agy,mcp}: invalid choice: 'editor' (choose from 'claude-code', 'agy', 'mcp')",
     );
 }
 
@@ -4796,13 +4796,13 @@ fn argparse_mcp_cases() {
     assert_err(
         vec![Arg::Text("mcp".to_string()), Arg::Text("--x".to_string())],
         2,
-        "sm: error: unrecognized arguments: --x",
+        "sm mcp: error: unrecognized arguments: --x; see sm mcp --help",
     );
     // case 343
     assert_err(
         vec![Arg::Text("mcp".to_string()), Arg::Text("x".to_string())],
         2,
-        "sm: error: unrecognized arguments: x",
+        "sm mcp: error: unrecognized arguments: x; see sm mcp --help",
     );
 }
 

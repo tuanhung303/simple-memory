@@ -343,21 +343,36 @@ fn connect_capped(
     }
     // sqlite3.connect: READWRITE | CREATE, no URI parsing (uri=False), timeout=5.0.
     let os = crate::py::io::fs_path(target);
-    let conn = Connection::open_with_flags(
-        &os,
-        OpenFlags::SQLITE_OPEN_READ_WRITE
-            | OpenFlags::SQLITE_OPEN_CREATE
-            | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .map_err(|e| SmError::sqlite_open(&e, &os))?;
-    conn.busy_timeout(Duration::from_millis(BUSY_TIMEOUT_MS as u64))?;
-    register_fold(&conn)?;
-    register_word(&conn)?;
-    register_epoch(&conn)?;
-    execute_waiting_capped(&conn, "PRAGMA journal_mode = WAL", deadline, cap_s)?;
-    execute(&conn, "PRAGMA foreign_keys = ON")?;
-    apply_migrations_capped(&conn, deadline, cap_s)?;
-    Ok(conn)
+    let opened = (|| {
+        let conn = Connection::open_with_flags(
+            &os,
+            OpenFlags::SQLITE_OPEN_READ_WRITE
+                | OpenFlags::SQLITE_OPEN_CREATE
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(|e| SmError::sqlite_open(&e, &os))?;
+        conn.busy_timeout(Duration::from_millis(BUSY_TIMEOUT_MS as u64))?;
+        register_fold(&conn)?;
+        register_word(&conn)?;
+        register_epoch(&conn)?;
+        execute_waiting_capped(&conn, "PRAGMA journal_mode = WAL", deadline, cap_s)?;
+        execute(&conn, "PRAGMA foreign_keys = ON")?;
+        apply_migrations_capped(&conn, deadline, cap_s)?;
+        Ok(conn)
+    })();
+    // A file SQLite cannot open, write or read as a database: say which file.
+    opened.map_err(|mut e: SmError| {
+        let unopenable = e.class == "DatabaseError"
+            || [
+                "unable to open database file",
+                "attempt to write a readonly database",
+            ]
+            .contains(&e.msg.as_str());
+        if e.is(crate::error::Base::Sqlite) && unopenable {
+            e.msg = format!("cannot open {target}: {}", e.msg);
+        }
+        e
+    })
 }
 
 /// The wall time SQLite's own busy handler takes to give up after `ms` on a held write lock,
@@ -694,7 +709,20 @@ mod tests {
         let err = connect(d.path().to_str().unwrap(), None).unwrap_err();
         assert_eq!(
             err.python_text(),
-            "OperationalError: unable to open database file"
+            format!(
+                "OperationalError: cannot open {}: unable to open database file",
+                d.path().display()
+            )
+        );
+        let bad = d.path().join("bad.db");
+        std::fs::write(&bad, "not a database, only text that is long enough").unwrap();
+        let err = connect(bad.to_str().unwrap(), None).unwrap_err();
+        assert_eq!(
+            err.python_text(),
+            format!(
+                "DatabaseError: cannot open {}: file is not a database",
+                bad.display()
+            )
         );
     }
 }

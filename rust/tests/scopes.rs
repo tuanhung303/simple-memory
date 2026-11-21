@@ -255,10 +255,19 @@ fn an_unknown_path_exits_2_and_lists_the_known_ones() {
             "unknown scope: acme/nope; known: acme, acme/globex, acme/globex/web, initech\n"
         )
     );
-    // no [scopes] at all: nothing is known
+    // no [scopes] at all: the message names the file and the README section
     let (_e, bare) = scratch();
     let (code, _, err) = sm(&bare, &["query", "kiwi", "--in", "acme"]);
-    assert_eq!((code, err.as_str()), (2, "unknown scope: acme; known: \n"));
+    assert_eq!(
+        (code, err),
+        (
+            2,
+            format!(
+                "unknown scope: acme; {}/config.toml has no [scopes] table (README: Multi-repo scopes and maintenance)\n",
+                bare.display()
+            )
+        )
+    );
 }
 
 #[test]

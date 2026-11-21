@@ -6,7 +6,7 @@ const os = require("node:os");
 const path = require("node:path");
 const { resolveBinary } = require("../lib/platform");
 const { maybeNotifyAndRefresh } = require("../lib/update");
-const { version: PACKAGE_VERSION } = require("../package.json");
+const { version: PACKAGE_VERSION, repository } = require("../package.json");
 
 const FORWARDED_SIGNALS = ["SIGINT", "SIGTERM", "SIGHUP"];
 
@@ -25,7 +25,7 @@ const resolved = resolveBinary();
 if (!resolved.ok) {
   process.stderr.write(
     `simple-memory: ${resolved.reason} (${process.platform}-${process.arch}).\n` +
-      "Build from source with ./scripts/install.sh or set SM_BINARY_PATH to an existing sm binary.\n"
+      `Build from source: git clone ${repository.url.replace(/^git\+/, "")}, cd simple-memory, then run ./scripts/install.sh (needs Rust). Or set SM_BINARY_PATH to an existing sm binary.\n`
   );
   process.exit(1);
 }

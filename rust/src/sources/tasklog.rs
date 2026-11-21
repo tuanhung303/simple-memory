@@ -9,7 +9,7 @@ use crate::py::str::{lower, split, strip};
 use crate::py::value::PyValue;
 use crate::py::yaml::safe_load;
 use crate::sources::{
-    SourceFile, dict_get as get, file_error, iterate, mtime, sorted_paths, truthy,
+    Scan, dict_get as get, file_error, iterate, mtime, parse_each, sorted_paths, truthy,
 };
 
 /// `str(data.get(key) or fallback)`.
@@ -20,6 +20,20 @@ fn get_str_or(data: &[(PyValue, PyValue)], key: &str, fallback: &str) -> Result<
     }
 }
 
+/// A YAML scalar: a str, number, bool, date or null.
+fn is_scalar(v: &PyValue) -> bool {
+    matches!(
+        v,
+        PyValue::None
+            | PyValue::Bool(_)
+            | PyValue::Int(_)
+            | PyValue::Float(_)
+            | PyValue::Str(_)
+            | PyValue::Date(_)
+            | PyValue::DateTime(_)
+    )
+}
+
 fn format_section(heading: &str, value: Option<&PyValue>) -> Result<String, SmError> {
     let Some(value) = value.filter(|v| truthy(v)) else {
         return Ok(String::new());
@@ -27,7 +41,23 @@ fn format_section(heading: &str, value: Option<&PyValue>) -> Result<String, SmEr
     if let PyValue::List(items) = value {
         let mut lines: Vec<String> = Vec::new();
         for x in items.iter().filter(|x| !matches!(x, PyValue::None)) {
-            let text = x.try_py_str()?;
+            let text = match x {
+                // `- fixed X (tests: 14 passed)` loads as a one-key mapping: keep the line as written
+                PyValue::Dict(d)
+                    if d.len() == 1
+                        && !matches!(d[0].0, PyValue::None)
+                        && is_scalar(&d[0].0)
+                        && is_scalar(&d[0].1) =>
+                {
+                    let (k, v) = &d[0];
+                    let v = match v {
+                        PyValue::None => String::new(),
+                        v => format!(" {}", v.try_py_str()?),
+                    };
+                    format!("{}:{v}", k.try_py_str()?)
+                }
+                x => x.try_py_str()?,
+            };
             if !strip(&text).is_empty() {
                 lines.push(format!("- {text}"));
             }
@@ -67,13 +97,13 @@ pub fn parse_tasklog_file(path: &str) -> Result<Item, SmError> {
         // impossible date, a value nested too deep) is a fault of this one file, not of the import
         Err(e) => {
             let msg = split(&e.message).join(" ");
-            return Err(SmError::value(format!("Malformed YAML in {p}: {msg}")));
+            return Err(SmError::value(format!("Malformed YAML: {msg}")));
         }
     };
     let PyValue::Dict(data) = data else {
-        return Err(SmError::type_(format!(
-            "Tasklog file {p} does not contain a YAML mapping"
-        )));
+        return Err(SmError::type_(
+            "the file is not a YAML mapping of task log fields (id, title, results)",
+        ));
     };
 
     let task_id = strip(&get_str_or(&data, "id", p.stem())?).to_string();
@@ -183,21 +213,18 @@ pub fn parse_tasklog_file(path: &str) -> Result<Item, SmError> {
     .post_init())
 }
 
-/// `load_tasklogs(path)`: each file with its item.
-pub fn load_tasklogs(path: &str) -> Result<Vec<SourceFile>, SmError> {
+/// `load_tasklogs(path)`: each file with its item; a file the parser refuses stops the import of
+/// that one file, and in a folder only skips that file.
+pub fn load_tasklogs(path: &str) -> Result<Scan, SmError> {
     let p = PyPath::new(path).expanduser()?.resolve()?;
-    let parse = |f: PyPath| {
-        let item = parse_tasklog_file(f.as_str()).map_err(|e| file_error(f.as_str(), e))?;
-        Ok((f, item))
-    };
     if p.is_file() {
-        return Ok(vec![parse(p)?]);
+        let item = parse_tasklog_file(p.as_str()).map_err(|e| file_error(p.as_str(), e))?;
+        return Ok((vec![(p, item)], Vec::new()));
     }
     if p.is_dir() {
-        return sorted_paths(p.rglob("*.yaml")?)
-            .into_iter()
-            .map(parse)
-            .collect();
+        return Ok(parse_each(sorted_paths(p.rglob("*.yaml")?), |f| {
+            parse_tasklog_file(f.as_str())
+        }));
     }
     Err(SmError::new(
         Base::Os,
@@ -227,14 +254,8 @@ mod tests {
             parse_tasklog_file(&write(d.path(), "r/docs/tasklog/a.yaml", yaml.as_bytes()))
         };
         // the loader's error is malformed YAML for the file
-        let a = std::fs::canonicalize(d.path())
-            .unwrap()
-            .join("r/docs/tasklog/a.yaml");
-        let parse_msg = format!(
-            "ValueError: Malformed YAML in {}: Exceeds the limit (4300 digits) for integer string conversion: value has 4301 digits; \
-             use sys.set_int_max_str_digits() to increase the limit",
-            a.display()
-        );
+        let parse_msg = "ValueError: Malformed YAML: Exceeds the limit (4300 digits) for integer string conversion: \
+             value has 4301 digits; use sys.set_int_max_str_digits() to increase the limit";
         let str_msg = "ValueError: Exceeds the limit (4300 digits) for integer string conversion; use sys.set_int_max_str_digits() to increase the limit";
         assert_eq!(
             parse(format!("id: x\ntitle: {}\n", "9".repeat(4301)))
@@ -275,6 +296,7 @@ mod tests {
               as_of: not-an-iso-date\nsuperseded_by: 20261025-010203-abcdef12-sample-task-9999\nresults:\n  - Checked logs\n");
         let items: Vec<Item> = load_tasklogs(d.path().join("anvil/docs/tasklog").to_str().unwrap())
             .unwrap()
+            .0
             .into_iter()
             .map(|(_, it)| it)
             .collect();
@@ -323,13 +345,48 @@ mod tests {
         assert!(e.is(Base::Value));
         assert!(
             e.msg
-                .starts_with(&format!("Malformed YAML in {bad}: while parsing a flow")),
+                .starts_with(&format!("{bad}: Malformed YAML: while parsing a flow")),
             "{}",
             e.msg
         );
         assert!(
             !e.msg.contains('\n'),
             "the YAML message is folded onto one line"
+        );
+    }
+
+    #[test]
+    fn a_folder_skips_each_file_the_parser_refuses_and_keeps_the_rest() {
+        let d = tempfile::tempdir_in(crate::sources::TEST_TMP).unwrap();
+        let tab = write(d.path(), "t/a.yaml", b"id: a\nresults:\n\t- x\n");
+        write(d.path(), "t/b.yaml", b"id: b\nresults:\n  - y\n");
+        let list = write(d.path(), "t/c.yaml", b"- a list\n");
+        let shut = write(d.path(), "t/d.yaml", b"id: d\n");
+        std::fs::set_permissions(&shut, std::os::unix::fs::PermissionsExt::from_mode(0o000))
+            .unwrap();
+        let (files, skipped) = load_tasklogs(d.path().join("t").to_str().unwrap()).unwrap();
+        let sources: Vec<&str> = files.iter().map(|(_, it)| it.source.as_str()).collect();
+        assert_eq!(sources, ["task:b"]);
+        assert_eq!(
+            skipped,
+            [
+                format!(
+                    "{tab}: Malformed YAML: while scanning for the next token found character '\\t' \
+                     that cannot start any token at line 3, column 1: - x ^"
+                ),
+                format!(
+                    "{list}: the file is not a YAML mapping of task log fields (id, title, results)"
+                ),
+                format!("{shut}: [Errno 13] Permission denied: '{shut}'"),
+            ]
+        );
+        assert_eq!(
+            load_tasklogs(&tab).unwrap_err().python_text(),
+            format!(
+                "ValueError: {tab}: Malformed YAML: while scanning for the next token found \
+                 character '\\t' that cannot start any token at line 3, column 1: - x ^"
+            ),
+            "one file the parser refuses stops its import"
         );
     }
 
@@ -433,13 +490,9 @@ mod tests {
         let d = tempfile::tempdir_in(crate::sources::TEST_TMP).unwrap();
         let m = write(d.path(), "m.yaml", b"id: m\nas_of: 2026-13-01\n");
         let e = parse_tasklog_file(&m).unwrap_err();
-        let m = std::fs::canonicalize(&m).unwrap();
         assert_eq!(
             e.python_text(),
-            format!(
-                "ValueError: Malformed YAML in {}: month must be in 1..12, not 13",
-                m.display()
-            ),
+            "ValueError: Malformed YAML: month must be in 1..12, not 13",
             "a datetime ValueError of the loader is malformed YAML for the file"
         );
         let e = parse_tasklog_file(&write(
@@ -460,11 +513,10 @@ mod tests {
             "UnicodeDecodeError: 'utf-8' codec can't decode byte 0xff in position 13: invalid start byte"
         );
         for (name, text) in [("l.yaml", "- a\n"), ("n.yaml", ""), ("s.yaml", "text\n")] {
-            let p = write(d.path(), name, text.as_bytes());
-            let e = parse_tasklog_file(&p).unwrap_err();
+            let e = parse_tasklog_file(&write(d.path(), name, text.as_bytes())).unwrap_err();
             assert_eq!(
                 e.python_text(),
-                format!("TypeError: Tasklog file {p} does not contain a YAML mapping")
+                "TypeError: the file is not a YAML mapping of task log fields (id, title, results)"
             );
         }
         let gone = d.path().join("gone");
@@ -518,6 +570,21 @@ mod tests {
                 PyValue::int(1)
             )])),
             "H:\n{'a': 1}"
+        );
+        let one = |k: PyValue, v: PyValue| PyValue::Dict(vec![(k, v)]);
+        let str_ = |x: &str| PyValue::Str(x.into());
+        assert_eq!(
+            s(PyValue::List(vec![
+                one(str_("fixed X (tests"), str_("14 passed)")),
+                one(str_("tests"), PyValue::int(14)),
+                one(str_("blocked on"), PyValue::None),
+                one(str_("k"), PyValue::List(vec![str_("v")])),
+                one(PyValue::None, str_("v")),
+                PyValue::Dict(vec![(str_("a"), str_("1")), (str_("b"), str_("2"))]),
+            ])),
+            "H:\n- fixed X (tests: 14 passed)\n- tests: 14\n- blocked on:\n- {'k': ['v']}\n\
+             - {None: 'v'}\n- {'a': '1', 'b': '2'}",
+            "a list item that is a one-key mapping of two scalars reads as its line"
         );
     }
 }

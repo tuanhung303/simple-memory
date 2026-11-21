@@ -9,7 +9,7 @@ use crate::error::{Base, SmError};
 use crate::py::path::{Errors, PyPath};
 use crate::py::str::ci_literal;
 use crate::py::str::{RE_S, lower, splitlines, strip, translate};
-use crate::sources::{SourceFile, file_error, mtime, sorted_paths};
+use crate::sources::{Scan, file_error, mtime, parse_each, sorted_paths};
 
 static HEADING_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(&translate(r"^(#{2,3})\s+(.+?)\s*$")).expect("heading pattern"));
@@ -140,25 +140,25 @@ pub fn parse_handoff_file(path: &str, repos: Option<&RepoRoots>) -> Result<Item,
     .post_init())
 }
 
-/// `load_handoffs(path, repos=None)`: each file with its item.
-pub fn load_handoffs(path: &str, repos: Option<&RepoRoots>) -> Result<Vec<SourceFile>, SmError> {
+/// `load_handoffs(path, repos=None)`: each file with its item; a file the parser refuses stops
+/// the import of that one file, and in a folder only skips that file.
+pub fn load_handoffs(path: &str, repos: Option<&RepoRoots>) -> Result<Scan, SmError> {
     let p = PyPath::new(path).expanduser()?.resolve()?;
     let default = RepoRoots::default();
     let known_repos = repos.unwrap_or(&default);
-    let parse = |f: PyPath| {
-        let item = parse_handoff_file(f.as_str(), Some(known_repos))
-            .map_err(|e| file_error(f.as_str(), e))?;
-        Ok((f, item))
-    };
     if p.is_file() {
-        return Ok(vec![parse(p)?]);
+        let item = parse_handoff_file(p.as_str(), Some(known_repos))
+            .map_err(|e| file_error(p.as_str(), e))?;
+        return Ok((vec![(p, item)], Vec::new()));
     }
     if p.is_dir() {
-        return sorted_paths(p.rglob("*.md")?)
+        let files = sorted_paths(p.rglob("*.md")?)
             .into_iter()
             .filter(|f| f.as_str().ends_with(".md"))
-            .map(parse)
             .collect();
+        return Ok(parse_each(files, |f| {
+            parse_handoff_file(f.as_str(), Some(known_repos))
+        }));
     }
     Err(SmError::new(
         Base::Os,
@@ -218,6 +218,7 @@ mod tests {
         let items: Vec<Item> =
             load_handoffs(&s(d.path()), Some(&roots(&["simple-memory", "anvil"])))
                 .unwrap()
+                .0
                 .into_iter()
                 .map(|(_, it)| it)
                 .collect();
@@ -289,7 +290,7 @@ mod tests {
         let d = tmp();
         let f = d.path().join("n.md");
         fs::write(&f, "a\r\nb\rc\n").unwrap();
-        let items = load_handoffs(&s(&f), None).unwrap();
+        let (items, _) = load_handoffs(&s(&f), None).unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].1.body, "a\nb\nc");
     }

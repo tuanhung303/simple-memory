@@ -1,16 +1,18 @@
 use std::collections::{HashMap, HashSet};
 
 use indexmap::IndexMap;
-use rusqlite::Connection;
+use rusqlite::{Connection, OpenFlags};
 
+use crate::cli::query::shlex_quote;
 use crate::config::{aliases, get_db_path, get_home, load_config, repo_roots};
 use crate::core::item::Item;
 use crate::core::redact::redact_for_store;
 use crate::core::tags::has_retired_tag;
-use crate::error::SmError;
+use crate::error::{Base, SmError};
 use crate::py::path::{Errors, PyPath};
 use crate::py::str::{slice, split};
 use crate::py::value::PyValue;
+use crate::service::backup::auto_backups;
 use crate::service::import_::{
     CopyKey, OnePerSource, automemory_without_file, cfg_get, cfg_on, cfg2, path_of,
     plan_automemory, roots_of,
@@ -357,11 +359,7 @@ pub fn run_doctor(
     if dry_run && !backfill_refs {
         return Err(SmError::value("--dry-run applies to --backfill-refs only"));
     }
-    let cfg = if imports {
-        load_config(home)?
-    } else {
-        PyValue::Dict(Vec::new())
-    };
+    let cfg = load_config(home)?;
     let conn = connect(get_db_path(home)?.as_str(), None)?;
     let refs = if backfill_refs {
         fill_refs(&conn, dry_run)?
@@ -382,6 +380,45 @@ pub fn run_doctor(
         lag,
         dry_run,
     })
+}
+
+/// Does the error carry SQLite's text for a damaged file (SQLITE_CORRUPT, SQLITE_NOTADB)?
+pub fn is_damaged(e: &SmError) -> bool {
+    e.is(Base::Sqlite)
+        && e.class == "DatabaseError"
+        && ["malformed", "not a database", "vtable constructor failed"]
+            .iter()
+            .any(|w| e.msg.contains(w))
+}
+
+/// What to do after an `is_damaged` error: the newest backup and the two steps that put it in
+/// place, or that there is none. Nothing when memory.db passes `quick_check`, since the error then
+/// came from another file (`sm import legacy <db>`).
+pub fn restore_steps(home: Option<&str>) -> Result<Vec<String>, SmError> {
+    let h = get_home(home)?;
+    let db = h.join("memory.db");
+    let check = Connection::open_with_flags(db.to_os(), OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .and_then(|c| c.query_row("PRAGMA quick_check", [], |r| r.get::<_, String>(0)));
+    if check.is_ok_and(|v| v == "ok") {
+        return Ok(Vec::new());
+    }
+    let Some(backup) = auto_backups(home)?.pop() else {
+        return Ok(vec![format!(
+            "{db} looks damaged and {} holds no backup to restore",
+            h.join("backups")
+        )]);
+    };
+    let (q, aside) = (|p: &PyPath| shlex_quote(p.as_str()), h.join("damaged"));
+    Ok(vec![
+        format!("{db} looks damaged; to restore the newest backup, {backup}:"),
+        format!(
+            "  1. mkdir -p {} && mv {}/memory.db* {}/",
+            q(&aside),
+            q(&h),
+            q(&aside)
+        ),
+        format!("  2. cp {} {}", q(&backup), q(&db)),
+    ])
 }
 
 #[cfg(test)]

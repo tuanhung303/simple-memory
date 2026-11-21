@@ -661,6 +661,10 @@ setInterval(() => {}, 10000);
       assert.equal(missing.stdout, "");
       assert.match(missing.stderr, new RegExp(`${process.platform}-${process.arch}`));
       assert.match(missing.stderr, /\.\/scripts\/install\.sh/);
+      assert.match(
+        missing.stderr,
+        /git clone https:\/\/github\.com\/tuanhung303\/simple-memory\.git, cd simple-memory, then run/
+      );
       assert.match(missing.stderr, /SM_BINARY_PATH/);
 
       const dirRun = spawnSync(process.execPath, [BIN_SM], {
@@ -1346,6 +1350,10 @@ describe("scripts/postinstall.js", () => {
         });
         assert.equal(unsupCode, 0);
         assert.match(unsupErr.text(), /no prebuilt binary for win32-x64/);
+        assert.match(
+          unsupErr.text(),
+          /git clone https:\/\/github\.com\/tuanhung303\/simple-memory\.git, cd simple-memory, then run \.\/scripts\/install\.sh/
+        );
         assert.equal(requests, 0);
       });
     } finally {
@@ -1528,6 +1536,7 @@ describe("scripts/postinstall.js", () => {
           });
           assert.equal(rc, 0, `mode ${m} should warn and exit 0`);
           assert.match(errOut.text(), /\.\/scripts\/install\.sh/);
+          assert.match(errOut.text(), /git clone https:\/\/github\.com\/tuanhung303\/simple-memory\.git, cd simple-memory/);
           assert.match(errOut.text(), wantPattern);
           assert.equal(fs.existsSync(path.join(vendorDir, "sm")), false);
         }

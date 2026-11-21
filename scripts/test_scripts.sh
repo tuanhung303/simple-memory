@@ -128,6 +128,24 @@ if [[ $rc == 0 && -x "$tmp/inst-dest/sm" && -L "$tmp/inst-dest/simple-memory" &&
 else
     bad "install.sh builds, atomically installs binary + symlink, prints version and PATH hint" "rc=$rc out='$inst_out'"
 fi
+# the build starts inside rust/, so rust/rust-toolchain.toml applies (rustup reads it from the working directory only), and a relative CARGO_TARGET_DIR still names the folder it was given in
+mkdir -p "$tmp/inst-bin2" "$tmp/inst-dest2" "$tmp/inst-cwd/rel-target/release"
+cat > "$tmp/inst-bin2/cargo" <<EOF
+#!/bin/sh
+{ pwd -P; echo "\$CARGO_TARGET_DIR"; } > "$tmp/inst-cargo2.log"
+EOF
+chmod 755 "$tmp/inst-bin2/cargo"
+cp "$sm_bin" "$tmp/inst-cwd/rel-target/release/sm"
+chmod 755 "$tmp/inst-cwd/rel-target/release/sm"
+inst_cwd=$(cd "$tmp/inst-cwd" && env -i PATH="$tmp/inst-bin2:/usr/bin:/bin" HOME="$tmp" CARGO_TARGET_DIR=rel-target SM_INSTALL_DIR="$tmp/inst-dest2" bash "$repo/scripts/install.sh" 2>&1)
+rc=$?
+want_cwd=$(cd "$repo/rust" && pwd -P)
+want_target=$(cd "$tmp/inst-cwd" && pwd -P)/rel-target
+if [[ $rc == 0 && "$(sed -n 1p "$tmp/inst-cargo2.log")" == "$want_cwd" && "$(sed -n 2p "$tmp/inst-cargo2.log")" == "$want_target" ]]; then
+    ok "install.sh builds from inside rust/ and keeps a relative CARGO_TARGET_DIR"
+else
+    bad "install.sh builds from inside rust/ and keeps a relative CARGO_TARGET_DIR" "rc=$rc log='$(cat "$tmp/inst-cargo2.log" 2>/dev/null)' out='$inst_cwd'"
+fi
 inst_on_path=$(env -i PATH="$tmp/inst-dest:$tmp/inst-bin:/usr/bin:/bin" HOME="$tmp" SM_INSTALL_DIR="$tmp/inst-dest" bash "$repo/scripts/install.sh" 2>&1)
 rc2=$?
 if [[ $rc2 == 0 && "$inst_on_path" != *"Add "* ]]; then

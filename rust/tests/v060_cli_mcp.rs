@@ -308,7 +308,10 @@ fn show_format_json_emits_full_provenance_array_and_handles_missing() {
     // Partial missing: exit 1, stdout stays valid JSON array of found items, stderr lists missing.
     let (code, out, err) = fx.sm(&["show", &id1, "m_missing", "--format", "json"]);
     assert_eq!(code, 1);
-    assert_eq!(err, "not found: m_missing\n");
+    assert_eq!(
+        err,
+        "error: item m_missing not found (ids are case-sensitive and must be given in full)\n"
+    );
     let partial: Vec<Value> = serde_json::from_str(&out).unwrap();
     assert_eq!(partial.len(), 1);
     assert_eq!(partial[0]["id"], id1);
@@ -317,7 +320,11 @@ fn show_format_json_emits_full_provenance_array_and_handles_missing() {
     let (code, out, err) = fx.sm(&["show", "m_missing", "--format", "json"]);
     assert_eq!(
         (code, out.as_str(), err.as_str()),
-        (1, "[]\n", "not found: m_missing\n")
+        (
+            1,
+            "[]\n",
+            "error: item m_missing not found (ids are case-sensitive and must be given in full)\n"
+        )
     );
 
     // Invalid format exits 2.
@@ -330,9 +337,12 @@ fn show_format_json_emits_full_provenance_array_and_handles_missing() {
 fn list_empty_repo_prints_other_repos_hint_only_when_appropriate() {
     let fx = Fx::new();
 
-    // Completely empty store prints nothing.
+    // Completely empty store: stdout stays empty, stderr says why.
     let (code, out, err) = fx.sm(&["list", "--repo", "anvil"]);
-    assert_eq!((code, out.as_str(), err.as_str()), (0, "", ""));
+    assert_eq!(
+        (code, out.as_str(), err.as_str()),
+        (0, "", "no items in repo anvil\n")
+    );
 
     // Seed items in other repos: 2 active in beta, 1 active in global, 1 retired in gamma.
     fx.put(&["--repo", "beta", "--tag", "decided", "Beta item 1"]);
@@ -353,29 +363,38 @@ fn list_empty_repo_prints_other_repos_hint_only_when_appropriate() {
         (0, "other repos: beta=2 global=1 -> sm list --all\n", "")
     );
 
-    // JSON format stays pure JSON without raw hint text.
+    // JSON format stays pure JSON without raw hint text; stderr says why it is empty.
     let (code, out, err) = fx.sm(&["list", "--repo", "anvil", "--format", "json"]);
-    assert_eq!((code, err.as_str()), (0, ""));
+    assert_eq!((code, err.as_str()), (0, "no items in repo anvil\n"));
     let v: Value = serde_json::from_str(&out).unwrap();
     assert_eq!(v["total"], 0);
     assert_eq!(v["items"], json!([]));
 
-    // Offset past total on non-empty repo `beta` prints nothing.
+    // Offset past total on non-empty repo `beta`: stdout stays empty, stderr says why.
     let (code, out, err) = fx.sm(&["list", "--repo", "beta", "--offset", "99"]);
-    assert_eq!((code, out.as_str(), err.as_str()), (0, "", ""));
+    assert_eq!(
+        (code, out.as_str(), err.as_str()),
+        (0, "", "offset 99 is past the end (2 items)\n")
+    );
 
-    // `--all` with 0 matches prints nothing.
+    // `--all` with 0 matches: stdout stays empty, stderr says why.
     let (code, out, err) = fx.sm(&["list", "--all", "--kind", "handoff"]);
-    assert_eq!((code, out.as_str(), err.as_str()), (0, "", ""));
+    assert_eq!(
+        (code, out.as_str(), err.as_str()),
+        (0, "", "no items match the filters in any repo\n")
+    );
 
-    // `--in` with 0 matches prints nothing.
+    // `--in` with 0 matches: stdout stays empty, stderr says why.
     std::fs::write(
         fx.home().join("config.toml"),
         "[scopes]\nacme = [\"repo:anvil\"]\n",
     )
     .unwrap();
     let (code, out, err) = fx.sm(&["list", "--in", "acme"]);
-    assert_eq!((code, out.as_str(), err.as_str()), (0, "", ""));
+    assert_eq!(
+        (code, out.as_str(), err.as_str()),
+        (0, "", "no items in scope acme\n")
+    );
 }
 
 #[test]
@@ -690,11 +709,17 @@ fn list_empty_repo_hint_respects_all_active_filters() {
 
     // Filtering by --kind handoff (active): beta has 0 active handoffs -> NO false hint.
     let (code, out, err) = fx.sm(&["list", "--repo", "anvil", "--kind", "handoff"]);
-    assert_eq!((code, out.as_str(), err.as_str()), (0, "", ""));
+    assert_eq!(
+        (code, out.as_str(), err.as_str()),
+        (0, "", "no items match the filters in repo anvil\n")
+    );
 
     // Filtering by future --since: 0 matches in beta -> NO false hint.
     let (code, out, err) = fx.sm(&["list", "--repo", "anvil", "--since", "2099-01-01"]);
-    assert_eq!((code, out.as_str(), err.as_str()), (0, "", ""));
+    assert_eq!(
+        (code, out.as_str(), err.as_str()),
+        (0, "", "no items match the filters in repo anvil\n")
+    );
 
     // Filtering by --status retired: beta has 1 retired item -> accurate count AND carries --status retired.
     let (code, out, err) = fx.sm(&["list", "--repo", "anvil", "--status", "retired"]);
@@ -710,5 +735,302 @@ fn list_empty_repo_hint_respects_all_active_filters() {
     assert_eq!(
         out.trim(),
         "other repos: beta=1 -> sm list --all --kind fact"
+    );
+}
+
+const STDIN_HINT: &str =
+    "sm put does not read stdin: give the text as an argument, as in sm put --tag <tag> \"<text>\"";
+
+#[test]
+fn put_refuses_a_dash_body_and_an_empty_body_says_stdin_is_not_read() {
+    let fx = Fx::new();
+    for dash in ["-", " - "] {
+        let (code, out, err) = fx.sm(&["put", "--repo", "anvil", "--tag", "prior", dash]);
+        assert_eq!(
+            (code, out.as_str(), err),
+            (
+                1,
+                "",
+                format!("error: the body is \"-\", but {STDIN_HINT}\n")
+            )
+        );
+    }
+    let (code, out, err) = fx.sm(&["put", "--repo", "anvil", "--tag", "prior"]);
+    assert_eq!(
+        (code, out.as_str(), err),
+        (
+            1,
+            "",
+            format!("{STDIN_HINT}\nerror: Item body cannot be empty\n")
+        )
+    );
+    // A dash inside a longer body is text, not a stdin marker.
+    let id = fx.put(&["--repo", "anvil", "--tag", "prior", "a", "-", "b"]);
+    let (_, out, _) = fx.sm(&["show", &id]);
+    assert!(out.ends_with("\na - b\n"), "{out}");
+    let (_, out, _) = fx.sm(&["list", "--all", "--format", "json"]);
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["total"], 1);
+}
+
+#[test]
+fn help_names_defaults_separators_stdin_and_what_apply_writes() {
+    let fx = Fx::new();
+    let help = |args: &[&str]| {
+        let (code, out, err) = fx.sm(args);
+        assert_eq!((code, err.as_str()), (0, ""), "{args:?}");
+        out
+    };
+    let rows = [
+        (
+            &["list", "--help"][..],
+            "brief (default): one line per item; text: a header and a snippet per item; json: one JSON object with the items, total and paging",
+        ),
+        (
+            &["query", "--help"][..],
+            "text (default): a header and a snippet per hit; brief: one line per hit; json: one JSON object with each hit's fields, snippet and why it matched",
+        ),
+        (
+            &["list", "--help"][..],
+            "Keep items with as_of on or after this time: an ISO 8601 date or timestamp, or a relative form such as 30m, 24h, 7d or 2w (minutes, hours, days or weeks back)",
+        ),
+        (
+            &["query", "--help"][..],
+            "Keep items with as_of on or before this time: an ISO 8601 date or timestamp (a date includes the full day), or a relative form such as 30m, 24h, 7d or 2w",
+        ),
+        (
+            &["put", "--help"][..],
+            "Memory text to store, as one or more arguments (sm put does not read stdin)",
+        ),
+        (
+            &["put", "--help"][..],
+            "References (ticket ids, shas, paths), separated by commas or spaces; repeat the flag to add more",
+        ),
+        (
+            &["put", "--help"][..],
+            "Freeform tags, separated by commas (a space stays inside a tag); repeat the flag to add more",
+        ),
+        (
+            &["put", "--help"][..],
+            "Old item id(s) this item supersedes, separated by commas or spaces",
+        ),
+        (
+            &["amend", "--help"][..],
+            "exits 1 with \"No changes to apply\" when every value given matches the item",
+        ),
+        (
+            &["--help"][..],
+            "Import items from files (tasklog, handoff, legacy, proposal, automemory, sessions, jsonl, catch-up)",
+        ),
+        (
+            &["import", "tasklog", "--help"][..],
+            "No effect for this source (only a proposal import needs it); the import writes without it",
+        ),
+        (
+            &["import", "proposal", "--help"][..],
+            "Write the proposal rows into the store (without it a proposal import only counts them)",
+        ),
+        (
+            &["hooks", "print", "--help"][..],
+            "Harness to print the hook for: claude-code, agy or mcp",
+        ),
+    ];
+    for (args, row) in rows {
+        let out = help(args);
+        assert!(out.contains(row), "{args:?} lacks {row:?}:\n{out}");
+    }
+    for (args, line) in [
+        (
+            &["hooks"][..],
+            "sm hooks: error: the following arguments are required: {print}\n",
+        ),
+        (
+            &["hooks", "print"][..],
+            "sm hooks print: error: the following arguments are required: {claude-code,agy,mcp}\n",
+        ),
+    ] {
+        let (code, _, err) = fx.sm(args);
+        assert_eq!(code, 2);
+        assert!(err.ends_with(line), "{args:?}: {err}");
+    }
+}
+
+#[test]
+fn a_wrong_flag_on_a_subcommand_prints_that_subcommands_usage() {
+    let fx = Fx::new();
+    let (code, out, err) = fx.sm(&["amend", "m_X", "--text", "x"]);
+    assert_eq!((code, out.as_str()), (2, ""));
+    let lines: Vec<&str> = err.lines().collect();
+    assert!(
+        lines[0].starts_with("usage: sm amend [-h] [--repo REPO]"),
+        "{err}"
+    );
+    assert_eq!(
+        lines[1..],
+        ["sm amend: error: unrecognized arguments: --text x; see sm amend --help"]
+    );
+    let (code, _, err) = fx.sm(&["import", "tasklog", "p", "extra"]);
+    assert_eq!(code, 2);
+    assert!(err.starts_with("usage: sm import tasklog [-h]"), "{err}");
+    assert!(
+        err.ends_with(
+            "sm import tasklog: error: unrecognized arguments: extra; see sm import tasklog --help\n"
+        ),
+        "{err}"
+    );
+    // A flag before the command is the top-level parser's: its usage stays.
+    let (code, _, err) = fx.sm(&["--zz", "list"]);
+    assert_eq!(code, 2);
+    assert!(err.starts_with("usage: sm [-h] [-v]"), "{err}");
+    assert!(
+        err.ends_with("sm: error: unrecognized arguments: --zz\n"),
+        "{err}"
+    );
+}
+
+#[test]
+fn every_command_that_takes_an_id_says_item_not_found_in_one_form() {
+    let fx = Fx::new();
+    let id = fx.put(&["--repo", "anvil", "--tag", "prior", "Pool size is 16"]);
+    let full = "m_01AAAAAAAAAAAAAAAAAAAAAAAA";
+    let hint = " (ids are case-sensitive and must be given in full)";
+    let lower = id.to_lowercase();
+    let short = &id[..10];
+    let cases: Vec<(Vec<&str>, String)> = vec![
+        (vec!["show", full], format!("item {full} not found")),
+        (
+            vec!["show", &lower],
+            format!("item {lower} not found{hint}"),
+        ),
+        (
+            vec!["related", short],
+            format!("item {short} not found{hint}"),
+        ),
+        (vec!["related", full], format!("item {full} not found")),
+        (
+            vec!["supersede", full, &id],
+            format!("item {full} not found"),
+        ),
+        (
+            vec!["supersede", &id, short],
+            format!("item {short} not found{hint}"),
+        ),
+        (
+            vec!["retire", &lower],
+            format!("item {lower} not found{hint}"),
+        ),
+        (
+            vec!["amend", full, "--title", "t"],
+            format!("item {full} not found"),
+        ),
+        (
+            vec![
+                "put",
+                "--repo",
+                "anvil",
+                "--tag",
+                "prior",
+                "--supersedes",
+                short,
+                "new body",
+            ],
+            format!("item {short} not found{hint}"),
+        ),
+    ];
+    for (args, msg) in cases {
+        let (code, _, err) = fx.sm(&args);
+        assert_eq!((code, err), (1, format!("error: {msg}\n")), "{args:?}");
+    }
+}
+
+#[test]
+fn value_errors_name_fields_and_the_forms_that_work() {
+    let fx = Fx::new();
+    let id = fx.put(&["--repo", "anvil", "--tag", "prior", "Pool size is 16"]);
+    for (args, msg) in [
+        (
+            vec!["put", "--repo", "anvil", "--tag", "verified", "x"],
+            "error: Tag 'verified' needs non-empty evidence\n",
+        ),
+        (
+            vec!["amend", id.as_str()],
+            "error: amend needs at least one field to change\n",
+        ),
+        (
+            vec!["list", "--since", "7x"],
+            "error: Invalid ISO 8601 timestamp '7x'; a relative form (30m, 24h, 7d, 2w) also works\n",
+        ),
+        (
+            vec!["query", "pool", "--until", "7x"],
+            "error: Invalid ISO 8601 timestamp '7x'; a relative form (30m, 24h, 7d, 2w) also works\n",
+        ),
+        (
+            vec![
+                "put", "--repo", "anvil", "--tag", "prior", "--as-of", "7d", "y",
+            ],
+            "error: Invalid ISO 8601 timestamp '7d'\n",
+        ),
+        (
+            vec!["stats", "--days", "0"],
+            "error: --days must be above 0, got 0\n",
+        ),
+        (
+            vec!["stats", "--days", "-1.5"],
+            "error: --days must be above 0, got -1.5\n",
+        ),
+    ] {
+        let (code, _, err) = fx.sm(&args);
+        assert_eq!((code, err.as_str()), (1, msg), "{args:?}");
+    }
+}
+
+#[test]
+fn empty_list_and_export_say_why_on_stderr() {
+    let fx = Fx::new();
+    let (code, out, err) = fx.sm(&["list", "--repo", "anvil"]);
+    assert_eq!(
+        (code, out.as_str(), err.as_str()),
+        (0, "", "no items in repo anvil\n")
+    );
+    let (code, out, err) = fx.sm(&["list", "--repo", "anvil", "--format", "json"]);
+    assert_eq!((code, err.as_str()), (0, "no items in repo anvil\n"));
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(
+        (v["total"].clone(), v["items"].clone()),
+        (json!(0), json!([]))
+    );
+    let (code, out, err) = fx.sm(&["export", "--repo", "nope"]);
+    assert_eq!(
+        (code, out.as_str(), err.as_str()),
+        (
+            0,
+            "",
+            "no items in repo nope (sm export --all exports every repo)\n"
+        )
+    );
+    fx.put(&["--repo", "anvil", "--tag", "prior", "first item"]);
+    let (_, _, err) = fx.sm(&["list", "--repo", "anvil", "--offset", "1"]);
+    assert_eq!(err, "offset 1 is past the end (1 item)\n");
+    fx.put(&["--repo", "anvil", "--tag", "prior", "second note"]);
+    let (code, out, err) = fx.sm(&["list", "--repo", "anvil", "--offset", "300"]);
+    assert_eq!(
+        (code, out.as_str(), err.as_str()),
+        (0, "", "offset 300 is past the end (2 items)\n")
+    );
+    let (code, out, err) = fx.sm(&["list", "--repo", "anvil", "--kind", "handoff"]);
+    assert_eq!(
+        (code, out.as_str(), err.as_str()),
+        (0, "", "no items match the filters in repo anvil\n")
+    );
+    let (code, out, err) = fx.sm(&["list", "--all", "--kind", "handoff"]);
+    assert_eq!(
+        (code, out.as_str(), err.as_str()),
+        (0, "", "no items match the filters in any repo\n")
+    );
+    // The other-repos hint on stdout already says why: no stderr line.
+    let (code, out, err) = fx.sm(&["list", "--repo", "beta"]);
+    assert_eq!(
+        (code, out.as_str(), err.as_str()),
+        (0, "other repos: anvil=2 -> sm list --all\n", "")
     );
 }

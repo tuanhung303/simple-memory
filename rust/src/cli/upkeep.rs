@@ -127,8 +127,8 @@ mod tests {
     }
 
     /// While another process holds hook/catchup.lock, a manual run that writes prints
-    /// LOCK_HELD_MESSAGE and exits 1 before it opens memory.db; a catch-up exits 0 silently and
-    /// writes no catchup.log row. The home comes from SIMPLE_MEMORY_HOME, so the runs happen in a
+    /// LOCK_HELD_MESSAGE and exits 1 before it opens memory.db; a catch-up says it skipped, exits
+    /// 0 and writes no catchup.log row. The home comes from SIMPLE_MEMORY_HOME, so the runs happen in a
     /// child test process that gets a scratch one.
     #[test]
     fn a_held_catchup_lock_stops_every_manual_run_that_writes() {
@@ -148,7 +148,11 @@ mod tests {
             );
             assert_eq!(
                 sm(&["import", "catch-up"]),
-                (0, String::new(), String::new())
+                (
+                    0,
+                    "catch-up: another run is in progress; skipped".to_string(),
+                    String::new()
+                )
             );
             assert!(!std::path::Path::new(&format!("{h}/memory.db")).exists());
             assert!(!std::path::Path::new(&format!("{h}/catchup.log")).exists());

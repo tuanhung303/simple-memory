@@ -50,7 +50,7 @@ pub fn run(ns: &Namespace, out: &mut Out) -> Result<i32, SmError> {
         }
     }
     for id in &missing {
-        out.eprint(&format!("not found: {id}"))?;
+        out.eprint(&format!("error: {}", SmError::not_found(id).msg))?;
     }
     let ids: Vec<String> = found.iter().map(|it| it.id.clone()).collect();
     log_usage("show", &ids, None, None, None)?;

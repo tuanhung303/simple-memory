@@ -2,7 +2,7 @@
 
 use crate::cli::query::{HEADER_REFS_CHARS, HOOK_TITLE_CHARS, compact_refs};
 use crate::core::item::Item;
-use crate::error::{Base, SmError};
+use crate::error::SmError;
 use crate::py;
 use crate::py::argparse::Namespace;
 use crate::py::io::Out;
@@ -80,14 +80,7 @@ pub fn format_related(target: &Item, related: &[Related], skipped: &[String], fm
 
 pub fn run(ns: &Namespace, out: &mut Out) -> Result<i32, SmError> {
     let id = ns.get_str("id");
-    let (target, related, skipped) = match run_related(id, ns.get_int("limit"), None) {
-        Ok(found) => found,
-        Err(e) if e.is(Base::Key) => {
-            out.eprint(&format!("not found: {id}"))?;
-            return Ok(1);
-        }
-        Err(e) => return Err(e),
-    };
+    let (target, related, skipped) = run_related(id, ns.get_int("limit"), None)?;
     out.print(&format_related(
         &target,
         &related,

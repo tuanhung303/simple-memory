@@ -1101,7 +1101,7 @@ fn negative_limit_fails_before_db_or_git_work() {
             &format!(
                 "[prompt_hook]\nlimit = -1\n{min_idf_cfg}\
                  [query]\ndefault_bias = [\"bogus\"]\n\
-                 [repos]\nroots = 5\n"
+                 [repos]\nroots = [5]\n"
             ),
         );
         let err = run_ok(&home, "check anvil negative limit", &repo, "", "anvil").unwrap_err();

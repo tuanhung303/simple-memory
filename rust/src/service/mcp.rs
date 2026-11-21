@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 
 use crate::core::rank::DEFAULT_QUERY_LIMIT;
 use crate::core::refs::RefsArg;
-use crate::core::tags::{VALID_KINDS, VALID_TAGS};
+use crate::core::tags::{ALL_TAGS, VALID_KINDS, VALID_TAGS};
 use crate::error::{Base, SmError};
 use crate::py;
 use crate::py::io::Out;
@@ -49,8 +49,8 @@ fn tools_json() -> Value {
     let repo = json!({"type": "string", "description": "Repo key; default: the repo of the server's working folder"});
     let scopes_in = json!({"type": "string", "description": "Comma-separated [scopes] paths (company/client/project) whose items to keep; searches every repo"});
     let source = json!({"type": "string", "description": "Comma-separated source prefixes (case-sensitive)"});
-    let since = json!({"type": "string", "description": "Keep items with as_of on or after ISO 8601 date or timestamp"});
-    let until = json!({"type": "string", "description": "Keep items with as_of on or before ISO 8601 date or timestamp (date-only includes full day)"});
+    let since = json!({"type": "string", "description": "Keep items with as_of on or after this ISO 8601 date or timestamp, or a relative bound such as 24h, 7d"});
+    let until = json!({"type": "string", "description": "Keep items with as_of on or before this ISO 8601 date or timestamp (date-only includes full day), or a relative bound such as 24h, 7d"});
     json!([
         {
             "name": "memory_query",
@@ -62,7 +62,7 @@ fn tools_json() -> Value {
                     "query": {"type": "string", "description": "Words, ticket ids, shas or paths"},
                     "bias": {"type": "string", "description": "Comma-separated reorder: recency, durable kinds and verified/decided tags by default ([query] default_bias); relevance, a tag, a kind, or scope:<path>"},
                     "kind": {"type": "string", "description": format!("Comma-separated kind filter: {}", VALID_KINDS.join(", "))},
-                    "tag": {"type": "string", "description": format!("Comma-separated tag filter: {}", VALID_TAGS.join(", "))},
+                    "tag": {"type": "string", "description": format!("Comma-separated tag filter: {}", ALL_TAGS.join(", "))},
                     "source": source,
                     "since": since,
                     "until": until,
@@ -83,7 +83,7 @@ fn tools_json() -> Value {
             "description": "Full text and provenance of each id, in the order given. isError when an id is not found.",
             "inputSchema": {
                 "type": "object",
-                "properties": {"ids": {"type": "array", "items": {"type": "string"}, "minItems": 1}},
+                "properties": {"ids": {"type": "array", "items": {"type": "string"}, "minItems": 1, "description": "Item ids"}},
                 "required": ["ids"],
                 "additionalProperties": false,
             },
@@ -95,8 +95,8 @@ fn tools_json() -> Value {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "id": {"type": "string"},
-                    "limit": {"type": "integer", "minimum": 1, "default": DEFAULT_RELATED_LIMIT},
+                    "id": {"type": "string", "description": "Item id"},
+                    "limit": {"type": "integer", "minimum": 1, "default": DEFAULT_RELATED_LIMIT, "description": "Most related items to return"},
                 },
                 "required": ["id"],
                 "additionalProperties": false,
@@ -109,12 +109,12 @@ fn tools_json() -> Value {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "text": {"type": "string", "description": "The item body; its first line is the title"},
+                    "text": {"type": "string", "description": "The item body (sm put takes it as body); its first line is the title"},
                     "kind": {"type": "string", "enum": VALID_KINDS, "default": "fact"},
                     "tag": {"type": "string", "enum": VALID_TAGS},
                     "evidence": {"type": "string", "description": "Command, sha, file:line or quote behind the tag"},
-                    "refs": {"type": "string", "description": "Ticket ids, shas or paths, space-separated"},
-                    "supersedes": {"type": "string", "description": "Old item ids this item replaces, space-separated"},
+                    "refs": {"type": "string", "description": "Ticket ids, shas or paths, separated by spaces or commas"},
+                    "supersedes": {"type": "string", "description": "Old item ids this item replaces, separated by spaces or commas"},
                     "repo": repo,
                 },
                 "required": ["text", "tag"],
@@ -127,7 +127,10 @@ fn tools_json() -> Value {
             "description": "Mark old_id superseded by new_id; a normal query then hides old_id.",
             "inputSchema": {
                 "type": "object",
-                "properties": {"old_id": {"type": "string"}, "new_id": {"type": "string"}},
+                "properties": {
+                    "old_id": {"type": "string", "description": "Item to retire"},
+                    "new_id": {"type": "string", "description": "Item that replaces it"},
+                },
                 "required": ["old_id", "new_id"],
                 "additionalProperties": false,
             },
@@ -135,14 +138,14 @@ fn tools_json() -> Value {
         {
             "name": "memory_list",
             "title": "List memory items",
-            "description": "Browse stored memory items chronologically with filters and pagination. Returns the JSON of `sm list --format json`.",
+            "description": "Browse stored memory items, newest first, with filters and pagination. Returns the JSON of `sm list --format json`.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "limit": {"type": "integer", "minimum": 1, "default": DEFAULT_LIST_LIMIT},
                     "offset": {"type": "integer", "minimum": 0, "default": 0},
                     "kind": {"type": "string", "description": format!("Comma-separated kind filter: {}", VALID_KINDS.join(", "))},
-                    "tag": {"type": "string", "description": format!("Comma-separated tag filter: {}", VALID_TAGS.join(", "))},
+                    "tag": {"type": "string", "description": format!("Comma-separated tag filter: {}", ALL_TAGS.join(", "))},
                     "source": source,
                     "since": since,
                     "until": until,
@@ -164,15 +167,15 @@ fn tools_json() -> Value {
                 "type": "object",
                 "properties": {
                     "id": {"type": "string", "description": "Active item id to amend"},
-                    "text": {"type": "string", "description": "Replace body text"},
+                    "text": {"type": "string", "description": "Replace body text (--body on sm amend)"},
                     "title": {"type": "string", "description": "Replace title"},
                     "kind": {"type": "string", "enum": VALID_KINDS, "description": "Replace kind"},
                     "tag": {"type": "string", "enum": VALID_TAGS, "description": "Replace evidence tag"},
                     "evidence": {"type": "string", "description": "Replace evidence text"},
                     "repo": {"type": "string", "description": "Replace repo"},
-                    "add_refs": {"type": "string", "description": "Add references (space- or comma-separated)"},
-                    "remove_refs": {"type": "string", "description": "Remove references (space- or comma-separated)"},
-                    "refs": {"type": "string", "description": "Replace references (space- or comma-separated)"},
+                    "add_refs": {"type": "string", "description": "Add references (separated by spaces or commas)"},
+                    "remove_refs": {"type": "string", "description": "Remove references (separated by spaces or commas)"},
+                    "refs": {"type": "string", "description": "Replace references (separated by spaces or commas)"},
                     "add_tags": {"type": "string", "description": "Add comma-separated freeform tags"},
                     "remove_tags": {"type": "string", "description": "Remove comma-separated freeform tags"},
                     "tags": {"type": "string", "description": "Replace comma-separated freeform tags"},
@@ -190,7 +193,7 @@ fn tools_json() -> Value {
                 "type": "object",
                 "properties": {
                     "id": {"type": "string", "description": "Active item id to retire"},
-                    "reason": {"type": "string", "default": "", "description": "Reason for retiring the item (default: manual)"},
+                    "reason": {"type": "string", "default": "manual", "description": "Why the item is retired; no commas"},
                 },
                 "required": ["id"],
                 "additionalProperties": false,
@@ -690,11 +693,11 @@ impl Server {
         let name = match get(params, "name") {
             Some(PyValue::Str(n)) if tool_schema(n).is_some() => n.clone(),
             other => {
-                let shown = other.map_or_else(|| "None".to_string(), PyValue::py_str);
-                return Err(Fail::Rpc(rpc(
-                    INVALID_PARAMS,
-                    format!("Unknown tool: {shown}"),
-                )));
+                let message = match other {
+                    None | Some(PyValue::None) => "missing argument 'name'".to_string(),
+                    Some(v) => format!("Unknown tool: {}", v.py_str()),
+                };
+                return Err(Fail::Rpc(rpc(INVALID_PARAMS, message)));
             }
         };
         let empty = PyValue::Dict(Vec::new());
@@ -1040,8 +1043,10 @@ pub fn serve(
 ) -> Result<i32, SmError> {
     let server = Server::new(home);
     out.eprint(&format!(
-        "sm mcp: serving MCP {} and {} on stdio",
-        MODERN_VERSIONS[0], LEGACY_VERSIONS[0]
+        "sm mcp: serving MCP {} and {} to {} on stdio",
+        MODERN_VERSIONS[0],
+        LEGACY_VERSIONS[LEGACY_VERSIONS.len() - 1],
+        LEGACY_VERSIONS[0]
     ))?;
     loop {
         let mut raw = Vec::new();

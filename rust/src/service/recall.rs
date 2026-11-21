@@ -18,6 +18,7 @@ use crate::config::{
 use crate::core::fold::{fold, has_accents};
 use crate::core::item::Item;
 use crate::core::rank::{is_hint_term, query_terms};
+use crate::core::redact::redact_text;
 use crate::core::terms::{expand_aliases, quote_fts_term, stands_as_word, word_runs};
 use crate::error::{Base, SmError};
 use crate::py;
@@ -30,7 +31,7 @@ use crate::py::value::PyValue;
 use crate::service::capture::timeout_expired;
 use crate::service::capture::{Completed, Run, Stdio as TraceStdio, run_process, trace_spawn};
 use crate::service::query::{
-    QueryArgs, StrList, default_bias_from_cfg, keyword_aliases, resolve_scope_biases,
+    LocalFound, QueryArgs, StrList, default_bias_from_cfg, keyword_aliases, resolve_scope_biases,
     run_local_query, run_query, scope_df,
 };
 use crate::store::connect::connect;
@@ -39,6 +40,8 @@ use crate::store::search::{
 };
 
 pub const DEFAULT_HAIKU_MIN_IDF: f64 = 3.0;
+/// Both idf floors, the model's `min_idf` and the local `local_min_idf`, apply only from this many
+/// active items in scope: below it every idf is too small to tell a topic word from a common one.
 pub const HAIKU_FLOOR_MIN_SCOPE: i64 = 20;
 
 pub const MAX_PROMPT_CHARS: usize = 2000;
@@ -172,11 +175,20 @@ pub fn clean_query(raw: &str) -> String {
             return if line.to_uppercase() == "NONE" {
                 String::new()
             } else {
-                slice(line, None, Some(MAX_QUERY_CHARS as isize)).to_string()
+                slice(&redact_query(line), None, Some(MAX_QUERY_CHARS as isize)).to_string()
             };
         }
     }
     String::new()
+}
+
+static REDACTED_MARK_RE: LazyLock<PyRegex> =
+    LazyLock::new(|| PyRegex::new(r"\[REDACTED:\w+\]").expect("the marker pattern compiles"));
+
+/// The text with each secret cut as the store cuts it on write, and no marker left to become a
+/// search term: both the model's query and the local path's prompt go through it.
+pub fn redact_query(text: &str) -> String {
+    split(&REDACTED_MARK_RE.sub(&redact_text(text, None, None), " ", 0)).join(" ")
 }
 
 /// `<pasted_content\b[^>]*>(.*?)(?:</pasted_content\b[^>]*>|\Z)` with re.DOTALL.
@@ -245,6 +257,12 @@ seems sure maybe really thanks thank continue go going right well good
 ";
 static STOPWORDS: LazyLock<std::collections::HashSet<&'static str>> =
     LazyLock::new(|| ENGLISH_STOPWORDS.split_ascii_whitespace().collect());
+
+/// A built-in English stopword (a folded term).
+pub fn is_stopword(term: &str) -> bool {
+    STOPWORDS.contains(term)
+}
+
 pub const LOCAL_TAIL: usize = 20;
 pub const LOCAL_HEAD: usize = 20;
 pub const LOCAL_SLOTS: usize = LOCAL_TAIL + LOCAL_HEAD;
@@ -281,7 +299,7 @@ pub fn local_words_with_extra(
             continue;
         }
         let term = fold(Some(word));
-        if !STOPWORDS.contains(term.as_str())
+        if !is_stopword(&term)
             && !extra.contains(term.as_str())
             && is_hint_term(&term)
             && !out.contains(&term)
@@ -439,7 +457,8 @@ pub fn local_query(
     home: Option<&str>,
     cwd: Option<&str>,
     deadline: Option<Instant>,
-) -> Result<(String, Vec<Item>), SmError> {
+) -> Result<LocalFound, SmError> {
+    let prompt = &redact_query(prompt);
     let (cfg_opt, loaded);
     let (projects, extra_sw) = match projects {
         Some(p) => {
@@ -1757,7 +1776,18 @@ pub fn run_prompt_hook(
                     Vec::new(),
                 )
             }
-            Ok((query, fetched)) => {
+            Ok((query, fetched, below)) => {
+                let query = match below {
+                    Some(b) => {
+                        row.insert("local_min_idf".into(), PyValue::Float(b.min_idf));
+                        row.insert(
+                            "best_idf".into(),
+                            PyValue::Float((b.best * 100.0).round() / 100.0),
+                        );
+                        b.query
+                    }
+                    None => query,
+                };
                 let dropped = fetched
                     .iter()
                     .filter(|it| injected.contains(&it.id))
@@ -2006,6 +2036,11 @@ mod tests {
     /// items, three prompt words found in one item only clear the local idf floor:
     /// 3 * ln(21) = 9.1 >= LOCAL_TAU 8.0, while two give 6.1 and fall under it.
     fn home(config: &str, items: &[(&str, &str, &str)]) -> Home {
+        home_with(20, config, items)
+    }
+
+    /// `home` with `fillers` filler items.
+    fn home_with(fillers: usize, config: &str, items: &[(&str, &str, &str)]) -> Home {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().to_str().unwrap().to_string();
         std::fs::write(
@@ -2014,7 +2049,7 @@ mod tests {
         )
         .unwrap();
         let conn = connect(&format!("{path}/memory.db"), None).unwrap();
-        for n in 0..20 {
+        for n in 0..fillers {
             let it = crate::core::item::Item::new(
                 &format!("f_{n:02}"),
                 "global",
@@ -2220,7 +2255,7 @@ mod tests {
                 ("m_stop", "customstop dorde trap", ""),
             ],
         );
-        let (q, items) = local_query(
+        let (q, items, _) = local_query(
             "customstop dorde deploy queue retry please",
             4,
             0,
@@ -2411,7 +2446,13 @@ mod tests {
         };
         let p = payload("why does the loader fail on retry?", "", "");
         let err = run_prompt_hook(&p, false, Some(&h.path), &run).unwrap_err();
-        assert_eq!(err.msg, "unable to open database file");
+        assert_eq!(
+            err.msg,
+            format!(
+                "cannot open {}/memory.db: unable to open database file",
+                h.path
+            )
+        );
         assert!(rows(&h).is_empty());
         hook(&h, &Fake::new(Ok((0, "NONE"))), "thanks a lot mate", "");
         let r = &rows(&h)[0];
@@ -2605,6 +2646,104 @@ mod tests {
         );
     }
 
+    fn ids(got: &Recall) -> Vec<&str> {
+        got.items.iter().map(|i| i.id.as_str()).collect()
+    }
+
+    fn hook_log(h: &Home) -> String {
+        std::fs::read_to_string(format!("{}/hook.log", h.path)).unwrap()
+    }
+
+    #[test]
+    fn a_secret_in_the_model_line_never_reaches_the_query_or_hook_log() {
+        let h = home(
+            "[prompt_hook]\ntimeout = 3\n",
+            &[("m_1", "stripe webhook retries note", "")],
+        );
+        let prompt =
+            "stripe webhook fails after I set DB_PASSWORD=Hunter2-example-p0, check retries";
+        let fake = Fake::new(Ok((
+            0,
+            "stripe webhook DB_PASSWORD=Hunter2-example-p0 retries\n",
+        )));
+        let got = hook(&h, &fake, prompt, "").unwrap();
+        assert_eq!(
+            (got.query.as_str(), ids(&got)),
+            ("stripe webhook retries", vec!["m_1"])
+        );
+        assert_eq!(field(&rows(&h)[0], "query"), "'stripe webhook retries'");
+        let log = hook_log(&h);
+        assert!(
+            !log.contains("Hunter2") && !log.contains("REDACTED"),
+            "{log}"
+        );
+
+        // a line that is nothing but a secret is no query
+        let fake = Fake::new(Ok((0, "DB_PASSWORD=Hunter2-example-p0\n")));
+        assert_eq!(hook(&h, &fake, prompt, ""), None);
+        assert_eq!(
+            (field(&rows(&h)[1], "path"), field(&rows(&h)[1], "query")),
+            ("'none'".to_string(), "'NONE'".to_string())
+        );
+        assert!(!hook_log(&h).contains("Hunter2"));
+    }
+
+    #[test]
+    fn the_local_path_cuts_a_secret_the_same_way_before_it_picks_words() {
+        // the store holds the value as a plain word, so only the cut keeps it out of the query
+        let h = home(
+            "[prompt_hook]\nmodel = \"none\"\n",
+            &[("m_1", "zebra okapi kudu Quaggaprime9", "")],
+        );
+        let fake = Fake::new(Ok((0, "x")));
+        let prompt = "about zebra okapi kudu, I set DB_PASSWORD=Quaggaprime9 today";
+        let got = hook(&h, &fake, prompt, "").unwrap();
+        assert_eq!(
+            (got.query.as_str(), ids(&got)),
+            ("zebra okapi kudu", vec!["m_1"])
+        );
+        assert!(!hook_log(&h).to_lowercase().contains("quaggaprime9"));
+    }
+
+    #[test]
+    fn the_local_floor_waits_for_twenty_active_items_in_scope() {
+        // 19 items: no floor, so two words recall the item; 20 items: the floor 8.0 drops it
+        // (2 * ln 20 = 5.99) and the row says so.
+        let item = [(
+            "m_1",
+            "Limit HTTP connection pool to 16 sockets per worker",
+            "",
+        )];
+        let config = "[prompt_hook]\nmodel = \"none\"\n";
+        let fake = Fake::new(Ok((0, "x")));
+        let prompt = "what is the connection pool now";
+        let small = home_with(18, config, &item);
+        let got = hook(&small, &fake, prompt, "").unwrap();
+        assert_eq!(
+            (got.query.as_str(), ids(&got)),
+            ("connection pool", vec!["m_1"])
+        );
+        assert_eq!(field(&rows(&small)[0], "local_min_idf"), "-");
+
+        let full = home_with(19, config, &item);
+        assert_eq!(hook(&full, &fake, prompt, ""), None);
+        let r = &rows(&full)[0];
+        assert_eq!(
+            (
+                field(r, "query"),
+                field(r, "ids"),
+                field(r, "local_min_idf"),
+                field(r, "best_idf")
+            ),
+            (
+                "'connection pool'".to_string(),
+                "[]".to_string(),
+                "8.0".to_string(),
+                "5.99".to_string()
+            )
+        );
+    }
+
     #[test]
     fn compaction_scan_finds_a_mark_split_across_chunks() {
         let d = tempfile::tempdir().unwrap();
@@ -2700,7 +2839,7 @@ mod tests {
             (x >> 33) as usize % n
         };
         let ids = |p: &str| {
-            let (_, items) = local_query(
+            let (_, items, _) = local_query(
                 p,
                 4,
                 0,

@@ -769,21 +769,24 @@ fn local_min_idf_config_defaults_override_zero_disable_and_validation() {
 
     let (d, home) = scratch();
     let repo = init_git_repo(d.path(), "anvil");
-    // 10 items total: one rare term has IDF ln(10/1) = 2.3026 (< 8.0 default, >= 2.0 custom).
-    for i in 0..9 {
-        seed_item(
-            &home,
-            &format!("f_{i:02}"),
-            "anvil",
-            "fact",
-            &format!("ordinary filler {i}"),
-            &format!("neutral body {i}"),
-            "decided",
-            "",
-            "",
-            TS,
-        );
-    }
+    // 10 items, under the 20 active items the floor needs: the default admits the rare item.
+    let seed_fillers = |from: usize, to: usize| {
+        for i in from..to {
+            seed_item(
+                &home,
+                &format!("f_{i:02}"),
+                "anvil",
+                "fact",
+                &format!("ordinary filler {i}"),
+                &format!("neutral body {i}"),
+                "decided",
+                "",
+                "",
+                TS,
+            );
+        }
+    };
+    seed_fillers(0, 9);
     seed_item(
         &home,
         "m_rare",
@@ -796,13 +799,33 @@ fn local_min_idf_config_defaults_override_zero_disable_and_validation() {
         "",
         TS,
     );
-
-    // Default local_min_idf = 8.0 drops single rare word (2.30 < 8.0).
     write(
         &home.join("config.toml"),
         "[catch_up]\nenabled = false\n[prompt_hook]\nmodel = \"none\"\n",
     );
-    let (_, items_def) = local_query(
+    let (_, items_small, _) = local_query(
+        "tell me about obsidian today",
+        4,
+        0,
+        None,
+        "anvil",
+        home.to_str(),
+        None,
+        None,
+    )
+    .unwrap();
+    assert_eq!(items_small.len(), 1);
+    assert_eq!(items_small[0].id, "m_rare");
+
+    // 20 items total: one rare term has IDF ln(20/1) = 2.9957 (< 8.0 default, >= 2.0 custom).
+    seed_fillers(9, 19);
+
+    // Default local_min_idf = 8.0 drops single rare word (3.00 < 8.0).
+    write(
+        &home.join("config.toml"),
+        "[catch_up]\nenabled = false\n[prompt_hook]\nmodel = \"none\"\n",
+    );
+    let (_, items_def, _) = local_query(
         "tell me about obsidian today",
         4,
         0,
@@ -815,12 +838,12 @@ fn local_min_idf_config_defaults_override_zero_disable_and_validation() {
     .unwrap();
     assert!(items_def.is_empty());
 
-    // Lowering local_min_idf = 2.0 admits m_rare (2.30 >= 2.0), while 2.5 still rejects it.
+    // Lowering local_min_idf = 2.0 admits m_rare (3.00 >= 2.0), while 3.5 still rejects it.
     write(
         &home.join("config.toml"),
         "[catch_up]\nenabled = false\n[prompt_hook]\nmodel = \"none\"\nlocal_min_idf = 2.0\n",
     );
-    let (_, items_low) = local_query(
+    let (_, items_low, _) = local_query(
         "tell me about obsidian today",
         4,
         0,
@@ -836,9 +859,9 @@ fn local_min_idf_config_defaults_override_zero_disable_and_validation() {
 
     write(
         &home.join("config.toml"),
-        "[catch_up]\nenabled = false\n[prompt_hook]\nmodel = \"none\"\nlocal_min_idf = 2.5\n",
+        "[catch_up]\nenabled = false\n[prompt_hook]\nmodel = \"none\"\nlocal_min_idf = 3.5\n",
     );
-    let (_, items_hi) = local_query(
+    let (_, items_hi, _) = local_query(
         "tell me about obsidian today",
         4,
         0,
@@ -856,7 +879,7 @@ fn local_min_idf_config_defaults_override_zero_disable_and_validation() {
         &home.join("config.toml"),
         "[catch_up]\nenabled = false\n[prompt_hook]\nmodel = \"none\"\nlocal_min_idf = 0.0\n",
     );
-    let (_, items_zero) = local_query(
+    let (_, items_zero, _) = local_query(
         "tell me about obsidian today",
         4,
         0,
@@ -1560,4 +1583,224 @@ fn an_exclusion_over_more_matches_than_sqlite_binds_in_one_statement_still_answe
         assert_eq!(ids, vec!["m_keep"], "recent={recent}");
         assert_eq!(v["more"]["pool_full"], json!(false), "recent={recent}");
     }
+}
+
+// ---------------------------------------------------------------- 10. Footer truth on hidden items and filler words
+
+fn put_item_cli(home: &Path, args: &[&str]) -> String {
+    let mut a = vec!["put", "--evidence", "made-up check"];
+    a.extend_from_slice(args);
+    let (code, out, err) = sm(home, &a);
+    assert_eq!(code, 0, "put failed: {err}");
+    out.trim().to_string()
+}
+
+/// etl: a retired Fivetran decision, a Snowflake decision, a DAG fact, a filler fact; billing: two
+/// Stripe facts.
+fn etl_store() -> (tempfile::TempDir, PathBuf, [String; 4]) {
+    let (d, home) = scratch();
+    write(&home.join("config.toml"), "[catch_up]\nenabled = false\n");
+    let item = |kind: &str, repo: &str, as_of: &str, body: &str| {
+        put_item_cli(
+            &home,
+            &[
+                "--kind", kind, "--tag", "verified", "--repo", repo, "--as-of", as_of, "--", body,
+            ],
+        )
+    };
+    let fivetran = item(
+        "decision",
+        "etl",
+        "2026-06-03T10:00:00Z",
+        "Use Fivetran for Shopify ingestion into BigQuery",
+    );
+    let (code, _, err) = sm(&home, &["retire", &fivetran, "--reason", "moved"]);
+    assert_eq!(code, 0, "{err}");
+    let snowflake = item(
+        "decision",
+        "etl",
+        "2026-07-16T10:00:00Z",
+        "Snowflake trial ended and we stay on BigQuery",
+    );
+    let dag = item(
+        "fact",
+        "etl",
+        "2026-07-20T10:00:00Z",
+        "The nightly DAG runs on Cloud Composer",
+    );
+    let filler = item("fact", "etl", "2026-07-21T10:00:00Z", "We moved on");
+    item(
+        "fact",
+        "billing",
+        "2026-07-01T10:00:00Z",
+        "Stripe retries a failed webhook for 3 days",
+    );
+    item(
+        "fact",
+        "billing",
+        "2026-07-02T10:00:00Z",
+        "Stripe webhooks are signed",
+    );
+    (d, home, [fivetran, snowflake, dag, filler])
+}
+
+fn query_ok(home: &Path, args: &[&str]) -> String {
+    let mut a = vec!["query"];
+    a.extend_from_slice(args);
+    let (code, out, err) = sm(home, &a);
+    assert_eq!((code, err.as_str()), (0, ""), "{args:?}");
+    out
+}
+
+#[test]
+fn missing_names_the_items_the_status_or_a_filter_hid_and_what_shows_them() {
+    let (_d, home, _) = etl_store();
+    let q = |args: &[&str]| query_ok(&home, args);
+    assert_eq!(
+        q(&["fivetran", "--repo", "etl"]),
+        "missing: fivetran: 1 retired or superseded -> sm query \"fivetran\" --repo etl --include-history\n"
+    );
+    assert_eq!(
+        q(&["snowflake", "--repo", "etl", "--since", "7d"]),
+        "missing: snowflake: 1 outside --since 7d -> sm query \"snowflake\" --repo etl\n"
+    );
+    assert_eq!(
+        q(&["snowflake", "--repo", "etl", "--kind", "fact"]),
+        "missing: snowflake: 1 outside --kind fact -> sm query \"snowflake\" --repo etl\n"
+    );
+    assert_eq!(
+        q(&["fivetran", "--repo", "etl", "--kind", "fact"]),
+        "missing: fivetran: 1 retired or superseded, outside --kind fact -> sm query \"fivetran\" --repo etl --include-history\n"
+    );
+    // nothing in scope holds it: term=0 stays
+    assert_eq!(q(&["airbyte", "--repo", "etl"]), "missing: airbyte=0\n");
+    // a stopword gets no suggested query
+    assert_eq!(
+        q(&["the", "--repo", "etl", "--kind", "decision"]),
+        "missing: the: 1 outside --kind decision\n"
+    );
+    let footer = q(&[
+        "we", "the", "--repo", "etl", "--limit", "1", "--format", "brief",
+    ]);
+    let missing = footer.lines().find(|l| l.starts_with("missing: ")).unwrap();
+    assert!(!missing.contains("->"), "{footer}");
+    // the JSON keeps its keys and its count
+    let v: Value =
+        serde_json::from_str(&q(&["fivetran", "--repo", "etl", "--format", "json"])).unwrap();
+    assert_eq!(v["missing"], json!([{"term": "fivetran", "in_scope": 0}]));
+    let keys: Vec<&String> = v.as_object().unwrap().keys().collect();
+    assert_eq!(
+        keys,
+        [
+            "query", "bias", "scope", "results", "missing", "more", "refs", "next"
+        ]
+    );
+}
+
+#[test]
+fn a_hit_that_matched_only_filler_words_is_not_listed() {
+    let (_d, home, [_, snowflake, dag, filler]) = etl_store();
+    // no topic word in the repo: the pointer to the other repo comes first
+    assert_eq!(
+        query_ok(
+            &home,
+            &["how do we handle stripe webhooks", "--repo", "etl"]
+        ),
+        "more: other repos billing=2 -> sm query \"how do we handle stripe webhooks\" --all\n\
+         missing: handle=0; stripe=0; webhooks=0\n"
+    );
+    // the dag matches 3 of 4 words, the snowflake note 2, the filler note only "on"
+    let ids = |args: &[&str]| -> Vec<String> {
+        let v: Value = serde_json::from_str(&query_ok(&home, args)).unwrap();
+        v["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["id"].as_str().unwrap().to_string())
+            .collect()
+    };
+    assert_eq!(
+        ids(&[
+            "on composer cloud bigquery",
+            "--repo",
+            "etl",
+            "--format",
+            "json"
+        ]),
+        [dag.clone(), snowflake.clone()]
+    );
+    // a query of only stopwords keeps every hit
+    let mut all = ids(&["we on", "--repo", "etl", "--format", "json"]);
+    all.sort();
+    let mut want = vec![snowflake, dag, filler];
+    want.sort();
+    assert_eq!(all, want);
+}
+
+#[test]
+fn query_names_an_unknown_repo_a_dropped_repo_and_a_config_with_no_scopes() {
+    let (_d, home) = scratch();
+    write(&home.join("config.toml"), "[catch_up]\nenabled = false\n");
+    for repo in [
+        "kestrel-etl",
+        "kestrel-etl",
+        "lumen-app",
+        "orion",
+        "a",
+        "b",
+        "c",
+    ] {
+        put_item_cli(
+            &home,
+            &[
+                "--kind",
+                "fact",
+                "--tag",
+                "verified",
+                "--repo",
+                repo,
+                "--",
+                &format!("note in {repo}"),
+            ],
+        );
+    }
+    let (code, _, err) = sm(&home, &["query", "note", "--repo", "kestrel"]);
+    assert_eq!(
+        (code, err.as_str()),
+        (
+            0,
+            "no items in repo 'kestrel'; known repos: kestrel-etl, a, b, c, lumen-app (+1 more)\n"
+        )
+    );
+    let (code, _, err) = sm(&home, &["query", "note", "--repo", "kestrel-etl"]);
+    assert_eq!((code, err.as_str()), (0, ""));
+    let (code, out, err) = sm(&home, &["query", "note", "--all", "--repo", "kestrel-etl"]);
+    assert_eq!(
+        (code, err.as_str()),
+        (
+            0,
+            "--all searches every repo, so --repo kestrel-etl is not used\n"
+        )
+    );
+    assert_eq!(out, sm(&home, &["query", "note", "--all"]).1);
+    let (code, _, err) = sm(&home, &["query", "note", "--in", "acme"]);
+    assert_eq!(
+        (code, err),
+        (
+            2,
+            format!(
+                "unknown scope: acme; {}/config.toml has no [scopes] table (README: Multi-repo scopes and maintenance)\n",
+                home.display()
+            )
+        )
+    );
+    write(
+        &home.join("config.toml"),
+        "[catch_up]\nenabled = false\n[scopes]\nacme = [\"repo:orion\"]\n",
+    );
+    let (code, _, err) = sm(&home, &["query", "note", "--in", "nope"]);
+    assert_eq!(
+        (code, err.as_str()),
+        (2, "unknown scope: nope; known: acme\n")
+    );
 }

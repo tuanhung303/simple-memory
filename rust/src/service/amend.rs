@@ -11,9 +11,7 @@ pub fn run_amend(
     home: Option<&str>,
 ) -> Result<(String, bool), SmError> {
     if patch.is_empty() {
-        return Err(SmError::value(
-            "sm amend requires at least one field to change",
-        ));
+        return Err(SmError::value("amend needs at least one field to change"));
     }
     bind_text(strip(item_id))?;
     let conn = connect(get_db_path(home)?.as_str(), None)?;

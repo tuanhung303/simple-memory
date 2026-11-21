@@ -275,17 +275,60 @@ fn catchup_runs_every_part_and_logs_one_row() {
 }
 
 #[test]
-fn catchup_exits_quietly_while_another_holds_the_lock() {
+fn catchup_says_it_skipped_while_another_holds_the_lock() {
     let e = env();
     let held = hold_catchup_lock(&e.home);
     assert!(run_catchup(e.h()).unwrap().is_none());
     assert_eq!(
         sm(&e.home, &["import", "catch-up"]),
-        (0, String::new(), String::new())
+        (
+            0,
+            String::new(),
+            "catch-up: another run is in progress; skipped\n".to_string()
+        )
     );
     assert!(!e.home.join("catchup.log").exists());
     drop(held);
     catchup(&e);
+}
+
+#[test]
+fn catchup_names_unknown_config_keys_on_stderr_and_keeps_stdout() {
+    let plain = env();
+    let e = env();
+    let cfg_path = e.home.join("config.toml");
+    let cfg = std::fs::read_to_string(&cfg_path).unwrap();
+    write(
+        &cfg_path,
+        &format!("{cfg}tasklog_root = []\n[upkep]\nx = 1\n"),
+    );
+    let (code, out, err) = sm(&e.home, &["import", "catch-up"]);
+    let (plain_code, plain_out, _) = sm(&plain.home, &["import", "catch-up"]);
+    assert_eq!((code, out), (plain_code, plain_out));
+    let p = cfg_path.display();
+    assert_eq!(
+        err,
+        format!(
+            "warning: {p}: unknown key upkeep.tasklog_root; sm config prints the keys in effect\n\
+             warning: {p}: unknown section [upkep]; sm config prints the keys in effect\n"
+        )
+    );
+    assert_eq!(
+        sm(&e.home, &["import", "catch-up", "--quiet"]),
+        (0, String::new(), String::new())
+    );
+    // a config that does not parse still gives the old skip line while another run holds the lock
+    let held = hold_catchup_lock(&e.home);
+    write(&cfg_path, "[upkeep\n");
+    assert_eq!(
+        sm(&e.home, &["import", "catch-up"]),
+        (
+            0,
+            String::new(),
+            "catch-up: another run is in progress; skipped\n".to_string()
+        )
+    );
+    drop(held);
 }
 
 #[test]
@@ -861,6 +904,49 @@ fn catchup_reimports_a_stored_task_log_whose_body_changed_and_supersedes_the_old
     assert_eq!(
         body_of(&e.home, &new),
         "Results:\n- done 20261101-090000-baba-e\n- edited by hand"
+    );
+    let again = catchup(&e);
+    assert_eq!(
+        again["parts"]["imports"]["counts"],
+        json!({"not_stored": 0, "inserted": 0, "failed_rows": 0})
+    );
+    assert_eq!(
+        task_rows(&e.home),
+        vec![
+            (old, "superseded".into(), Some(new.clone())),
+            (new, "active".into(), None)
+        ]
+    );
+}
+
+/// A result line that YAML reads as a one-key mapping (`- fixed X (tests: 14 passed)`) is stored
+/// as written. A task log stored with the mapping's old text (the body an earlier build stored)
+/// gets one new version at the next catch-up; the catch-up after it changes nothing.
+#[test]
+fn a_result_line_with_a_colon_is_stored_as_written_once() {
+    let e = env();
+    let t = e.repo.join("docs/tasklog/2026-11-01/090000-baba-c.yaml");
+    let head = "id: 20261101-090000-baba-c\ntitle: C\nas_of: 2026-11-01T09:00:00+00:00\nresults:\n";
+    write(
+        &t,
+        &format!("{head}  - \"{{'fixed X (tests': '14 passed)'}}\"\n"),
+    );
+    import_tasklog(&e, &t);
+    let [(old, _, _)] = <[_; 1]>::try_from(task_rows(&e.home)).unwrap();
+    assert_eq!(
+        body_of(&e.home, &old),
+        "Results:\n- {'fixed X (tests': '14 passed)'}"
+    );
+    write(&t, &format!("{head}  - fixed X (tests: 14 passed)\n"));
+    let row = catchup(&e);
+    assert_eq!(
+        row["parts"]["imports"]["counts"],
+        json!({"not_stored": 1, "inserted": 1, "failed_rows": 0})
+    );
+    let [_, (new, _, _)] = <[_; 2]>::try_from(task_rows(&e.home)).unwrap();
+    assert_eq!(
+        body_of(&e.home, &new),
+        "Results:\n- fixed X (tests: 14 passed)"
     );
     let again = catchup(&e);
     assert_eq!(
@@ -2476,7 +2562,16 @@ fn cli_catch_up_quiet_and_lock_held() {
     let held = hold_catchup_lock(&e.home);
     assert_eq!(
         sm(&e.home, &["import", "catch-up"]),
-        (0, String::new(), String::new())
+        (
+            0,
+            String::new(),
+            "catch-up: another run is in progress; skipped\n".to_string()
+        )
+    );
+    assert_eq!(
+        sm(&e.home, &["import", "catch-up", "--quiet"]),
+        (0, String::new(), String::new()),
+        "the catch-up other commands start in the background stays silent"
     );
     drop(held);
     assert_eq!(

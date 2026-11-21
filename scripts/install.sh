@@ -9,7 +9,9 @@ mkdir -p "$dest_dir"
 dest_dir=$(cd "$dest_dir" && pwd -P)
 
 target_dir=${CARGO_TARGET_DIR:-$repo/rust/target}
-cargo build --release --locked --manifest-path "$repo/rust/Cargo.toml"
+case $target_dir in /*) ;; *) target_dir=$PWD/$target_dir ;; esac
+# Build from inside rust/: rustup reads rust/rust-toolchain.toml from the working directory only.
+(cd "$repo/rust" && CARGO_TARGET_DIR=$target_dir cargo build --release --locked --manifest-path "$repo/rust/Cargo.toml")
 
 built="$target_dir/release/sm"
 [[ -x $built ]] || { echo "install.sh: expected executable at $built" >&2; exit 1; }

@@ -25,7 +25,7 @@ fn run_show(item_id: &str, home: Option<&str>) -> Result<Item, SmError> {
     found
         .into_iter()
         .next()
-        .ok_or_else(|| SmError::key(&format!("Item not found: {item_id}")))
+        .ok_or_else(|| SmError::not_found(item_id))
 }
 
 fn tmpdir() -> (tempfile::TempDir, PathBuf) {
@@ -119,7 +119,7 @@ fn service_put_query_show_supersede_doctor() {
     };
     let err = run_put("Verified without evidence", &a).unwrap_err();
     assert!(
-        err.is(Base::Value) && err.msg.contains("requires non-empty --evidence"),
+        err.is(Base::Value) && err.msg.contains("needs non-empty evidence"),
         "{err}"
     );
 
@@ -1882,7 +1882,7 @@ fn cli_put_query_show_supersede_doctor() {
     assert!(err.contains("Evidence tag is required"), "{err}");
     let (code, _, err) = sm(&home, &["put", "--tag", "verified", "No evidence given"]);
     assert_eq!(code, 1);
-    assert!(err.contains("requires non-empty --evidence"), "{err}");
+    assert!(err.contains("needs non-empty evidence"), "{err}");
 
     let body1 = "R6 stays reverted: narrowing prune_stale() loses old catches";
     let (code, out, _) = sm(
@@ -2405,8 +2405,8 @@ fn sm_within_env(
 }
 
 /// A task log and an auto-memory note that hold `yaml`, each next to a normal file, are
-/// refused like any malformed YAML file: a one-line error for the file itself (`Malformed
-/// YAML in <path>: ` then `problem`), a row in `unreadable:` and a failed row in a catch-up,
+/// refused like any malformed YAML file: a one-line error for the file itself (`<path>:
+/// Malformed YAML: ` then `problem`), a row in `unreadable:` and a failed row in a catch-up,
 /// the normal task log stored; the auto-memory front matter falls back to its known keys line
 /// by line. Each command must end within 20 s.
 fn refused_yaml_and_the_next_file_imported(yaml: &str, problem: &str) {
@@ -2453,7 +2453,7 @@ fn refused_yaml_and_the_next_file_imported(yaml: &str, problem: &str) {
     );
 
     let (code, _, err) = sm_within(&home, &["import", "tasklog", bad.to_str().unwrap()], 20);
-    let msg = format!("Malformed YAML in {}: {problem}", bad.display());
+    let msg = format!("{}: Malformed YAML: {problem}", bad.display());
     assert_eq!(
         (code, err.as_str()),
         (1, format!("error: {msg}\n").as_str())
@@ -2467,7 +2467,7 @@ fn refused_yaml_and_the_next_file_imported(yaml: &str, problem: &str) {
         "imports: tasklog_files=2 handoff_files=0 not_stored=1 unreadable=1 stored_tasks_without_file=0"
     );
     assert!(
-        lines[3].starts_with(&format!("unreadable: {}: Malformed YAML in", bad.display())),
+        lines[3].starts_with(&format!("unreadable: {}: Malformed YAML: ", bad.display())),
         "{}",
         lines[3]
     );
@@ -2480,7 +2480,13 @@ fn refused_yaml_and_the_next_file_imported(yaml: &str, problem: &str) {
     );
 
     let (code, out, err) = sm_within(&home, &["import", "catch-up"], 20);
-    assert_eq!((code, err.as_str()), (0, ""));
+    assert_eq!(
+        (code, err.as_str()),
+        (
+            0,
+            "catch-up: 1 file not imported; sm doctor --imports lists it\n"
+        )
+    );
     assert!(
         !out.contains("Traceback") && !out.contains("error"),
         "{out}"
@@ -2512,7 +2518,7 @@ fn alias_bomb_depth_7_is_refused_and_the_next_file_imported() {
 fn a_value_key_that_leads_back_to_its_mapping_is_refused_and_the_next_file_imported() {
     refused_yaml_and_the_next_file_imported(
         "v: !!str &a {=: *a}\nresults:\n  - x\n",
-        "found a value key that leads back to its own mapping in \"<unicode string>\", line 3, column 4: v: !!str &a {=: *a} ^",
+        "found a value key that leads back to its own mapping at line 3, column 4: v: !!str &a {=: *a} ^",
     );
 }
 
@@ -2636,8 +2642,9 @@ fn no_traceback(out: &str, err: &str) {
 }
 
 /// A task log whose as_of is in year 0 in UTC (OverflowError after the YAML load): `sm import
-/// tasklog <dir>` names the file and stores nothing; doctor lists it as unreadable; a catch-up
-/// counts it as a failed row and stores every other file.
+/// tasklog <dir>` names the file, stores the other task log and exits 1; doctor lists it as
+/// unreadable; a catch-up counts it as a failed row, points at doctor and stores every other
+/// file.
 fn task_log_in_year_zero_utc_is_named_and_the_rest_imported(as_of: &str) {
     let f = odd_files(&format!("as_of: {as_of}\n"), "");
     let (code, out, err) = sm_east(&f, &["doctor", "--imports"]);
@@ -2655,22 +2662,31 @@ fn task_log_in_year_zero_utc_is_named_and_the_rest_imported(as_of: &str) {
         (code, out.as_str(), err.as_str()),
         (
             1,
-            "",
+            "import tasklog (applied): total=1\nby_repo: r1=1\nby_tag: derived=1\n\
+             total=1 inserted=1 deduped=0 superseded=0 rejected=0 supersede_missing=0 failed_rows=1\n",
             format!(
-                "error: {}: OverflowError: date value out of range\n",
+                "skipped: {}: OverflowError: date value out of range\n\
+                 1 file not imported; fix it and run the import again\n",
                 f.odd_task
             )
             .as_str()
         )
     );
-    assert_eq!(sources(&f), Vec::<String>::new());
+    assert_eq!(sources(&f), ["task:20261101-090600-good"]);
 
     let (code, out, err) = sm_east(&f, &["import", "catch-up"]);
-    assert_eq!((code, err.as_str()), (0, ""), "{out}");
+    assert_eq!(
+        (code, err.as_str()),
+        (
+            0,
+            "catch-up: 1 file not imported; sm doctor --imports lists it\n"
+        ),
+        "{out}"
+    );
     no_traceback(&out, &err);
     assert!(
         out.lines()
-            .any(|l| l == "imports: ok not_stored=1 inserted=1 failed_rows=1"),
+            .any(|l| l == "imports: ok not_stored=0 inserted=0 failed_rows=1"),
         "{out}"
     );
     assert_eq!(
@@ -2749,6 +2765,142 @@ fn a_note_name_past_4300_digits_is_unreadable() {
     note_with_a_field_that_cannot_convert_is_unreadable(&format!("name: 0x{}\n", "f".repeat(3572)));
 }
 
+/// `sm import tasklog <dir>` with two files the parser refuses: one `skipped:` line for each, the
+/// good file stored, the counts printed once, one closing line and exit 1. Once the files are
+/// fixed the same command stores them, exits 0 and prints nothing on stderr.
+#[test]
+fn a_named_import_of_a_folder_skips_each_bad_file_and_stores_the_rest() {
+    let f = odd_files("results:\n\t- tab\n", "");
+    let list = f.day.join("090700-list.yaml");
+    write(&list, "- a list\n");
+    let dir = f.day.to_str().unwrap();
+    let (code, out, err) = sm_east(&f, &["import", "tasklog", dir]);
+    assert_eq!(
+        (code, out.as_str(), err),
+        (
+            1,
+            "import tasklog (applied): total=1\nby_repo: r1=1\nby_tag: derived=1\n\
+             total=1 inserted=1 deduped=0 superseded=0 rejected=0 supersede_missing=0 failed_rows=2\n",
+            format!(
+                "skipped: {}: Malformed YAML: while scanning for the next token found character '\\t' \
+                 that cannot start any token at line 4, column 1: - tab ^\n\
+                 skipped: {}: the file is not a YAML mapping of task log fields (id, title, results)\n\
+                 2 files not imported; fix them and run the import again\n",
+                f.odd_task,
+                list.display()
+            )
+        )
+    );
+    assert_eq!(sources(&f), ["task:20261101-090600-good"]);
+    assert_eq!(
+        sm_east(&f, &["import", "catch-up", "--quiet"]),
+        (0, String::new(), String::new())
+    );
+    let (code, out, err) = sm_east(&f, &["import", "catch-up"]);
+    assert_eq!(
+        (code, err.as_str()),
+        (
+            0,
+            "catch-up: 2 files not imported; sm doctor --imports lists them\n"
+        ),
+        "{out}"
+    );
+    assert!(
+        out.lines()
+            .any(|l| l == "imports: ok not_stored=0 inserted=0 failed_rows=2"),
+        "{out}"
+    );
+
+    write(
+        Path::new(&f.odd_task),
+        "id: 20261101-090500-odd\ntitle: odd\nresults:\n  - x\n",
+    );
+    write(&list, "id: 20261101-090700-list\nresults:\n  - y\n");
+    let (code, out, err) = sm_east(&f, &["import", "tasklog", dir]);
+    assert_eq!(
+        (code, out.as_str(), err.as_str()),
+        (
+            0,
+            "import tasklog (applied): total=3\nby_repo: r1=3\nby_tag: derived=3\n\
+             total=3 inserted=2 deduped=1 superseded=0 rejected=0 supersede_missing=0 failed_rows=0\n",
+            ""
+        )
+    );
+    let (code, out, err) = sm_east(&f, &["import", "catch-up"]);
+    assert_eq!((code, err.as_str()), (0, ""), "{out}");
+    assert!(
+        out.lines()
+            .any(|l| l == "imports: ok not_stored=0 inserted=0 failed_rows=0"),
+        "no hint when no file failed: {out}"
+    );
+}
+
+/// A named import of a folder with no task log stores nothing, exits 0 and says so once.
+#[test]
+fn a_named_import_of_an_empty_folder_prints_its_counts_once() {
+    let (_d, tmp) = tmpdir();
+    let home = tmp.join("home");
+    std::fs::create_dir_all(tmp.join("empty")).unwrap();
+    let (code, out, err) = sm(
+        &home,
+        &["import", "tasklog", tmp.join("empty").to_str().unwrap()],
+    );
+    assert_eq!(
+        (code, out.as_str(), err.as_str()),
+        (
+            0,
+            "import tasklog (applied): total=0\nby_repo: none\nby_tag: none\n\
+             total=0 inserted=0 deduped=0 superseded=0 rejected=0 supersede_missing=0 failed_rows=0\n",
+            ""
+        )
+    );
+}
+
+/// A note with no name, no description and no text after its front matter gives nothing to
+/// store but its file name: doctor
+/// and `sm import automemory` count it as unreadable and name it, as a note that cannot be read.
+/// An item an earlier import stored from it stays as it was.
+#[test]
+fn a_note_with_no_name_description_or_body_is_unreadable() {
+    let f = odd_files("", "");
+    let (code, _, err) = sm_east(&f, &["import", "automemory"]);
+    assert_eq!((code, err.as_str()), (0, ""));
+    let before = common::column(
+        &f.home,
+        "SELECT body || ' ' || status FROM items ORDER BY source",
+    );
+    assert_eq!(before, ["normal note body active", "odd body active"]);
+
+    write(Path::new(&f.odd_note), "---\ntype: project\n---\n\n  \n");
+    let row = format!("unreadable: {}", f.odd_note);
+    let (code, out, err) = sm_east(&f, &["doctor", "--imports"]);
+    assert_eq!((code, err.as_str()), (0, ""), "{out}");
+    let lines: Vec<&str> = out.lines().collect();
+    assert!(
+        lines.contains(
+            &"automemory: files=2 not_stored=0 stored_without_file=0 unmapped=0 unreadable=1"
+        ),
+        "{out}"
+    );
+    assert!(lines.contains(&row.as_str()), "{out}");
+    let (code, out, err) = sm_east(&f, &["import", "automemory"]);
+    assert_eq!((code, err.as_str()), (0, ""), "{out}");
+    assert_eq!(
+        out.lines().collect::<Vec<_>>(),
+        [
+            "import automemory (applied): files=2 added=0 updated=0 retired=0 unchanged=1 unreadable=1 unmapped=0 yaml_errors=0",
+            row.as_str()
+        ]
+    );
+    assert_eq!(
+        common::column(
+            &f.home,
+            "SELECT body || ' ' || status FROM items ORDER BY source"
+        ),
+        before
+    );
+}
+
 /// `commits: 1234567` (a short commit id of digits, which YAML reads as an int) is one commit
 /// id, stored as the one-item list `commits: ["1234567"]` is.
 #[test]
@@ -2816,8 +2968,8 @@ fn a_commits_value_of_one_string_is_one_commit_id() {
 }
 
 /// A handoff written in year 0 in UTC is that file's problem, as for a task log: doctor lists
-/// it as unreadable, `sm import handoff <dir>` names it and stores nothing, and a catch-up
-/// counts it as a failed row and stores every other file.
+/// it as unreadable, `sm import handoff <dir>` names it, stores the other handoff and exits 1,
+/// and a catch-up counts it as a failed row and stores every other file.
 #[test]
 fn a_handoff_written_in_year_one_local_time_is_named_and_the_rest_imported() {
     let f = odd_files("", "");
@@ -2844,18 +2996,30 @@ fn a_handoff_written_in_year_one_local_time_is_named_and_the_rest_imported() {
         (code, out.as_str(), err.as_str()),
         (
             1,
-            "",
-            format!("error: {odd}: OverflowError: date value out of range\n").as_str()
+            "import handoff (applied): total=1\nby_repo: unassigned=1\nby_tag: derived=1\n\
+             total=1 inserted=1 deduped=0 superseded=0 rejected=0 supersede_missing=0 failed_rows=1\n",
+            format!(
+                "skipped: {odd}: OverflowError: date value out of range\n\
+                 1 file not imported; fix it and run the import again\n"
+            )
+            .as_str()
         )
     );
-    assert_eq!(sources(&f), Vec::<String>::new());
+    assert_eq!(sources(&f), ["handoff:good.md"]);
 
     let (code, out, err) = sm_east(&f, &["import", "catch-up"]);
-    assert_eq!((code, err.as_str()), (0, ""), "{out}");
+    assert_eq!(
+        (code, err.as_str()),
+        (
+            0,
+            "catch-up: 1 file not imported; sm doctor --imports lists it\n"
+        ),
+        "{out}"
+    );
     no_traceback(&out, &err);
     assert!(
         out.lines()
-            .any(|l| l == "imports: ok not_stored=3 inserted=3 failed_rows=1"),
+            .any(|l| l == "imports: ok not_stored=2 inserted=2 failed_rows=1"),
         "{out}"
     );
     assert_eq!(

@@ -1,5 +1,7 @@
 //! Port of Python 3.15.1's tomllib (Lib/tomllib/{_parser,_re,_types,__init__}.py): `loads` with
-//! the default `parse_float=float`, giving the values and the TOMLDecodeError text Python gives.
+//! the default `parse_float=float`, giving the values and the TOMLDecodeError text Python gives,
+//! except that a key reads as config.toml writes it (`a.b`, not `('a', 'b')`) and a table declared
+//! twice and an invalid value say what to change.
 //!
 //! Positions: tomllib indexes its str by code point; this port keeps byte offsets into the same
 //! text and steps by char, so each offset names the same char. An error turns its offset into
@@ -58,8 +60,9 @@ fn table_to_py(t: Table) -> PyValue {
     )
 }
 
+/// A key as config.toml writes it: its parts joined by dots.
 fn key_repr(key: &[String]) -> String {
-    PyValue::Tuple(key.iter().map(|k| PyValue::Str(k.clone())).collect()).py_repr()
+    key.join(".")
 }
 
 fn is_ascii_ctrl(c: char) -> bool {
@@ -428,7 +431,13 @@ impl<'s> Parser<'s> {
         let pos = self.skip_chars(pos + 1, toml_ws);
         let (pos, key) = self.parse_key(pos)?;
         if out.flags.is(&key, EXPLICIT_NEST) || out.flags.is(&key, FROZEN) {
-            return Err(self.err(format!("Cannot declare {} twice", key_repr(&key)), pos));
+            return Err(self.err(
+                format!(
+                    "[{}] is declared twice; keep one header and put the keys under it",
+                    key_repr(&key)
+                ),
+                pos,
+            ));
         }
         out.flags.set(&key, EXPLICIT_NEST, false);
         if let Err(e) = get_or_create_nest(&mut out.data, &key, true) {
@@ -842,7 +851,7 @@ impl<'s> Parser<'s> {
                 Node::Leaf(PyValue::Float(crate::py::float::from_str(first_four)?)),
             ));
         }
-        Err(self.err("Invalid value", pos))
+        Err(self.err("invalid value: text needs quotes and a list needs [ ]", pos))
     }
 }
 
@@ -1002,7 +1011,7 @@ mod tests {
         );
         assert_eq!(
             err("[a]\n[a]"),
-            "TOMLDecodeError: Cannot declare ('a',) twice (at line 2, column 3)"
+            "TOMLDecodeError: [a] is declared twice; keep one header and put the keys under it (at line 2, column 3)"
         );
         assert_eq!(
             err("a.b = 1\n[a.b]"),
@@ -1010,15 +1019,15 @@ mod tests {
         );
         assert_eq!(
             err("[a.b]\n[a]\nb.c = 1"),
-            "TOMLDecodeError: Cannot redefine namespace ('a', 'b') (at end of document)"
+            "TOMLDecodeError: Cannot redefine namespace a.b (at end of document)"
         );
         assert_eq!(
             err("a = []\n[[a]]"),
-            "TOMLDecodeError: Cannot mutate immutable namespace ('a',) (at line 2, column 4)"
+            "TOMLDecodeError: Cannot mutate immutable namespace a (at line 2, column 4)"
         );
         assert_eq!(
             err("a = {b = 1}\na.c = 2"),
-            "TOMLDecodeError: Cannot mutate immutable namespace ('a',) (at end of document)"
+            "TOMLDecodeError: Cannot mutate immutable namespace a (at end of document)"
         );
         assert_eq!(
             err("a = {b = 1, b = 2}"),
@@ -1026,7 +1035,7 @@ mod tests {
         );
         assert_eq!(
             err("a = {b = [], b.c = 1}"),
-            "TOMLDecodeError: Cannot mutate immutable namespace ('b', 'c') (at line 1, column 21)"
+            "TOMLDecodeError: Cannot mutate immutable namespace b.c (at line 1, column 21)"
         );
         assert_eq!(
             err("a = 1\n[[a]]"),
@@ -1066,11 +1075,11 @@ mod tests {
         );
         assert_eq!(
             err("a = {}\n[a]"),
-            "TOMLDecodeError: Cannot declare ('a',) twice (at line 2, column 3)"
+            "TOMLDecodeError: [a] is declared twice; keep one header and put the keys under it (at line 2, column 3)"
         );
         assert_eq!(
             err("[a]\nb.c = 1\n[a.b]"),
-            "TOMLDecodeError: Cannot declare ('a', 'b') twice (at line 3, column 5)"
+            "TOMLDecodeError: [a.b] is declared twice; keep one header and put the keys under it (at line 3, column 5)"
         );
         assert_eq!(
             err("a = \"x\u{0}\""),

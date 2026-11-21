@@ -47,6 +47,8 @@ sm update --check   # check npm for a newer version and refresh the local cache
 sm update           # run npm install -g simple-memory@latest for npm installs, or print the source-upgrade command
 ```
 
+The first command after an update that opens the store (`sm stats` does) moves `memory.db` to the new schema (version 3 now); the released 0.6.0 still reads and writes it. Copy `memory.db` first if you want the old file. The first catch-up can also store a new version of an imported file that an older build stored with a secret in clear (`inserted` counts it); the old version stays as a superseded item, secret included, and the next catch-up stores nothing.
+
 Interactive npm CLI runs also read `$SIMPLE_MEMORY_HOME/update-check.json` (refreshed in the background at most once every 24 hours) and print a one-line notice to stderr when a newer release exists. The reminder stays silent on non-TTY streams, CI, `mcp`, `hook`/`hooks`, `update`, `--format json`, `--version`/`-v`, `--help`/`-h`, or when `SM_NO_UPDATE_CHECK=1` is set.
 
 ### Build from source (Linux or custom Rust build)
@@ -96,9 +98,9 @@ sm query "connection pool ADR-004"
 ```
 
 ```text
-[m_01M7R350TK1Z1DKWVWT4NSF8MQ] #1 repo=my-repo kind=decision tag=decided as_of=2026-11-18T19:46:44+00:00 ~26 tok why=terms:4/4,bias:decision,bias:decided,recent refs=ADR-004
+[m_01M7R350TK1Z1DKWVWT4NSF8MQ] #1 repo=my-repo kind=decision tag=decided as_of=2026-11-18T19:46:44+00:00 ~26 tok why=ref:ADR-004,terms:4/4,bias:decision,bias:decided,recent refs=ADR-004
   Limit HTTP connection pool to 16 sockets per worker
-[m_01M7R350W6QV508RDWBHA9S45W] #2 repo=my-repo kind=fact tag=verified as_of=2026-11-18T19:46:44+00:00 ~32 tok why=terms:3/4,bias:fact,bias:verified,recent refs=ADR-004
+[m_01M7R350W6QV508RDWBHA9S45W] #2 repo=my-repo kind=fact tag=verified as_of=2026-11-18T19:46:44+00:00 ~32 tok why=ref:ADR-004,terms:3/4,bias:fact,bias:verified,recent refs=ADR-004
   Pool size 16 keeps p99 request latency under 12 ms at peak load
 next: sm show m_01M7R350TK1Z1DKWVWT4NSF8MQ m_01M7R350W6QV508RDWBHA9S45W; sm related m_01M7R350TK1Z1DKWVWT4NSF8MQ
 ```
@@ -108,6 +110,8 @@ next: sm show m_01M7R350TK1Z1DKWVWT4NSF8MQ m_01M7R350W6QV508RDWBHA9S45W; sm rela
 ```sh
 sm search connection pool -staging --since 7d
 ```
+
+`sm query` also searches `global` and `unassigned`; `sm list` and `sm export` show the current repo only (`--all` or `--repo R` widens them). `sm query --include-history` lists superseded and retired items after the active ones. Search matches whole words split at spaces and punctuation, so Chinese, Japanese or Korean text with no spaces is one word: search for the whole run, or put spaces between its words when you store it.
 
 Open full body and provenance with `sm show` (or `sm show --format json`), update metadata or text append-only with `sm amend`, retire obsolete items with `sm retire`, or replace outdated facts with `--supersedes` (`sm supersede OLD NEW`):
 
@@ -133,7 +137,7 @@ Print ready-to-merge JSON for each harness (`sm hooks print` writes no files):
 | Antigravity CLI (`agy`) | `sm hooks print agy` | `~/.gemini/config/hooks.json` |
 | Any MCP client | `sm hooks print mcp` | `"mcpServers"` in `.mcp.json` or client MCP config |
 
-Example output of `sm hooks print claude-code`:
+Example output of `sm hooks print claude-code` (a binary path that holds a space is quoted):
 
 ```json
 {
@@ -156,9 +160,9 @@ Example output of `sm hooks print claude-code`:
 ### How the prompt hook works
 
 1. Skips slash commands, machine-wrapped notifications, and prompts under 3 words.
-2. Uses `claude -p` (Haiku, with hooks, tools, and MCP servers off) to turn the prompt into keywords or `NONE`. Set `[prompt_hook] model = "none"` for offline IDF local-keyword search with zero model calls.
+2. Uses `claude -p` (Haiku, with hooks, tools, and MCP servers off) to turn the prompt into keywords or `NONE`. For offline IDF local-keyword search with zero model calls, set `model = "none"` under the `[prompt_hook]` header that `sm init` already wrote; a second `[prompt_hook]` header breaks every command.
 3. Falls back to local-keyword search on missing `claude`, error, or timeout (with a 10-minute cooldown after two consecutive failures that clears automatically when `claude_bin`, `model`, or `timeout` changes), skipping built-in English stopwords plus `[prompt_hook] extra_stopwords`.
-4. Injects at most 4 short lines carrying repo, kind, evidence tag, date, compact refs, and title (including `--in <scopes>` in the follow-up hint when project scopes match), and tracks shown IDs per session (per compaction epoch in Claude Code, per `conversationId` in `agy`). When the prompt or rewritten query names a configured `[prompt_hook.projects]` code mapped in `[scopes]`, those scope matchers union additively with the current repo and apply automatic `scope:<path>` bias (`+0.3` via `BIAS_BOOST`) on both the Haiku and local paths so cross-repo project notes surface without dropping local matches (opt out of automatic scope bias with `[query] default_bias = ["relevance"]`). On scopes with at least 20 active items, the Haiku path drops low-information hits whose matched-term IDF sum falls below `[prompt_hook] min_idf` (default `3.0`; `0.0` disables via `run_query`; exact ref hits bypass; dropped IDs log under `floor_dropped`). The local fallback applies `[prompt_hook] local_min_idf` (default `8.0`; `0.0` disables) as its local IDF floor. Disable per invocation with `SM_PROMPT_HOOK=0`.
+4. Injects at most 4 short lines carrying repo, kind, evidence tag, date, compact refs, and title (including `--in <scopes>` in the follow-up hint when project scopes match), and tracks shown IDs per session (per compaction epoch in Claude Code, per `conversationId` in `agy`). When the prompt or rewritten query names a configured `[prompt_hook.projects]` code mapped in `[scopes]`, those scope matchers union additively with the current repo and apply automatic `scope:<path>` bias (`+0.3` via `BIAS_BOOST`) on both the Haiku and local paths so cross-repo project notes surface without dropping local matches (opt out of automatic scope bias with `default_bias = ["relevance"]` under `[query]`). On scopes with at least 20 active items, the Haiku path drops low-information hits whose matched-term IDF sum falls below `[prompt_hook] min_idf` (default `3.0`; `0.0` disables via `run_query`; exact ref hits bypass; dropped IDs log under `floor_dropped`). The local fallback applies `[prompt_hook] local_min_idf` (default `8.0`; `0.0` disables) as its local IDF floor on the same scopes, so both floors start at 20 active items. Disable per invocation with `SM_PROMPT_HOOK=0`.
 
 ### MCP server (`sm mcp`)
 
@@ -188,14 +192,14 @@ Both prompt-hook recall (`sm hook prompt`) and explicit lookup (`sm query` / `sm
 
 - **Hard scope filter (`--in`)**: `sm query "auth timeout" --in acme/globex` searches across all repos and keeps only items matching `acme/globex` or its descendants.
 - **Soft scope bias (`--bias scope:<path>`)**: `sm query "auth timeout" --bias scope:acme/globex` (or MCP `memory_query` `bias`, or `[query] default_bias`) keeps the normal repo result set, widens the FTS candidate pool to `100`, and adds `+0.3` (`BIAS_BOOST`) per matched scope without overriding exact `ref_hits`, `phrase`, or `accent` matches (reported as `why=...,bias:scope:acme/globex`). When `--bias` contains only `scope:<path>` tokens, they merge additively on top of `[query] default_bias` so durable kind, tag, and recency boosts stay active; pass `relevance` or another explicit kind/tag token (such as `--bias relevance,scope:acme/globex`) to replace the defaults. Stack parent and child paths (`--bias scope:acme,scope:acme/globex`) for hierarchical specificity.
-- **Automatic hook scope bias**: When `sm hook prompt` matches a `[prompt_hook.projects]` code to `[scopes]`, matched paths union additively into SQL and apply automatic `scope:<path>` bias on both the Haiku and local paths. Set `[query] default_bias = ["relevance"]` to opt out of automatic scope bias (along with recency and kind/tag bias) while keeping additive SQL scope inclusion.
+- **Automatic hook scope bias**: When `sm hook prompt` matches a `[prompt_hook.projects]` code to `[scopes]`, matched paths union additively into SQL and apply automatic `scope:<path>` bias on both the Haiku and local paths. Set `default_bias = ["relevance"]` under `[query]` to opt out of automatic scope bias (along with recency and kind/tag bias) while keeping additive SQL scope inclusion.
 
 ## Multi-repo scopes and maintenance
 
-Group related repos or project codes locally in `~/.simple-memory/config.toml` under `[scopes]`:
+Group related repos or project codes locally in `~/.simple-memory/config.toml`: add the lines under the `[scopes]` header that `sm init` already wrote (a second `[scopes]` header breaks every command):
 
 ```toml
-[scopes]
+# under the existing [scopes] header
 "acme" = ["repo:acme-internal"]
 "acme/globex" = ["GLX"]
 "acme/globex/portal" = ["repo:globex-portal"]
@@ -211,11 +215,13 @@ sm upkeep --report      # read-only report of near-duplicates and stale planned/
 sm backup               # verified SQLite backup copy in ~/.simple-memory/backups/
 ```
 
+A copy made by hand with `sm backup` has the same `memory-<time>-auto.db` name as the automatic ones, so `--keep N` (default 7) and catch-up rotate it too: copy a file you want to keep somewhere else. To restore, move `memory.db` (and any `memory.db-wal` and `memory.db-shm` beside it) aside, then copy the backup file to `memory.db`.
+
 ## Extending simple-memory
 
 Modules follow a downward architecture (`cli` -> `service` -> `store` / `sources` / `config` -> `core`, plus shared `py`, `clock`, `error`), with three explicit helper edges (`rust/src/config.rs` -> `service::capture`, `rust/src/config.rs` -> `service::query::LOCAL_TAU`, and `rust/src/config.rs` -> `sources`; `stands_as_word` lives in `rust/src/core/terms.rs`):
 
-- **Custom stopwords and ranking defaults**: Set `[prompt_hook] extra_stopwords` for domain/language filler skipped by the local fallback, and `[query] default_bias` to override default ranking without recompiling.
+- **Custom stopwords and ranking defaults**: Set `extra_stopwords` under `[prompt_hook]` for domain/language filler skipped by the local fallback, and `default_bias` under `[query]` to override default ranking without recompiling.
 - **New import source**: Add a parser under `rust/src/sources/` returning `core::item::Item` records, register its subcommand in `rust/src/cli/args.rs` and `rust/src/service/import_.rs`, and wire it into `rust/src/service/catchup.rs` + `rust/src/service/doctor.rs` (`--imports`).
 - **New MCP tool or schema field**: Add tool schemas and handlers in `rust/src/service/mcp.rs` over shared `service/*` calls; place numbered `.sql` migrations under `rust/migrations/` and register them in `rust/src/store/connect.rs`.
 - **Additional redaction patterns**: Extend `rust/src/core/redact.rs` with linear-time regex patterns and unit tests.
@@ -251,9 +257,37 @@ Modules follow a downward architecture (`cli` -> `service` -> `store` / `sources
 </details>
 
 <details>
+<summary>Import file formats and catch-up counters</summary>
+
+- **Task log**: a YAML file under `docs/tasklog/<folder>/` in a `[upkeep] tasklog_roots` entry (`sm import tasklog PATH` takes a file, or a folder and every `.yaml` below it). Fields: `id` (default: file name), `title`, `repo` (default: the folder above `docs`), `state` (kept as a tag), `as_of` (default: file time), `results`, `directions`, `open` and `next` (a list or text; they make the body), `commits` (tag `executed`, the commits as evidence; with none the tag is `derived`), `continues`, `superseded_by`. A named import stores the good files, names each bad file and exits 1.
+- **Handoff**: every `.md` file in or below a `[upkeep] handoff_dirs` entry is stored as a handoff. The title is the first `# ` line of the first 20 lines (a `HANDOFF:` prefix is dropped; none: the file name). A `Written: <ISO time>` line there sets `as_of` (missing or invalid: file time). The repo comes from the folder that holds the file (a Claude Code project folder or scratchpad) or from a `CWD: <path>` line, matched against `[repos] roots` (no match: `unassigned`); a `Repo:` line is not read. The body keeps only the `##` and `###` sections headed Request, Done, Recap, Decision(s), Accomplished, What changed, Results, Open or Next (a heading that starts with one of these words counts); other sections, `### State` included, are dropped. With no such heading the whole file is the body.
+
+Counters that `sm import catch-up` (one line per part), `sm doctor --imports` and `sm upkeep` print:
+
+| Counter | Meaning |
+|---|---|
+| `not_stored` | files with no item yet, or whose body changed since the import |
+| `inserted` | items stored in this run |
+| `failed_rows` | files or rows that could not be imported (`sm doctor --imports` names the files) |
+| `unreadable` | files that could not be parsed |
+| `unmapped` | memory files, or sessions, whose folder maps to no repo (set `[repos] roots`) |
+| `stored_tasks_without_file`, `stored_without_file` | active items whose file is gone |
+| `added`, `updated`, `retired`, `unchanged` | memory files: new item, changed item, item retired because its file is gone, no change |
+| `made`, `deleted`, `items` | backup: copies made, old copies removed, items in the copy |
+| `sessions`, `superseded` | upkeep: sessions that had older handoffs, handoffs retired for the newest one |
+| `handoffs_without_session` | active handoffs whose file name holds no session id; upkeep cannot pair them, and prints this on every run |
+| `scanned`, `unchanged`, `active` | sessions: transcripts read, already seen, still in use |
+| `headless`, `light`, `covered` | sessions that need no card: no prompt, few prompts and no commit, an item already covers it |
+| `candidates`, `carded`, `plain` | sessions: cards wanted, cards stored, cards made without Haiku |
+| `candidates`, `retired`, `in_worktree`, `on_branch`, `no_folder` | retire_missing: task items whose file is gone; retired; kept because the file is in another checkout or on a branch; repo folder not found |
+| `deleted` | prune: hook state files older than 14 days removed |
+
+</details>
+
+<details>
 <summary>Configuration and environment variables</summary>
 
-`sm init` writes a commented template to `~/.simple-memory/config.toml` and never overwrites an existing file:
+`sm init` writes a commented template to `~/.simple-memory/config.toml` and never overwrites an existing file. The template already holds every section header below; to change a key, remove the `# ` before it under its header, and never add a second header. `sm doctor` reports a config that does not parse and exits 1; `sm config`, `sm doctor` and `sm import catch-up` name an unknown section or key on stderr.
 
 - `[repos] roots`: Parent directories whose direct children map workspace/transcript folders to repo keys (`[repo_aliases]` maps aliases such as worktrees).
 - `[keyword_aliases]`: Query term expansions (e.g. `"k8s" = "kubernetes"`).

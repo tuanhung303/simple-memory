@@ -22,6 +22,7 @@ use crate::core::terms::quote_fts_term;
 use crate::error::SmError;
 use crate::py;
 use crate::py::value::PyValue;
+use crate::service::recall::{HAIKU_FLOOR_MIN_SCOPE, is_stopword};
 use crate::store::connect::connect;
 use crate::store::search::{
     Filters, KeywordAliases, SearchOpts, count_matches, count_scope, head, ids_matching, search,
@@ -55,6 +56,20 @@ pub struct Lookup {
     pub other_repos: IndexMap<String, i64>,
     pub other_repos_cap: Option<i64>,
     pub shared_refs: Vec<(String, i64)>,
+    /// Per missing term with no item in scope: the items its status or a filter hid.
+    pub hidden: IndexMap<String, Hidden>,
+    /// Hits were left out because they matched only stopwords.
+    pub filler_dropped: bool,
+}
+
+/// Items in scope that hold a missing term but that the query's status or filters hid.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Hidden {
+    pub n: i64,
+    /// Retired or superseded: `--include-history` shows them.
+    pub retired: bool,
+    /// Outside `--tag`, `--kind`, `--source`, `--since` or `--until`.
+    pub filtered: bool,
 }
 
 /// A `Sequence[str] | str | None` flag value.
@@ -416,10 +431,11 @@ fn over_floor(
     df: &IndexMap<String, i64>,
     n_scope: i64,
 ) -> Result<Vec<Item>, SmError> {
-    over_floor_at(conn, items, units, df, n_scope, LOCAL_TAU)
+    Ok(over_floor_at(conn, items, units, df, n_scope, LOCAL_TAU)?.0)
 }
 
-/// `_over_floor` with the floor as an argument (the Python tests patch LOCAL_TAU).
+/// `_over_floor` with the floor as an argument (the Python tests patch LOCAL_TAU), and the best
+/// item's idf sum.
 fn over_floor_at(
     conn: &Connection,
     items: Vec<Item>,
@@ -427,7 +443,7 @@ fn over_floor_at(
     df: &IndexMap<String, i64>,
     n_scope: i64,
     tau: f64,
-) -> Result<Vec<Item>, SmError> {
+) -> Result<(Vec<Item>, f64), SmError> {
     let ids: Vec<String> = items.iter().map(|it| it.id.clone()).collect();
     let mut score: HashMap<String, f64> = HashMap::new();
     for unit in units {
@@ -444,10 +460,14 @@ fn over_floor_at(
             *score.entry(item_id).or_insert(0.0) += ratio.ln();
         }
     }
-    Ok(items
-        .into_iter()
-        .filter(|it| score.get(&it.id).copied().unwrap_or(0.0) >= tau)
-        .collect())
+    let best = score.values().copied().fold(0.0, f64::max);
+    Ok((
+        items
+            .into_iter()
+            .filter(|it| score.get(&it.id).copied().unwrap_or(0.0) >= tau)
+            .collect(),
+        best,
+    ))
 }
 
 /// Parse and validate `[prompt_hook] local_min_idf`: default `LOCAL_TAU` when missing or None;
@@ -476,8 +496,21 @@ pub fn local_min_idf_from_cfg(cfg: &PyValue) -> Result<f64, SmError> {
     }
 }
 
+/// The local search found items but the idf floor dropped every one: what it searched, the floor
+/// and the best item's idf sum, for hook.log.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BelowFloor {
+    pub query: String,
+    pub min_idf: f64,
+    pub best: f64,
+}
+
+/// (the local query, its items, why the floor left none).
+pub type LocalFound = (String, Vec<Item>, Option<BelowFloor>);
+
 /// `run_local_query`: (the local query, its top `limit + extra` items over the idf floor) on one
-/// connection with the hook's deadline and `run_query`'s scope; ("", []) when none clears it.
+/// connection with the hook's deadline and `run_query`'s scope; ("", []) when none clears it. The
+/// floor applies only from HAIKU_FLOOR_MIN_SCOPE active items in scope, as the model's does.
 #[allow(clippy::too_many_arguments)]
 pub fn run_local_query<S: AsRef<str>>(
     terms: &[S],
@@ -489,7 +522,7 @@ pub fn run_local_query<S: AsRef<str>>(
     home: Option<&str>,
     cwd: Option<&str>,
     deadline: Option<Instant>,
-) -> Result<(String, Vec<Item>), SmError> {
+) -> Result<LocalFound, SmError> {
     let a = QueryArgs {
         limit,
         repo,
@@ -508,7 +541,7 @@ fn local_query_at<S: AsRef<str>>(
     a: &QueryArgs,
     deadline: Option<Instant>,
     tau_override: Option<f64>,
-) -> Result<(String, Vec<Item>), SmError> {
+) -> Result<LocalFound, SmError> {
     let (limit, home) = (a.limit, a.home);
     let (filters, bias_list, scope_biases, cfg) = prepare(a, deadline)?;
     let tau = match tau_override {
@@ -521,7 +554,7 @@ fn local_query_at<S: AsRef<str>>(
     let df = scope_df(&conn, &all, &filters)?;
     let units = pick_local_units(terms, codes, &df);
     if units.is_empty() {
-        return Ok((String::new(), Vec::new()));
+        return Ok((String::new(), Vec::new(), None));
     }
     let query = units.join(" ");
     let ka = keyword_aliases(&cfg);
@@ -538,19 +571,29 @@ fn local_query_at<S: AsRef<str>>(
         &o,
         limit.max(LOCAL_SEARCH_DEPTH) + extra,
     )?;
-    let kept = if tau == 0.0 {
-        head(found, limit + extra)
+    let n_scope = if tau == 0.0 || found.is_empty() {
+        0
     } else {
-        let n_scope = count_scope(&conn, &filters)?;
-        head(
-            over_floor_at(&conn, found, &units, &df, n_scope, tau)?,
-            limit + extra,
-        )
+        count_scope(&conn, &filters)?
     };
+    if n_scope < HAIKU_FLOOR_MIN_SCOPE {
+        let kept = head(found, limit + extra);
+        return Ok(if kept.is_empty() {
+            (String::new(), Vec::new(), None)
+        } else {
+            (query, kept, None)
+        });
+    }
+    let (kept, best) = over_floor_at(&conn, found, &units, &df, n_scope, tau)?;
     Ok(if kept.is_empty() {
-        (String::new(), Vec::new())
+        let below = BelowFloor {
+            query,
+            min_idf: tau,
+            best,
+        };
+        (String::new(), Vec::new(), Some(below))
     } else {
-        (query, kept)
+        (query, head(kept, limit + extra), None)
     })
 }
 
@@ -615,10 +658,25 @@ pub fn run_lookup(query_text: &str, a: &QueryArgs) -> Result<Lookup, SmError> {
         ..filters
     };
     let conn = open(a.home, None)?;
-    let (scored, pool_cap) = search_scored(&conn, query_text, &f, &o, Some(a.limit))?;
+    let (positive_query, _excluded) = parse_query_exclusions(query_text);
+    let terms = query_terms(&positive_query);
+    let has_content = terms.iter().any(|t| is_hint_term(t) && !is_stopword(t));
+    // a hit made only of stopwords drops out when the query names a topic; every hit then needs
+    // its terms, not only the first `limit`
+    let drop_filler = has_content && terms.iter().any(|t| is_stopword(t));
+    let explain = if drop_filler { None } else { Some(a.limit) };
+    let (mut scored, pool_cap) = search_scored(&conn, query_text, &f, &o, explain)?;
+    let n_before = scored.len();
+    if drop_filler {
+        scored.retain(|s| {
+            !s.why.ref_hits.is_empty()
+                || s.why.terms_matched.is_empty()
+                || !s.why.terms_matched.iter().all(|t| is_stopword(t))
+        });
+    }
+    let filler_dropped = scored.len() < n_before;
     let n_scored = scored.len() as i64;
     let hits = head(scored, a.limit);
-    let (positive_query, _excluded) = parse_query_exclusions(query_text);
     let alias_map = term_alias_targets(&positive_query, ka.as_ref())?;
     let full_folded = fold(Some(py::str::strip(query_text)));
     let pos_folded = fold(Some(py::str::strip(&positive_query)));
@@ -627,8 +685,8 @@ pub fn run_lookup(query_text: &str, a: &QueryArgs) -> Result<Lookup, SmError> {
         .flat_map(|s| s.why.terms_matched.iter())
         .collect();
     let mut missing = Vec::new();
-    for t in query_terms(&positive_query) {
-        if !held.contains(&t) && is_hint_term(&t) {
+    for t in terms {
+        if !held.contains(&t) && is_hint_term(&t) && !(has_content && is_stopword(&t)) {
             let mut fts_parts = vec![quote_fts_term(&t)];
             if let Some(targets) = alias_map.get(t.as_str()) {
                 for w in targets {
@@ -638,14 +696,24 @@ pub fn run_lookup(query_text: &str, a: &QueryArgs) -> Result<Lookup, SmError> {
                     }
                 }
             }
-            let n = count_matches(&conn, &fts_parts.join(" OR "), &f)?;
+            let fts = fts_parts.join(" OR ");
+            let n = count_matches(&conn, &fts, &f)?;
             if n > 0 && (t == full_folded || t == pos_folded) {
                 continue;
             }
-            missing.push((t, n));
+            missing.push((t, n, fts));
         }
     }
     missing.truncate(MAX_MISSING_TERMS);
+    let mut hidden = IndexMap::new();
+    for (t, n, fts) in &missing {
+        if *n == 0
+            && let Some(h) = hidden_in_scope(&conn, fts, &f)?
+        {
+            hidden.insert(t.clone(), h);
+        }
+    }
+    let missing = missing.into_iter().map(|(t, n, _)| (t, n)).collect();
     let (other, other_cap) = match f.repo.as_deref() {
         Some(r) if !r.is_empty() && !f.include_all_repos => other_repos(&conn, query_text, &f, &o)?,
         _ => (IndexMap::new(), None),
@@ -666,7 +734,43 @@ pub fn run_lookup(query_text: &str, a: &QueryArgs) -> Result<Lookup, SmError> {
         other_repos: other,
         other_repos_cap: other_cap,
         shared_refs: shared,
+        hidden,
+        filler_dropped,
     })
+}
+
+/// The items in scope that match `fts` but that the status or the filters of `f` hid, when no
+/// item `f` keeps matches it.
+fn hidden_in_scope(conn: &Connection, fts: &str, f: &Filters) -> Result<Option<Hidden>, SmError> {
+    let unfiltered = Filters {
+        tags_filter: None,
+        kinds_filter: None,
+        sources_filter: None,
+        since_epoch: None,
+        until_epoch: None,
+        ..f.clone()
+    };
+    let with_history = |g: &Filters| Filters {
+        include_history: true,
+        ..g.clone()
+    };
+    let filtered = unfiltered != *f;
+    let wider = [
+        (!f.include_history).then(|| (with_history(f), true, false)),
+        filtered.then(|| (unfiltered.clone(), false, true)),
+        (filtered && !f.include_history).then(|| (with_history(&unfiltered), true, true)),
+    ];
+    for (g, retired, filtered) in wider.into_iter().flatten() {
+        let n = count_matches(conn, fts, &g)?;
+        if n > 0 {
+            return Ok(Some(Hidden {
+                n,
+                retired,
+                filtered,
+            }));
+        }
+    }
+    Ok(None)
 }
 
 /// `item_tokens`: title and body characters / 4, rounded up.
@@ -899,6 +1003,8 @@ mod tests {
             limit: 4,
             hits: vec![],
             missing: vec![],
+            hidden: IndexMap::new(),
+            filler_dropped: false,
             beyond_limit: 0,
             pool_cap: None,
             other_repos: IndexMap::new(),
@@ -1293,7 +1399,7 @@ mod tests {
                 ..Default::default()
             };
             let extra = rng.below(4) as i64;
-            let (query, items) =
+            let (query, items, _) =
                 local_query_at(&terms, &codes, extra, &a, None, Some(2.5)).unwrap();
             assert_eq!(query.is_empty(), items.is_empty());
             assert!(items.len() as i64 <= a.limit + extra);
@@ -1308,21 +1414,19 @@ mod tests {
             home: Some(home),
             ..Default::default()
         };
-        assert_eq!(
-            run_local_query(
-                &["orchid".to_string()],
-                &[],
-                4,
-                0,
-                "alpha",
-                StrList::None,
-                Some(home),
-                None,
-                None
-            )
-            .unwrap(),
-            (String::new(), vec![])
-        );
+        let (query, items, _) = run_local_query(
+            &["orchid".to_string()],
+            &[],
+            4,
+            0,
+            "alpha",
+            StrList::None,
+            Some(home),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!((query, items), (String::new(), vec![]));
         assert!(
             local_query_at(&["orchid".to_string()], &[], 0, &a, None, Some(0.0))
                 .unwrap()

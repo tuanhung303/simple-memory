@@ -9,8 +9,7 @@ use crate::store::items::get_item;
 #[cfg(test)]
 pub fn run_show(item_id: &str, home: Option<&str>) -> Result<Item, SmError> {
     let conn = connect(get_db_path(home)?.as_str(), None)?;
-    get_item(&conn, strip(item_id))?
-        .ok_or_else(|| SmError::key(&format!("Item not found: {item_id}")))
+    get_item(&conn, strip(item_id))?.ok_or_else(|| SmError::not_found(item_id))
 }
 
 /// `run_show_many(item_ids, home=...)`: (found items in the order given, ids not found); a

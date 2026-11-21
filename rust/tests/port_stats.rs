@@ -594,14 +594,14 @@ fn days_error(days: &str, want: &str) {
 
 #[test]
 fn days_above_100_years_is_an_error_not_a_traceback() {
-    // f"... got {float(days)}" for each of "1000000", "1e12", "inf"
+    // the value as typed, with no ".0", for each of "1000000", "1e12", "inf"
     days_error(
         "1000000",
-        "error: --days must be at most 36500, got 1000000.0\n",
+        "error: --days must be at most 36500, got 1000000\n",
     );
     days_error(
         "1e12",
-        "error: --days must be at most 36500, got 1000000000000.0\n",
+        "error: --days must be at most 36500, got 1000000000000\n",
     );
     days_error("inf", "error: --days must be at most 36500, got inf\n");
 }
@@ -622,8 +622,8 @@ fn days_nan_is_an_error() {
 
 #[test]
 fn days_must_be_above_zero() {
-    days_error("0", "error: --days must be above 0, got 0.0\n");
-    days_error("-1", "error: --days must be above 0, got -1.0\n");
+    days_error("0", "error: --days must be above 0, got 0\n");
+    days_error("-1", "error: --days must be above 0, got -1\n");
 }
 
 #[test]

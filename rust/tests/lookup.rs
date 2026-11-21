@@ -652,7 +652,10 @@ fn show_names_each_missing_id_on_stderr_and_exits_1() {
     let o = c.run(&["show", "m_gone1", &a, "m_gone2"]);
     assert_eq!(o.code, 1);
     assert_eq!(id_lines(&o, "id: "), [format!("id: {a}")]);
-    assert_eq!(o.err, "not found: m_gone1\nnot found: m_gone2\n");
+    assert_eq!(
+        o.err,
+        "error: item m_gone1 not found (ids are case-sensitive and must be given in full)\nerror: item m_gone2 not found (ids are case-sensitive and must be given in full)\n"
+    );
 }
 
 #[test]
@@ -788,7 +791,13 @@ fn related_lists_the_chain_shared_refs_and_the_session() {
 fn related_with_an_unknown_id_exits_1() {
     let c = Cli::new();
     let o = c.run(&["related", "m_gone"]);
-    assert_eq!((o.code, o.err.as_str()), (1, "not found: m_gone\n"));
+    assert_eq!(
+        (o.code, o.err.as_str()),
+        (
+            1,
+            "error: item m_gone not found (ids are case-sensitive and must be given in full)\n"
+        )
+    );
     let o = c.run(&["related", "m_gone", "--limit", "0"]);
     assert_eq!(
         (o.code, o.err.as_str()),

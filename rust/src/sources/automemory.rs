@@ -170,7 +170,8 @@ fn text_of(value: Option<&PyValue>) -> Result<String, SmError> {
     })
 }
 
-/// `parse_memory_file(path)`: raises on a file that is not UTF-8 or a field that cannot convert.
+/// `parse_memory_file(path)`: raises on a file that is not UTF-8, a field that cannot convert, or
+/// a note with no name, description or body (its item would hold only the file name).
 pub fn parse_memory_file(path: &PyPath) -> Result<MemoryFile, SmError> {
     let text = path.read_text(Errors::Strict)?;
     let (front, body) = split_frontmatter(&text);
@@ -179,11 +180,21 @@ pub fn parse_memory_file(path: &PyPath) -> Result<MemoryFile, SmError> {
         None => (Fields::new(), false),
     };
     let get = |k: &str| dict_get(&fields, k);
-    let name = match text_of(get("name"))? {
+    let name = text_of(get("name"))?;
+    let description = text_of(get("description"))?;
+    if [&name, &description, &body]
+        .iter()
+        .all(|t| strip(t).is_empty())
+    {
+        return Err(SmError::value(
+            "the note has no name, no description and no text after its front matter",
+        ));
+    }
+    let name = match name {
         n if n.is_empty() => path.stem().to_string(),
         n => n,
     };
-    let title = match text_of(get("description"))? {
+    let title = match description {
         t if t.is_empty() => name.clone(),
         t => t,
     };
@@ -540,6 +551,18 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(empty.body, "Only a title");
+        for (name, text) in [
+            ("blank.md", ""),
+            ("typed.md", "---\ntype: user\nname: ''\n---\n \n\n"),
+        ] {
+            let e =
+                parse_memory_file(&write(d.path(), &format!("p/memory/{name}"), text)).unwrap_err();
+            assert_eq!(
+                e.python_text(),
+                "ValueError: the note has no name, no description and no text after its front matter",
+                "{name}"
+            );
+        }
         let both = parse_memory_file(&write(
             d.path(),
             "p/memory/both.md",

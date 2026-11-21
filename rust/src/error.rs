@@ -110,6 +110,23 @@ impl SmError {
         Self::new(Base::Key, "KeyError", repr(key))
     }
 
+    /// A KeyError for an item id the store does not hold: `item <id> not found`, plus a hint when
+    /// the id has lower case after `m_` or is shorter than a full id.
+    pub fn not_found(id: &str) -> Self {
+        let partial = id.chars().count() < 28
+            || id
+                .strip_prefix("m_")
+                .unwrap_or(id)
+                .chars()
+                .any(|c| c.is_ascii_lowercase());
+        let hint = if partial {
+            " (ids are case-sensitive and must be given in full)"
+        } else {
+            ""
+        };
+        Self::new(Base::Key, "KeyError", format!("item {id} not found{hint}"))
+    }
+
     pub fn type_(msg: impl Into<String>) -> Self {
         Self::new(Base::Type, "TypeError", msg)
     }

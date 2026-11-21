@@ -125,7 +125,8 @@ fn py_err(class: &'static str, message: String) -> Fail {
 
 const BREAKS_AND_NUL: &str = "\0\r\n\u{85}\u{2028}\u{2029}";
 
-/// PyYAML `Mark.__str__` (`get_snippet` with indent 4 and max_length 75).
+/// PyYAML `Mark.__str__` (`get_snippet` with indent 4 and max_length 75), with `at` in place
+/// of PyYAML's `in "<unicode string>",`, which names no file a person can open.
 fn mark_str(m: &Mark, buf: &[char]) -> String {
     let pointer = m.index;
     let mut head = "";
@@ -150,7 +151,7 @@ fn mark_str(m: &Mark, buf: &[char]) -> String {
     }
     let snippet: String = buf[start..end].iter().collect();
     format!(
-        "  in \"<unicode string>\", line {}, column {}:\n    {head}{snippet}{tail}\n{}^",
+        "  at line {}, column {}:\n    {head}{snippet}{tail}\n{}^",
         m.line + 1,
         m.column + 1,
         " ".repeat(4 + pointer - start + head.len())
@@ -203,7 +204,7 @@ fn check_printable(chars: &[char]) -> Result<(), LoadError> {
         Some(pos) => Err(LoadError {
             class: "ReaderError",
             message: format!(
-                "unacceptable character #x{:04x}: special characters are not allowed\n  in \"<unicode string>\", position {pos}",
+                "unacceptable character #x{:04x}: special characters are not allowed\n  at position {pos}",
                 chars[pos] as u32
             ),
         }),
@@ -3785,7 +3786,7 @@ mod tests {
     fn a_value_key_that_leads_back_to_its_mapping_is_a_yaml_error() {
         let back = |at: &str| {
             format!(
-                "ConstructorError: found a value key that leads back to its own mapping\n  in \"<unicode string>\", line 1, column {at}"
+                "ConstructorError: found a value key that leads back to its own mapping\n  at line 1, column {at}"
             )
         };
         for (text, col) in [
@@ -3879,7 +3880,7 @@ mod tests {
         assert_eq!(e.class, "ScannerError");
         assert_eq!(
             e.message,
-            "mapping values are not allowed here\n  in \"<unicode string>\", line 1, column 5:\n    a: b: c\n        ^"
+            "mapping values are not allowed here\n  at line 1, column 5:\n    a: b: c\n        ^"
         );
         let e = safe_load("a: 1\n---\nb: 2\n").unwrap_err();
         assert_eq!(e.class, "ComposerError");

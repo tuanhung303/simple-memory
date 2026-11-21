@@ -42,7 +42,7 @@ pub fn main(argv: Vec<OsString>) -> i32 {
 
 /// `main(argv)` without the exit-time flush: parse, run the handler, map its error.
 pub fn run(args: &[String], out: &mut Out) -> i32 {
-    let ns = match args::build_parser().parse_args(args, out) {
+    let ns = match args::parse_args(args, out) {
         Ok(ns) => ns,
         Err(Exit(code)) => return code,
     };
@@ -52,11 +52,19 @@ pub fn run(args: &[String], out: &mut Out) -> i32 {
     }
 }
 
-/// The caught bases print `error: <one line>`; else the uncaught path: the
-/// traceback header, then `<Class>: <msg>` as the last stderr line. Both exit 1.
+/// The caught bases print `error: <one line>`, and after a damaged store how to restore its
+/// newest backup; else the uncaught path: the traceback header, then `<Class>: <msg>` as the last
+/// stderr line. Both exit 1.
 fn report_error(e: &SmError, out: &mut Out) -> i32 {
     if caught(e) {
         let _ = out.eprint(&format!("error: {}", one_line(&e.msg)));
+        if crate::service::doctor::is_damaged(e) {
+            let steps = crate::service::doctor::restore_steps(None)
+                .unwrap_or_else(|e2| vec![format!("error: {}", one_line(&e2.msg))]);
+            for line in steps {
+                let _ = out.eprint(&line);
+            }
+        }
         return 1;
     }
     let name = qualified_name(&e.class);
@@ -251,7 +259,7 @@ mod tests {
         assert_eq!(code, 2);
         assert_eq!(
             out.captured().1.lines().last(),
-            Some("sm: error: unrecognized arguments: b")
+            Some("sm put: error: unrecognized arguments: b; see sm put --help")
         );
     }
 }

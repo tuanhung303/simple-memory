@@ -17,12 +17,6 @@ fn print_import_summary(res: &ImportResult, out: &mut Out) -> Result<(), SmError
         "import {} ({mode}): total={}",
         res.kind, res.total
     ))?;
-    for (r, c) in &res.by_repo {
-        out.print(&format!("  repo {r}: {c}"))?;
-    }
-    for (t, c) in &res.by_tag {
-        out.print(&format!("  tag {t}: {c}"))?;
-    }
     let join = |m: &indexmap::IndexMap<String, i64>| {
         let s: Vec<String> = m.iter().map(|(k, v)| format!("{k}={v}")).collect();
         if s.is_empty() {
@@ -47,7 +41,7 @@ fn print_import_summary(res: &ImportResult, out: &mut Out) -> Result<(), SmError
         res.superseded,
         res.rejected,
         res.supersede_missing,
-        res.failed_rows.len()
+        res.failed_rows.len() + res.skipped.len()
     ))
 }
 
@@ -103,10 +97,20 @@ fn sessions(ns: &Namespace, out: &mut Out) -> Result<i32, SmError> {
 }
 
 fn catch_up(ns: &Namespace, out: &mut Out) -> Result<i32, SmError> {
+    let quiet = ns.get_bool("quiet");
+    if !quiet {
+        // a config that does not parse: run_catchup gives its own error (or the lock skip)
+        for line in crate::config::unknown_keys(None).unwrap_or_default() {
+            out.eprint(&line)?;
+        }
+    }
     let Some(row) = run_catchup(None)? else {
+        if !quiet {
+            out.eprint("catch-up: another run is in progress; skipped")?;
+        }
         return Ok(0);
     };
-    if !ns.get_bool("quiet") {
+    if !quiet {
         for (name, part) in &row.parts {
             let counts: Vec<String> = part
                 .counts
@@ -119,6 +123,18 @@ fn catch_up(ns: &Namespace, out: &mut Out) -> Result<i32, SmError> {
             };
             let line = format!("{name}: {state} {}", counts.join(" "));
             out.print(line.trim_end_matches(' '))?;
+        }
+        let failed: i64 = row
+            .parts
+            .values()
+            .filter_map(|p| p.counts.get("failed_rows"))
+            .sum();
+        match failed {
+            0 => {}
+            1 => out.eprint("catch-up: 1 file not imported; sm doctor --imports lists it")?,
+            n => out.eprint(&format!(
+                "catch-up: {n} files not imported; sm doctor --imports lists them"
+            ))?,
         }
     }
     Ok(if row.ok { 0 } else { 1 })
@@ -138,8 +154,23 @@ pub fn run(ns: &Namespace, out: &mut Out) -> Result<i32, SmError> {
                 ns.get_bool("apply"),
                 None,
             )?;
+            for s in &res.skipped {
+                out.eprint(&format!("skipped: {s}"))?;
+            }
             print_import_summary(&res, out)?;
-            Ok(0)
+            Ok(match res.skipped.len() {
+                0 => 0,
+                1 => {
+                    out.eprint("1 file not imported; fix it and run the import again")?;
+                    1
+                }
+                n => {
+                    out.eprint(&format!(
+                        "{n} files not imported; fix them and run the import again"
+                    ))?;
+                    1
+                }
+            })
         }
     }
 }

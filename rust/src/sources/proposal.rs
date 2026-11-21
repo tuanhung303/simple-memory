@@ -209,7 +209,7 @@ mod tests {
             [("tag", r#""executed""#), ("evidence", r#""  ""#)],
         ] {
             let e = err(&over);
-            assert!(e.msg.contains("requires non-empty --evidence"), "{}", e.msg);
+            assert!(e.msg.contains("needs non-empty evidence"), "{}", e.msg);
         }
         assert!(
             err(&[("kind", r#""invalid_kind""#)])

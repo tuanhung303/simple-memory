@@ -121,10 +121,10 @@ pub fn validate_and_supersede_one(
         return Err(SmError::value("Cannot supersede an item with itself"));
     }
     let Some(old_row) = status_of(conn, oid)? else {
-        return Err(SmError::key(&format!("Item not found: {oid}")));
+        return Err(SmError::not_found(oid));
     };
     if status_of(conn, nid)?.is_none() {
-        return Err(SmError::key(&format!("Replacement item not found: {nid}")));
+        return Err(SmError::not_found(nid));
     }
     let mut visited: HashSet<String> = HashSet::from([oid.to_string()]);
     let mut curr: Option<String> = Some(nid.to_string());
@@ -1064,7 +1064,7 @@ pub fn retire_item_with_reason(
             )
             .optional()?;
         let Some((status, superseded_by, tags)) = row else {
-            return Err(SmError::key(&format!("Item not found: {id}")));
+            return Err(SmError::not_found(id));
         };
         let sup = superseded_by
             .as_deref()
@@ -1148,15 +1148,13 @@ pub fn amend_item(
     patch: &AmendPatch<'_>,
 ) -> Result<(String, bool), SmError> {
     if patch.is_empty() {
-        return Err(SmError::value(
-            "sm amend requires at least one field to change",
-        ));
+        return Err(SmError::value("amend needs at least one field to change"));
     }
     let old_id = strip(old_id);
     bind_text(old_id)?;
     transaction(conn, None, |conn| {
         let Some(old) = get_item(conn, old_id)? else {
-            return Err(SmError::key(&format!("Item not found: {old_id}")));
+            return Err(SmError::not_found(old_id));
         };
         if old.status != "active" {
             return Err(match crate::store::upkeep::chain_head(conn, &old.id)? {
@@ -1666,11 +1664,11 @@ mod tests {
         );
         assert_eq!(
             err_text(supersede_item(&conn, "m_none", "m_4")),
-            "KeyError: 'Item not found: m_none'"
+            "KeyError: item m_none not found (ids are case-sensitive and must be given in full)"
         );
         assert_eq!(
             err_text(supersede_item(&conn, "m_4", "m_none")),
-            "KeyError: 'Replacement item not found: m_none'"
+            "KeyError: item m_none not found (ids are case-sensitive and must be given in full)"
         );
         assert_eq!(
             err_text(supersede_item(&conn, "m_4", "m_1")),
@@ -1686,7 +1684,7 @@ mod tests {
         let bad = it("m_5", "anvil", "Should not be committed.", "decided");
         assert_eq!(
             err_text(put_item(&conn, &bad, Some(&["m_TYPO".into()]))),
-            "KeyError: 'Item not found: m_TYPO'"
+            "KeyError: item m_TYPO not found (ids are case-sensitive and must be given in full)"
         );
         assert_eq!(get_item(&conn, "m_5").unwrap(), None);
         assert!(conn.is_autocommit());
@@ -1746,7 +1744,7 @@ mod tests {
         };
         assert_eq!(
             err_text(put_item(&conn, &no_ev, None)),
-            "ValueError: Tag 'verified' requires non-empty --evidence"
+            "ValueError: Tag 'verified' needs non-empty evidence"
         );
         assert!(
             err_text(put_item(&conn, &it("m_3", "r", "b3", "n/a"), None))

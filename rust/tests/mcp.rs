@@ -255,8 +255,90 @@ fn handshake_as_claude_code_runs_it() {
     assert_eq!(out[3], json!({"jsonrpc": "2.0", "id": 2, "result": {}}));
     assert_eq!(out.len(), 4);
     assert!(
-        err.starts_with("sm mcp: serving MCP 2026-07-28 and 2025-11-25 on stdio"),
+        err.starts_with("sm mcp: serving MCP 2026-07-28 and 2024-11-05 to 2025-11-25 on stdio"),
         "{err}"
+    );
+}
+
+#[test]
+fn tool_text_says_what_the_server_accepts_and_a_call_without_a_name_says_so() {
+    let fx = Fx::new();
+    let repo = fx.repo_dir();
+    let (out, _) = fx.conv(
+        vec![
+            init(),
+            json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
+            json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"arguments": {}}}),
+            json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": null}}),
+            json!({"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "memory_drop"}}),
+            call(5, "memory_list", json!({"tag": "n/a", "since": "7d", "until": "24h"})),
+            call(6, "memory_put", json!({"text": "a body", "tag": "assumed", "refs": "T-1,T-2 T-3"})),
+            call(7, "memory_retire", json!({"id": "m_missing"})),
+        ],
+        &repo,
+    );
+    let raw = out[1]["result"]["tools"].to_string();
+    assert!(raw.len() < 8200, "tools/list grew to {} bytes", raw.len());
+    let tools = out[1]["result"]["tools"].as_array().unwrap();
+    let props = |name: &str| {
+        tools.iter().find(|t| t["name"] == name).unwrap()["inputSchema"]["properties"].clone()
+    };
+    let text = |name: &str, key: &str| {
+        props(name)[key]["description"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    for tool in ["memory_query", "memory_list"] {
+        assert!(text(tool, "tag").contains("n/a"), "{tool} tag");
+        assert!(text(tool, "since").contains("7d"), "{tool} since");
+        assert!(text(tool, "until").contains("24h"), "{tool} until");
+    }
+    for key in ["refs", "supersedes"] {
+        assert!(
+            text("memory_put", key).contains("spaces or commas"),
+            "put {key}"
+        );
+    }
+    for key in ["add_refs", "remove_refs", "refs"] {
+        assert!(
+            text("memory_amend", key).contains("spaces or commas"),
+            "amend {key}"
+        );
+    }
+    assert_eq!(props("memory_retire")["reason"]["default"], "manual");
+    assert!(
+        tools.iter().find(|t| t["name"] == "memory_list").unwrap()["description"]
+            .as_str()
+            .unwrap()
+            .contains("newest first")
+    );
+    for (tool, key) in [
+        ("memory_show", "ids"),
+        ("memory_related", "id"),
+        ("memory_related", "limit"),
+        ("memory_supersede", "old_id"),
+        ("memory_supersede", "new_id"),
+        ("memory_put", "text"),
+        ("memory_amend", "text"),
+    ] {
+        assert!(!text(tool, key).is_empty(), "{tool} {key}");
+    }
+    assert!(text("memory_put", "text").contains("sm put"));
+    assert!(text("memory_amend", "text").contains("--body"));
+    assert_eq!(out[2]["error"]["message"], "missing argument 'name'");
+    assert_eq!(out[3]["error"]["message"], "missing argument 'name'");
+    assert_eq!(out[4]["error"]["message"], "Unknown tool: memory_drop");
+    // the text above is what the server takes: each call runs
+    assert_eq!(out[5]["result"]["isError"], false, "{}", out[5]);
+    assert_eq!(payload(&out[6])["created"], true);
+    assert!(
+        out[7]["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("item m_missing not found"),
+        "{}",
+        out[7]
     );
 }
 
@@ -866,7 +948,7 @@ fn a_failing_tool_answers_is_error() {
         (
             "memory_put",
             json!({"text": "Ran the B suite", "tag": "executed"}),
-            "error: Tag 'executed' requires non-empty --evidence",
+            "error: Tag 'executed' needs non-empty evidence",
         ),
         (
             "memory_put",
@@ -921,12 +1003,12 @@ fn a_failing_tool_answers_is_error() {
         (
             "memory_related",
             json!({"id": "m_missing"}),
-            "error: Item not found: m_missing",
+            "error: item m_missing not found (ids are case-sensitive and must be given in full)",
         ),
         (
             "memory_supersede",
             json!({"old_id": "m_a", "new_id": "m_b"}),
-            "error: Item not found: m_a",
+            "error: item m_a not found (ids are case-sensitive and must be given in full)",
         ),
     ];
     for (name, arguments, message) in cases {
@@ -1779,7 +1861,7 @@ fn memory_amend_and_memory_retire_round_trip_and_validate_guards() {
     assert_eq!(out[3]["result"]["isError"], true);
     assert_eq!(
         out[3]["result"]["content"][0]["text"],
-        "error: sm amend requires at least one field to change"
+        "error: amend needs at least one field to change"
     );
     assert_eq!(out[4]["result"]["isError"], true);
     assert_eq!(
@@ -1916,7 +1998,7 @@ fn memory_amend_and_memory_retire_round_trip_and_validate_guards() {
     assert_eq!(out[4]["result"]["isError"], true);
     assert_eq!(
         out[4]["result"]["content"][0]["text"],
-        "error: Item not found: m_missing"
+        "error: item m_missing not found (ids are case-sensitive and must be given in full)"
     );
     assert_eq!(payload(&out[5])["results"], json!([]));
     let retired_list = payload(&out[6])["items"].as_array().unwrap().clone();

@@ -75,6 +75,12 @@ pub fn run_export(
     for it in &items {
         out.write(&(dumps_value(&item_json(it), &opts) + "\n"))?;
     }
+    if items.is_empty() {
+        out.eprint(&match &scope {
+            Some(repo) => format!("no items in repo {repo} (sm export --all exports every repo)"),
+            None => "no items in any repo".to_string(),
+        })?;
+    }
     Ok(items.len())
 }
 
@@ -548,7 +554,7 @@ mod tests {
             (with(json!({"tag": "n/a"})), "m_x: Invalid tag 'n/a'"),
             (
                 with(json!({"tag": "verified"})),
-                "m_x: Tag 'verified' requires non-empty --evidence",
+                "m_x: Tag 'verified' needs non-empty evidence",
             ),
             (
                 with(json!({"as_of": "2026-10-01 later"})),

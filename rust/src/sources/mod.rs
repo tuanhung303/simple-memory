@@ -38,6 +38,33 @@ pub(crate) fn file_error(path: &str, e: SmError) -> SmError {
     }
 }
 
+/// The files of a folder scan with their items, and `<path>: <reason>` for each file the parser
+/// refused.
+pub type Scan = (Vec<SourceFile>, Vec<String>);
+
+/// `parse` on each file of a folder: an error raised while reading, parsing or converting one
+/// file skips that file, never the rest of the folder.
+pub(crate) fn parse_each(
+    files: Vec<PyPath>,
+    parse: impl Fn(&PyPath) -> Result<Item, SmError>,
+) -> Scan {
+    let (mut parsed, mut skipped) = (Vec::new(), Vec::new());
+    for f in files {
+        match parse(&f) {
+            Ok(item) => parsed.push((f, item)),
+            Err(e) => {
+                let msg = crate::py::str::split(&file_error(f.as_str(), e).msg).join(" ");
+                skipped.push(if msg.starts_with(f.as_str()) {
+                    msg
+                } else {
+                    format!("{f}: {msg}")
+                });
+            }
+        }
+    }
+    (parsed, skipped)
+}
+
 /// `path.stat().st_mtime` (follows links): CPython's `sec + nsec * 1e-9`.
 pub(crate) fn mtime(p: &PyPath) -> Result<f64, SmError> {
     let os = p.to_os();

@@ -14,13 +14,16 @@ use crate::service::query::{
     Lookup, QueryArgs, StrList, item_text, item_tokens, lookup_json, next_cmds, run_lookup,
     split_list,
 };
+use crate::service::recall::is_stopword;
 use crate::service::usage::log_usage;
+use crate::store::search::repo_names;
 
 pub const MAX_TOTAL_CHARS: usize = 2400;
 pub const MIN_TEXT_CHARS: usize = 80;
 pub const HEADER_REFS_CHARS: usize = 100;
 pub const HOOK_TITLE_CHARS: usize = 160;
 pub const HOOK_REFS_CHARS: usize = 60;
+pub const MAX_KNOWN_REPOS: usize = 5;
 
 /// Leading refs that fit in max_chars (a longer first ref is
 /// cut), then ` +N`.
@@ -140,7 +143,8 @@ fn bias_of(ns: &Namespace) -> Option<Vec<String>> {
     }
 }
 
-/// (scope flags, filter flags) to carry into the footer commands.
+/// (scope flags, filter flags) to carry into the footer commands; the filter flags start with
+/// the `narrowing_flags`.
 fn query_flags(ns: &Namespace) -> (Vec<String>, Vec<String>) {
     let s = |v: &str| v.to_string();
     let repo = ns.get_str("repo");
@@ -154,6 +158,22 @@ fn query_flags(ns: &Namespace) -> (Vec<String>, Vec<String>) {
     } else {
         vec![]
     };
+    let mut filters = narrowing_flags(ns);
+    if ns.get_bool("include_history") {
+        filters.push(s("--include-history"));
+    }
+    if ns.get_bool("recent") {
+        filters.push(s("--recent"));
+    }
+    if let Some(b) = bias_of(ns).filter(|b| !b.is_empty()) {
+        filters.extend([s("--bias"), b.join(",")]);
+    }
+    (scope, filters)
+}
+
+/// The flags that leave items out: `--tag`, `--kind`, `--source`, `--since`, `--until`.
+fn narrowing_flags(ns: &Namespace) -> Vec<String> {
+    let s = |v: &str| v.to_string();
     let mut filters = Vec::new();
     for (flag, dest) in [("--tag", "tag"), ("--kind", "kind")] {
         let vals = split_list(StrList::Str(ns.get_str(dest)));
@@ -171,16 +191,7 @@ fn query_flags(ns: &Namespace) -> (Vec<String>, Vec<String>) {
             filters.extend([s(flag), shlex_quote(val)]);
         }
     }
-    if ns.get_bool("include_history") {
-        filters.push(s("--include-history"));
-    }
-    if ns.get_bool("recent") {
-        filters.push(s("--recent"));
-    }
-    if let Some(b) = bias_of(ns).filter(|b| !b.is_empty()) {
-        filters.extend([s("--bias"), b.join(",")]);
-    }
-    (scope, filters)
+    filters
 }
 
 /// `str(limit)` and `str(limit + n)` for the --limit flag, which may lie past i64.
@@ -224,14 +235,40 @@ impl LimitText {
 fn footer_lines(lk: &Lookup, ns: &Namespace, limit: &LimitText) -> Vec<String> {
     let (scope, filters) = query_flags(ns);
     let with = |a: &[String], b: &[String]| -> Vec<String> { a.iter().chain(b).cloned().collect() };
+    let narrow = narrowing_flags(ns);
     let mut lines = Vec::new();
     if !lk.missing.is_empty() {
         let parts: Vec<String> = lk
             .missing
             .iter()
             .map(|(term, n)| {
-                if *n != 0 {
-                    format!("{term}={n} -> {}", query_cmd(term, &with(&scope, &filters)))
+                // a stopword gets no suggested query
+                let cmd = |flags: &[String]| {
+                    if is_stopword(term) {
+                        String::new()
+                    } else {
+                        format!(" -> {}", query_cmd(term, flags))
+                    }
+                };
+                if let Some(h) = lk.hidden.get(term) {
+                    let outside = format!("outside {}", narrow.join(" "));
+                    let what = match (h.retired, h.filtered) {
+                        (true, false) => "retired or superseded".to_string(),
+                        (false, _) => outside,
+                        (true, true) => format!("retired or superseded, {outside}"),
+                    };
+                    let kept = if h.filtered {
+                        &filters[narrow.len()..]
+                    } else {
+                        &filters[..]
+                    };
+                    let mut flags = with(&scope, kept);
+                    if h.retired {
+                        flags.push("--include-history".into());
+                    }
+                    format!("{term}: {} {what}{}", h.n, cmd(&flags))
+                } else if *n != 0 {
+                    format!("{term}={n}{}", cmd(&with(&scope, &filters)))
                 } else {
                     format!("{term}=0")
                 }
@@ -286,7 +323,13 @@ fn footer_lines(lk: &Lookup, ns: &Namespace, limit: &LimitText) -> Vec<String> {
         ));
     }
     if !more.is_empty() {
-        lines.push(format!("more: {}", more.join("; ")));
+        let line = format!("more: {}", more.join("; "));
+        // only filler hits matched here: the other repos are the lead
+        if lk.hits.is_empty() && lk.filler_dropped && !lk.other_repos.is_empty() {
+            lines.insert(0, line);
+        } else {
+            lines.push(line);
+        }
     }
     if !lk.shared_refs.is_empty() {
         lines.push(format!(
@@ -443,6 +486,22 @@ fn print_query(
     out.print(&text)
 }
 
+/// The unknown-scope error, or with no `[scopes]` table at all, where to add one.
+fn unknown_scope_text(msg: &str, paths: &str) -> Result<String, SmError> {
+    let cfg = crate::config::load_config(None)?;
+    if !crate::config::scopes(&cfg)?.is_empty() {
+        return Ok(msg.to_string());
+    }
+    let first = split_list(StrList::Str(paths))
+        .into_iter()
+        .next()
+        .unwrap_or_default();
+    Ok(format!(
+        "unknown scope: {first}; {} has no [scopes] table (README: Multi-repo scopes and maintenance)",
+        crate::config::get_home(None)?.join("config.toml").as_str()
+    ))
+}
+
 fn s(v: &str) -> PyValue {
     PyValue::Str(v.to_string())
 }
@@ -489,13 +548,39 @@ pub fn run(ns: &Namespace, out: &mut Out) -> Result<i32, SmError> {
         cwd: None,
     };
     let query = join_query_tokens(&ns.get_str_list("query"));
+    let repo = py::str::strip(a.repo);
+    if a.all_repos && !repo.is_empty() {
+        out.eprint(&format!(
+            "--all searches every repo, so --repo {repo} is not used"
+        ))?;
+    }
     let lookup = match run_lookup(&query, &a) {
         Err(e) if e.class == crate::config::UNKNOWN_SCOPE => {
-            out.eprint(&e.msg)?;
+            out.eprint(&unknown_scope_text(&e.msg, ns.get_str("in"))?)?;
             return Ok(2);
         }
         r => r?,
     };
+    if !repo.is_empty() && !lookup.all_repos {
+        let conn =
+            crate::store::connect::connect(crate::config::get_db_path(None)?.as_str(), None)?;
+        let mut names = repo_names(&conn)?;
+        if !names.iter().any(|n| n == repo) {
+            let typed = repo.to_lowercase();
+            names.sort_by_key(|n| !n.to_lowercase().contains(&typed));
+            let rest = names.len().saturating_sub(MAX_KNOWN_REPOS);
+            names.truncate(MAX_KNOWN_REPOS);
+            let more = if rest > 0 {
+                format!(" (+{rest} more)")
+            } else {
+                String::new()
+            };
+            out.eprint(&format!(
+                "no items in repo '{repo}'; known repos: {}{more}",
+                names.join(", ")
+            ))?;
+        }
+    }
     print_query(&lookup, ns, &limit_text, out)?;
     let ids: Vec<String> = lookup.hits.iter().map(|h| h.item.id.clone()).collect();
     let flags = PyValue::Dict(vec![
@@ -538,6 +623,8 @@ mod tests {
             other_repos: IndexMap::new(),
             other_repos_cap: None,
             shared_refs: vec![],
+            hidden: IndexMap::new(),
+            filler_dropped: false,
         }
     }
 

@@ -243,6 +243,8 @@ pub struct ImportResult {
     pub rejected: i64,
     pub unresolved_supersedes: Vec<String>,
     pub failed_rows: Vec<String>,
+    /// `<path>: <reason>` for each file of a folder the parser refused; nothing of it is stored.
+    pub skipped: Vec<String>,
 }
 
 /// `run_import(source_kind, path, dry_run=..., apply=..., home=...)`.
@@ -263,9 +265,14 @@ pub fn run_import(
             .map(|(_, item)| item)
             .collect()
     };
+    let mut skipped = Vec::new();
+    let mut scanned = |(files, refused): crate::sources::Scan| {
+        skipped = refused;
+        one_per_source(files)
+    };
     let items = match kind.as_str() {
-        "tasklog" => one_per_source(load_tasklogs(path)?),
-        "handoff" => one_per_source(load_handoffs(path, Some(&repo_roots(&cfg)?))?),
+        "tasklog" => scanned(load_tasklogs(path)?),
+        "handoff" => scanned(load_handoffs(path, Some(&repo_roots(&cfg)?))?),
         "legacy" => alias_repos(load_legacy(path, Some(&repo_roots(&cfg)?))?, &al),
         "proposal" => {
             let (items, n) = load_proposals_with_rejects(path)?;
@@ -309,6 +316,7 @@ pub fn run_import(
         rejected,
         unresolved_supersedes: unresolved,
         failed_rows,
+        skipped,
     })
 }
 

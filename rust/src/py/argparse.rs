@@ -368,6 +368,7 @@ impl Parser {
     }
 
     /// `parse_args(args)`: errors print usage and `<prog>: error: <msg>` to stderr.
+    #[cfg(test)]
     pub fn parse_args(&self, args: &[String], out: &mut Out) -> Result<Namespace, Exit> {
         let (ns, extras) = self.parse_known_args(args.to_vec(), out)?;
         if !extras.is_empty() {

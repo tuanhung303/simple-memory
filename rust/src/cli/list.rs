@@ -278,6 +278,26 @@ pub fn run(ns: &Namespace, out: &mut Out) -> Result<i32, SmError> {
         && let Some(hint) = format_other_repos_hint(&page.other_repos, ns)
     {
         out.print(&hint)?;
+    } else if page.total == 0 {
+        let matching = if list_filter_flags(ns).is_empty() {
+            ""
+        } else {
+            " match the filters"
+        };
+        let scope = if !page.scopes.is_empty() {
+            format!("scope {}", page.scopes.join(","))
+        } else if page.all_repos {
+            "any repo".to_string()
+        } else {
+            format!("repo {}", page.repo.as_deref().unwrap_or_default())
+        };
+        out.eprint(&format!("no items{matching} in {scope}"))?;
+    } else if page.items.is_empty() {
+        let plural = if page.total == 1 { "" } else { "s" };
+        out.eprint(&format!(
+            "offset {} is past the end ({} item{plural})",
+            page.offset, page.total
+        ))?;
     }
     let ids: Vec<String> = page.items.iter().map(|it| it.id.clone()).collect();
     let flags = PyValue::Dict(vec![

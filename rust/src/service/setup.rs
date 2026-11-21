@@ -1,6 +1,7 @@
 use std::io::Write;
 
-use crate::config::{config_toml, defaults, get_db_path, get_home};
+use crate::cli::query::shlex_quote;
+use crate::config::{config_toml, defaults, get_db_path, get_home, load_config};
 use crate::error::SmError;
 use crate::py::path::{PyPath, encode_text};
 use crate::py::str::{splitlines, strip_chars};
@@ -16,7 +17,7 @@ pub const CONFIG_HEADER: &str = "\
 pub const HOOK_TARGETS: [(&str, &str); 3] = [
     (
         "claude-code",
-        "the \"hooks\" object in ~/.claude/settings.json (or a project's .claude/settings.json)",
+        "the top level of ~/.claude/settings.json (or a project's .claude/settings.json): the fragment already holds the \"hooks\" key",
     ),
     ("agy", "~/.gemini/config/hooks.json"),
     (
@@ -114,6 +115,30 @@ pub fn run_init(home: Option<&str>) -> Result<Vec<String>, SmError> {
         }
         Err(e) => return Err(SmError::from_io(&e, Some(&os))),
     }
+    // a config that does not load: sm init names its error on stderr
+    if claude_projects.is_dir()
+        && let Ok(now) = load_config(Some(h.as_str()))
+    {
+        let mut off = Vec::new();
+        for section in ["automemory", "capture"] {
+            if !crate::service::import_::cfg_on(&now, section, "enabled")? {
+                off.push(format!("[{section}]"));
+            }
+        }
+        if off.first().is_some_and(|s| s == "[automemory]") {
+            let what = if off.len() == 2 {
+                "import its memory files and write session cards"
+            } else {
+                "import its memory files"
+            };
+            done.push(format!(
+                "{} exists now: set enabled = true under {} in {} to {what}",
+                claude_projects.as_str(),
+                off.join(" and "),
+                cfg.as_str()
+            ));
+        }
+    }
     Ok(done)
 }
 
@@ -204,17 +229,27 @@ fn dict(pairs: Vec<(&str, PyValue)>) -> PyValue {
     PyValue::Dict(pairs.into_iter().map(|(k, v)| (s(k), v)).collect())
 }
 
-/// `hook_snippet(harness, sm_bin)`: the settings fragment that runs `sm hook prompt` on each
-/// prompt, or `sm mcp`; nothing is written.
-pub fn hook_snippet(harness: &str, sm_bin: Option<&str>) -> Result<PyValue, SmError> {
-    let binary = match sm_bin.filter(|b| !b.is_empty()) {
-        Some(b) => b.to_string(),
-        None => which("sm", None).unwrap_or_else(|| "sm".into()),
-    };
+/// The `sm` a hook should run: the one on PATH, else this binary with a note for stderr.
+pub fn hook_binary() -> Result<(String, Option<String>), SmError> {
+    if let Some(on_path) = which("sm", None) {
+        return Ok((on_path, None));
+    }
+    let exe = std::env::current_exe().map_err(|e| SmError::from_io(&e, None))?;
+    let exe = std::fs::canonicalize(&exe)
+        .map_err(|e| SmError::from_io(&e, Some(&exe)))?
+        .to_string_lossy()
+        .into_owned();
+    let note = format!("no sm on PATH: the command names this binary, {exe}");
+    Ok((exe, Some(note)))
+}
+
+/// `hook_snippet(harness, binary)`: the settings fragment that runs `<binary> hook prompt` on each
+/// prompt, the binary quoted for a POSIX shell, or `<binary> mcp`; nothing is written.
+pub fn hook_snippet(harness: &str, binary: &str) -> Result<PyValue, SmError> {
     if harness == "mcp" {
         let server = dict(vec![
             ("type", s("stdio")),
-            ("command", s(&binary)),
+            ("command", s(binary)),
             ("args", PyValue::List(vec![s("mcp")])),
         ]);
         return Ok(dict(vec![(
@@ -222,7 +257,7 @@ pub fn hook_snippet(harness: &str, sm_bin: Option<&str>) -> Result<PyValue, SmEr
             dict(vec![("simple-memory", server)]),
         )]));
     }
-    let command = format!("{binary} hook prompt");
+    let command = format!("{} hook prompt", shlex_quote(binary));
     if harness == "claude-code" {
         let entry = dict(vec![
             ("type", s("command")),
@@ -410,64 +445,88 @@ mod tests {
 
     #[test]
     fn hook_snippet_gives_each_harness_fragment() {
-        let cc = hook_snippet("claude-code", Some("/x/bin/sm")).unwrap();
+        let cc = hook_snippet("claude-code", "/x/bin/sm").unwrap();
         assert_eq!(
             one_line(&cc),
             r#"{"hooks": {"UserPromptSubmit": [{"hooks": [{"type": "command", "command": "/x/bin/sm hook prompt", "timeout": 15}]}]}}"#
         );
-        let agy = hook_snippet("agy", Some("/x/bin/sm")).unwrap();
+        let agy = hook_snippet("agy", "/x/bin/sm").unwrap();
         assert_eq!(
             one_line(&agy),
             r#"{"sm-recall": {"PreInvocation": [{"type": "command", "command": "/x/bin/sm hook prompt --agy", "timeout": 15}]}}"#
         );
-        let mcp = hook_snippet("mcp", Some("/x/bin/sm")).unwrap();
+        let mcp = hook_snippet("mcp", "/x/bin/sm").unwrap();
         assert_eq!(
             one_line(&mcp),
             r#"{"mcpServers": {"simple-memory": {"type": "stdio", "command": "/x/bin/sm", "args": ["mcp"]}}}"#
         );
-        let e = hook_snippet("vim", Some("/x/bin/sm")).unwrap_err();
+        let odd = "/x/My Tools/it's/sm";
+        let cc = hook_snippet("claude-code", odd).unwrap();
+        assert!(
+            one_line(&cc).contains(r#""command": "'/x/My Tools/it'\"'\"'s/sm' hook prompt""#),
+            "{}",
+            one_line(&cc)
+        );
+        let agy = hook_snippet("agy", odd).unwrap();
+        assert!(
+            one_line(&agy)
+                .contains(r#""command": "'/x/My Tools/it'\"'\"'s/sm' hook prompt --agy""#),
+            "{}",
+            one_line(&agy)
+        );
+        let mcp = hook_snippet("mcp", odd).unwrap();
+        assert!(
+            one_line(&mcp).contains(r#""command": "/x/My Tools/it's/sm", "args": ["mcp"]"#),
+            "{}",
+            one_line(&mcp)
+        );
+        let e = hook_snippet("vim", "/x/bin/sm").unwrap_err();
         assert_eq!(
             e.python_text(),
             "ValueError: unknown harness 'vim'; expected one of claude-code, agy, mcp"
         );
     }
 
-    /// With no binary (None or an empty string) the snippet names the `sm` found on PATH, else the
-    /// bare `sm`. PATH is the process's, so each case runs in a child test process with its own.
+    /// The hook binary is the `sm` found on PATH (an npm wrapper or this binary: no note), else
+    /// this binary with a note. PATH is the process's, so each case runs in a child test process.
     #[test]
-    fn hook_snippet_without_a_binary_names_the_sm_on_path_or_a_bare_sm() {
+    fn hook_binary_names_the_sm_on_path_or_this_binary() {
         use std::os::unix::fs::PermissionsExt;
         if let Some(want) = std::env::var_os("SM_F5_HOOK_WANT") {
-            let want = want.into_string().unwrap();
-            for bin in [None, Some("")] {
-                let v = one_line(&hook_snippet("mcp", bin).unwrap());
-                assert_eq!(
-                    v,
-                    format!(
-                        r#"{{"mcpServers": {{"simple-memory": {{"type": "stdio", "command": "{want}", "args": ["mcp"]}}}}}}"#
-                    )
-                );
-            }
+            let note = std::env::var("SM_F5_HOOK_NOTE").unwrap();
+            let got = hook_binary().unwrap();
+            assert_eq!(got.0, want.into_string().unwrap());
+            assert_eq!(got.1, Some(note).filter(|n| !n.is_empty()));
             return;
         }
         let (_t, d) = tmp();
         std::fs::create_dir(format!("{d}/bin")).unwrap();
         std::fs::create_dir(format!("{d}/empty")).unwrap();
+        std::fs::create_dir(format!("{d}/link")).unwrap();
         std::fs::write(format!("{d}/bin/sm"), "#!/bin/sh\n").unwrap();
         std::fs::set_permissions(
             format!("{d}/bin/sm"),
             std::fs::Permissions::from_mode(0o755),
         )
         .unwrap();
-        let name = "service::setup::tests::hook_snippet_without_a_binary_names_the_sm_on_path_or_a_bare_sm";
-        for (path, want) in [
-            (format!("{d}/bin"), format!("{d}/bin/sm")),
-            (format!("{d}/empty"), "sm".to_string()),
+        let exe = std::fs::canonicalize(std::env::current_exe().unwrap()).unwrap();
+        let exe = exe.to_str().unwrap();
+        std::os::unix::fs::symlink(exe, format!("{d}/link/sm")).unwrap();
+        let name = "service::setup::tests::hook_binary_names_the_sm_on_path_or_this_binary";
+        for (path, want, note) in [
+            (format!("{d}/bin"), format!("{d}/bin/sm"), String::new()),
+            (
+                format!("{d}/empty"),
+                exe.to_string(),
+                format!("no sm on PATH: the command names this binary, {exe}"),
+            ),
+            (format!("{d}/link"), format!("{d}/link/sm"), String::new()),
         ] {
-            let st = std::process::Command::new(std::env::current_exe().unwrap())
+            let st = std::process::Command::new(exe)
                 .args([name, "--exact", "--quiet"])
                 .env("PATH", &path)
                 .env("SM_F5_HOOK_WANT", &want)
+                .env("SM_F5_HOOK_NOTE", &note)
                 .output()
                 .unwrap();
             let text = String::from_utf8_lossy(&st.stdout);

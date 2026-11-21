@@ -385,7 +385,13 @@ fn parse_date_bound_at(
     if let Some(ep) = parse_relative_bound(value, s0, now_epoch)? {
         return Ok((ep, false));
     }
-    let norm = validate_as_of(Some(value), false, false)?;
+    let norm = validate_as_of(Some(value), false, false).map_err(|mut e| {
+        if e.msg.starts_with("Invalid ISO 8601 timestamp") {
+            e.msg
+                .push_str("; a relative form (30m, 24h, 7d, 2w) also works");
+        }
+        e
+    })?;
     let replaced = AS_OF_WORD_RE.replace(s0, "");
     let stripped = strip(&replaced);
     if end_of_day && DATE_ONLY_RE.is_match(stripped) {

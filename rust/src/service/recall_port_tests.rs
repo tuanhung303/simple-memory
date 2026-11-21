@@ -1700,7 +1700,7 @@ fn floor_store(extra: usize, other: usize) -> PyHome {
 }
 
 fn local(prompt: &str, h: &PyHome, limit: i64) -> (String, Vec<String>) {
-    let (q, items) = local_query(
+    let (q, items, _) = local_query(
         prompt,
         limit,
         0,
@@ -1831,7 +1831,7 @@ fn a_multi_word_project_code_is_one_floor_unit() {
     );
     put(&h, "the Forge runbook", "decided", "fact", "global");
     let projects = PyValue::Dict(vec![(s("the Forge"), s("Example Forge"))]);
-    let (q, items) = local_query(
+    let (q, items, _) = local_query(
         "the Forge now please",
         4,
         0,
@@ -2249,8 +2249,14 @@ fn hook_lets_a_store_error_that_is_no_lock_reach_the_cli() {
     )
     .unwrap_err();
     assert_eq!(
-        (e.class.as_ref(), e.msg.as_str()),
-        ("OperationalError", "unable to open database file")
+        (e.class.as_ref(), e.msg),
+        (
+            "OperationalError",
+            format!(
+                "cannot open {}: unable to open database file",
+                h.file("memory.db")
+            )
+        )
     );
 }
 
@@ -2268,9 +2274,14 @@ fn a_store_error_that_is_no_lock_in_the_local_path_writes_local_error() {
         ),
         None
     );
+    let full = format!(
+        "OperationalError: cannot open {}: unable to open database file",
+        h.file("memory.db")
+    );
+    // hook.log keeps the first 200 chars of the error, as run_prompt_hook does
     assert_eq!(
         local_row(&h)["local_error"],
-        "OperationalError: unable to open database file"
+        slice(&split(&full).join(" "), None, Some(200))
     );
 }
 

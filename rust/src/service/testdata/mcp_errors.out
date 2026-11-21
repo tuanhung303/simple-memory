@@ -10,7 +10,7 @@
 {"jsonrpc": "2.0", "id": 9, "error": {"code": -32022, "message": "Unsupported protocol version", "data": {"supported": ["2026-07-28", "2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"], "requested": "1999-01-01"}}}
 {"jsonrpc": "2.0", "id": 10, "error": {"code": -32602, "message": "_meta needs io.modelcontextprotocol/protocolVersion and clientCapabilities"}}
 {"jsonrpc": "2.0", "id": 11, "result": {"content": [{"type": "text", "text": "error: unknown argument 'bogus'; expected one of query, bias, kind, tag, limit, all_repos, repo, in"}], "isError": true}}
-{"jsonrpc": "2.0", "id": 12, "result": {"content": [{"type": "text", "text": "error: Item not found: m_missing"}], "isError": true}}
+{"jsonrpc": "2.0", "id": 12, "result": {"content": [{"type": "text", "text": "error: item m_missing not found (ids are case-sensitive and must be given in full)"}], "isError": true}}
 {"jsonrpc": "2.0", "id": "s", "result": {"content": [{"type": "text", "text": "error: unknown argument 'format'; expected one of query, bias, kind, tag, limit, all_repos, repo, in"}], "isError": true}}
 {"jsonrpc": "2.0", "id": null, "error": {"code": -32700, "message": "Parse error"}}
 {"jsonrpc": "2.0", "id": 13, "error": {"code": -32602, "message": "params must be an object"}}
@@ -18,7 +18,7 @@
 {"jsonrpc": "2.0", "id": 14, "result": {"content": [{"type": "text", "text": "error: missing required argument 'text'"}], "isError": true}}
 {"jsonrpc": "2.0", "id": 15, "result": {"content": [{"type": "text", "text": "error: argument 'limit' must be integer, got \"2\""}], "isError": true}}
 {"jsonrpc": "2.0", "id": 16, "result": {"content": [{"type": "text", "text": "error: missing required argument 'new_id'"}], "isError": true}}
-{"jsonrpc": "2.0", "id": 17, "result": {"content": [{"type": "text", "text": "error: Item not found: m_missing"}], "isError": true}}
-{"jsonrpc": "2.0", "id": 18, "error": {"code": -32602, "message": "Unknown tool: None"}}
+{"jsonrpc": "2.0", "id": 17, "result": {"content": [{"type": "text", "text": "error: item m_missing not found (ids are case-sensitive and must be given in full)"}], "isError": true}}
+{"jsonrpc": "2.0", "id": 18, "error": {"code": -32602, "message": "missing argument 'name'"}}
 {"jsonrpc": "2.0", "id": 19, "error": {"code": -32602, "message": "tools/call arguments must be an object"}}
 {"jsonrpc": "2.0", "id": 20, "result": {"protocolVersion": "2025-11-25", "capabilities": {"tools": {"listChanged": false}}, "serverInfo": {"name": "simple-memory", "title": "Simple Memory", "version": "<VERSION>"}, "instructions": "Simple Memory holds decisions, results and task logs from earlier agent sessions. Call memory_query with the words, ids or paths of the task before you work, memory_show for the full text of an id, and memory_put to store a durable fact no task log holds."}}

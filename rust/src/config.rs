@@ -221,15 +221,38 @@ fn get<'a>(d: &'a PyValue, key: &str) -> Option<&'a PyValue> {
     }
 }
 
-/// `load_config(home)`: DEFAULTS, each section updated by the file's table of that name (a key
-/// the file sets keeps the default's place; a new key goes last). Other sections are dropped.
-pub fn load_config(home: Option<&str>) -> Result<PyValue, SmError> {
-    let cfg_path = get_home(home)?.join("config.toml");
-    let mut default = defaults();
-    if !cfg_path.is_file() {
-        return Ok(default);
+/// The path of a home's config.toml and the tables it holds, or None when there is no file. A file
+/// that does not parse is an error that names the file, the place and the next step.
+fn read_config(home: Option<&str>) -> Result<Option<(PyPath, PyValue)>, SmError> {
+    let path = get_home(home)?.join("config.toml");
+    if !path.is_file() {
+        return Ok(None);
     }
-    let raw = toml_loads(&cfg_path.read_text(Errors::Strict)?)?;
+    let raw = toml_loads(&path.read_text(Errors::Strict)?).map_err(|e| {
+        // A TOMLDecodeError's text is `<problem> (at line L, column C)` or `(at end of document)`.
+        let Some((what, at)) = e.msg.strip_suffix(')').and_then(|m| m.rsplit_once(" (at ")) else {
+            return e;
+        };
+        let at = if at == "end of document" {
+            "the end of the file"
+        } else {
+            at
+        };
+        let msg = format!("{path}: {at}: {what}; fix the line, then run sm config");
+        SmError::new(e.base, e.class.clone(), msg)
+    })?;
+    Ok(Some((path, raw)))
+}
+
+/// `load_config(home)`: DEFAULTS, each section updated by the file's table of that name (a key
+/// the file sets keeps the default's place; a new key goes last). Other sections are dropped. A
+/// key whose default is a list refuses any other value, except the comma-separated string that
+/// `[query] default_bias` has always taken.
+pub fn load_config(home: Option<&str>) -> Result<PyValue, SmError> {
+    let mut default = defaults();
+    let Some((cfg_path, raw)) = read_config(home)? else {
+        return Ok(default);
+    };
     if let PyValue::Dict(sections) = &mut default {
         for (key, section) in sections.iter_mut() {
             let PyValue::Str(name) = key else { continue };
@@ -239,6 +262,21 @@ pub fn load_config(home: Option<&str>) -> Result<PyValue, SmError> {
             };
             for (k, v) in over {
                 match base.iter_mut().find(|(bk, _)| bk.key_eq(k)) {
+                    Some((_, PyValue::List(_)))
+                        if !matches!(v, PyValue::List(_))
+                            && !(name == "query"
+                                && k.key_eq(&s("default_bias"))
+                                && matches!(v, PyValue::Str(_))) =>
+                    {
+                        let example = match v {
+                            PyValue::Str(_) => toml_value(&PyValue::List(vec![v.clone()]))?,
+                            _ => "[]".into(),
+                        };
+                        return Err(SmError::value(format!(
+                            "{cfg_path}: {name}.{} must be a list, for example {example}",
+                            k.py_str()
+                        )));
+                    }
                     Some(slot) => slot.1 = v.clone(),
                     None => base.push((k.clone(), v.clone())),
                 }
@@ -246,6 +284,39 @@ pub fn load_config(home: Option<&str>) -> Result<PyValue, SmError> {
         }
     }
     Ok(default)
+}
+
+/// One warning line per section or key config.toml sets that DEFAULTS does not name. A table whose
+/// default is empty (`[repo_aliases]`, `[scopes]`, `[prompt_hook.projects]`) takes any key.
+pub fn unknown_keys(home: Option<&str>) -> Result<Vec<String>, SmError> {
+    let Some((path, raw)) = read_config(home)? else {
+        return Ok(Vec::new());
+    };
+    let mut found = Vec::new();
+    unknown_in(&raw, &defaults(), "", &mut found);
+    Ok(found
+        .into_iter()
+        .map(|what| format!("warning: {path}: unknown {what}; sm config prints the keys in effect"))
+        .collect())
+}
+
+fn unknown_in(set: &PyValue, known: &PyValue, prefix: &str, found: &mut Vec<String>) {
+    let (PyValue::Dict(set), PyValue::Dict(names)) = (set, known) else {
+        return;
+    };
+    if names.is_empty() {
+        return;
+    }
+    for (k, v) in set {
+        let name = format!("{prefix}{}", k.py_str());
+        match names.iter().find(|(n, _)| n.key_eq(k)) {
+            Some((_, default)) => unknown_in(v, default, &format!("{name}."), found),
+            None if prefix.is_empty() && matches!(v, PyValue::Dict(_)) => {
+                found.push(format!("section [{name}]"))
+            }
+            None => found.push(format!("key {name}")),
+        }
+    }
 }
 
 // ---------------------------------------------------------------- config_toml
@@ -1134,7 +1205,15 @@ mod tests {
         // Python 3.15.1: config.repo_roots(config.load_config(home)) for each `roots` below.
         let got = |toml: &str| {
             let h = home_with(&format!("[repos]\nroots = {toml}\n"));
-            roots(&load_config(h.path().to_str()).unwrap()).map_err(|e| e.python_text())
+            match load_config(h.path().to_str()) {
+                Ok(cfg) => roots(&cfg).map_err(|e| e.python_text()),
+                Err(e) => Err(e.msg.replace(&h.path().display().to_string(), "<home>")),
+            }
+        };
+        let not_a_list = |example: &str| {
+            Err(format!(
+                "<home>/config.toml: repos.roots must be a list, for example {example}"
+            ))
         };
         let not_a_path = |t: &str| {
             Err(format!(
@@ -1149,16 +1228,11 @@ mod tests {
         assert_eq!(got("[\"/x\", 1]"), not_a_path("int"));
         assert_eq!(got("[1979-05-27]"), not_a_path("date"));
         assert_eq!(got("[[\"a\"]]"), not_a_path("list"));
-        assert_eq!(
-            got("07:32"),
-            Err("TypeError: 'datetime.time' object is not iterable".to_string())
-        );
-        assert_eq!(
-            got("5"),
-            Err("TypeError: 'int' object is not iterable".to_string())
-        );
-        assert_eq!(got("\"ab\""), Ok(vec!["a".to_string(), "b".to_string()]));
-        assert_eq!(got("{ \"/r\" = 1 }"), Ok(vec!["/r".to_string()]));
+        // A value that is not a list stops at load, so it is never walked as an iterable.
+        assert_eq!(got("07:32"), not_a_list("[]"));
+        assert_eq!(got("5"), not_a_list("[]"));
+        assert_eq!(got("\"ab\""), not_a_list("[\"ab\"]"));
+        assert_eq!(got("{ \"/r\" = 1 }"), not_a_list("[]"));
     }
 
     #[test]
@@ -1196,6 +1270,90 @@ mod tests {
             get(q, "default_bias").unwrap().py_repr(),
             "['executed', 'recency']"
         );
+    }
+
+    #[test]
+    fn a_config_that_does_not_parse_names_the_file_the_place_and_the_next_step() {
+        let got = |toml: &str| {
+            let h = home_with(toml);
+            let msg = load_config(h.path().to_str()).unwrap_err().msg;
+            msg.replace(&format!("{}/config.toml", h.path().display()), "<cfg>")
+        };
+        assert_eq!(
+            got("[repos]\nroots = ~/code\n"),
+            "<cfg>: line 2, column 9: invalid value: text needs quotes and a list needs [ ]; fix the line, then run sm config"
+        );
+        assert_eq!(
+            got("[prompt_hook]\nlimit = 2\n[prompt_hook.projects]\n[prompt_hook.projects]\n"),
+            "<cfg>: line 4, column 22: [prompt_hook.projects] is declared twice; keep one header and put the keys under it; fix the line, then run sm config"
+        );
+        assert_eq!(
+            got("[backup]\nkeep = \"3\n"),
+            "<cfg>: line 2, column 10: Illegal character '\\n'; fix the line, then run sm config"
+        );
+        assert_eq!(
+            got("[backup]\nkeep = [1, 2"),
+            "<cfg>: the end of the file: Unclosed array; fix the line, then run sm config"
+        );
+    }
+
+    #[test]
+    fn every_list_key_refuses_another_type_at_load() {
+        let PyValue::Dict(sections) = defaults() else {
+            panic!("defaults is a dict")
+        };
+        let mut checked = Vec::new();
+        for (section, values) in &sections {
+            let PyValue::Dict(values) = values else {
+                continue;
+            };
+            for (key, default) in values {
+                if !matches!(default, PyValue::List(_)) {
+                    continue;
+                }
+                let name = format!("{}.{}", section.py_str(), key.py_str());
+                let h = home_with(&format!(
+                    "[{}]\n{} = \"/a b\"\n",
+                    section.py_str(),
+                    key.py_str()
+                ));
+                let cfg = format!("{}/config.toml", h.path().display());
+                if name == "query.default_bias" {
+                    // the comma-separated string default_bias has always taken still loads
+                    let got = load_config(h.path().to_str()).unwrap();
+                    assert_eq!(
+                        get(get(&got, "query").unwrap(), "default_bias"),
+                        Some(&s("/a b"))
+                    );
+                } else {
+                    assert_eq!(
+                        load_config(h.path().to_str()).unwrap_err().python_text(),
+                        format!("ValueError: {cfg}: {name} must be a list, for example [\"/a b\"]")
+                    );
+                }
+                let h = home_with(&format!("[{}]\n{} = 5\n", section.py_str(), key.py_str()));
+                assert_eq!(
+                    load_config(h.path().to_str()).unwrap_err().msg,
+                    format!(
+                        "{}/config.toml: {name} must be a list, for example []",
+                        h.path().display()
+                    )
+                );
+                checked.push(name);
+            }
+        }
+        assert_eq!(
+            checked,
+            [
+                "repos.roots",
+                "prompt_hook.extra_stopwords",
+                "upkeep.tasklog_roots",
+                "upkeep.handoff_dirs",
+                "query.default_bias"
+            ]
+        );
+        let h = home_with("[upkeep]\ntasklog_roots = []\nhandoff_dirs = [\"/x\"]\n");
+        assert!(load_config(h.path().to_str()).is_ok());
     }
 
     #[test]

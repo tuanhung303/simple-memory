@@ -34,8 +34,7 @@ pub fn run_related(
         return Err(SmError::value("--limit must be at least 1"));
     }
     let conn = connect(get_db_path(home)?.as_str(), None)?;
-    let target = get_item(&conn, strip(item_id))?
-        .ok_or_else(|| SmError::key(&format!("Item not found: {item_id}")))?;
+    let target = get_item(&conn, strip(item_id))?.ok_or_else(|| SmError::not_found(item_id))?;
     let mut found: IndexMap<String, Related> = IndexMap::new();
     fn entry(found: &mut IndexMap<String, Related>, it: Item) -> &mut Related {
         found.entry(it.id.clone()).or_insert_with(|| Related {
@@ -58,8 +57,10 @@ pub fn run_related(
     for (i, refs) in sharing {
         let it = match found.get(&i) {
             Some(r) => r.item.clone(),
-            // `loaded[i]`: an id that left the store between the two reads is a KeyError
-            None => loaded.shift_remove(&i).ok_or_else(|| SmError::key(&i))?,
+            // an id that left the store between the two reads
+            None => loaded
+                .shift_remove(&i)
+                .ok_or_else(|| SmError::not_found(&i))?,
         };
         let rel = entry(&mut found, it);
         rel.relation.push("refs".into());

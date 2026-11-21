@@ -2,7 +2,7 @@
 //! the Namespace it returns by dest name.
 
 use crate::py::argparse::{
-    Action, ActionError, Arg, Conv, Kind, Namespace, Nargs, Parser, Subparsers, Value,
+    Action, ActionError, Arg, Conv, Exit, Kind, Namespace, Nargs, Parser, Subparsers, Value,
 };
 use crate::py::io::Out;
 use crate::service::setup::HOOK_TARGETS;
@@ -130,6 +130,20 @@ fn choices(list: &[&str], default: Option<&str>, help: &str) -> Arg {
     }
 }
 
+const SINCE_HELP: &str = "Keep items with as_of on or after this time: an ISO 8601 date or timestamp, \
+                          or a relative form such as 30m, 24h, 7d or 2w (minutes, hours, days or weeks back)";
+const UNTIL_HELP: &str = "Keep items with as_of on or before this time: an ISO 8601 date or timestamp \
+                          (a date includes the full day), or a relative form such as 30m, 24h, 7d or 2w";
+
+/// An error about the last argument names it by its choices (`{a,b}`), not by its dest.
+fn name_by_choices(p: &mut Parser) {
+    let a = p.actions.last_mut().expect("an argument was added");
+    a.metavar = Some(format!(
+        "{{{}}}",
+        a.choices.as_deref().unwrap_or_default().join(",")
+    ));
+}
+
 fn add_query_args(p: &mut Parser) {
     p.allow_dash_exclusions(true);
     p.add_argument(
@@ -165,20 +179,8 @@ fn add_query_args(p: &mut Parser) {
         &["--source"],
         comma("Filter by comma-separated source prefixes (case-sensitive)"),
     );
-    p.add_argument(
-        &["--since"],
-        default_str(
-            "",
-            "Keep items with as_of on or after ISO 8601 date or timestamp",
-        ),
-    );
-    p.add_argument(
-        &["--until"],
-        default_str(
-            "",
-            "Keep items with as_of on or before ISO 8601 date or timestamp (date-only includes full day)",
-        ),
-    );
+    p.add_argument(&["--since"], default_str("", SINCE_HELP));
+    p.add_argument(&["--until"], default_str("", UNTIL_HELP));
     let q_in = p.add_argument(
         &["--in"],
         comma("Keep items in comma-separated [scopes] paths; searches every repo"),
@@ -198,9 +200,37 @@ fn add_query_args(p: &mut Parser) {
         choices(
             &["text", "brief", "json"],
             Some("text"),
-            "text: a header and a snippet per hit; brief: one line per hit; json (default: text)",
+            "text (default): a header and a snippet per hit; brief: one line per hit; json: one JSON object with each hit's fields, snippet and why it matched",
         ),
     );
+}
+
+/// `build_parser().parse_args(args)`, except that arguments left over after a subcommand get
+/// that subcommand's usage and its `--help` pointer.
+pub fn parse_args(args: &[String], out: &mut Out) -> Result<Namespace, Exit> {
+    let parser = build_parser();
+    let (ns, extras) = parser.parse_known_args(args.to_vec(), out)?;
+    if extras.is_empty() {
+        return Ok(ns);
+    }
+    let msg = format!("unrecognized arguments: {}", extras.join(" "));
+    let command_at = args.iter().position(|a| a == ns.get_str("command"));
+    if command_at.is_some_and(|i| extras.iter().any(|e| args[..i].contains(e))) {
+        return Err(parser.error(&msg, out));
+    }
+    let mut p = &parser;
+    while let Some(sub) = p.actions.iter().find_map(|a| match (&a.kind, &a.dest) {
+        (Kind::Parsers(subs), Some(dest)) => subs
+            .iter()
+            .find(
+                |(name, _, _)| matches!(ns.get_or(dest, &Value::None), Value::Str(s) if s == name),
+            )
+            .map(|(_, _, sub)| sub),
+        _ => None,
+    }) {
+        p = sub;
+    }
+    Err(p.error(&format!("{msg}; see {} --help", p.prog), out))
 }
 
 pub fn build_parser() -> Parser {
@@ -224,7 +254,8 @@ pub fn build_parser() -> Parser {
         &["body"],
         Arg {
             nargs: Some(Nargs::ZeroOrMore),
-            help: "Memory text to store".into(),
+            help: "Memory text to store, as one or more arguments (sm put does not read stdin)"
+                .into(),
             ..Arg::default()
         },
     );
@@ -248,9 +279,12 @@ pub fn build_parser() -> Parser {
     );
     p_put.add_argument(
         &["--refs"],
-        comma("Explicit references (ticket ids, shas, paths)"),
+        comma("References (ticket ids, shas, paths), separated by commas or spaces; repeat the flag to add more"),
     );
-    p_put.add_argument(&["--tags"], comma("Freeform tags"));
+    p_put.add_argument(
+        &["--tags"],
+        comma("Freeform tags, separated by commas (a space stays inside a tag); repeat the flag to add more"),
+    );
     p_put.add_argument(
         &["--title"],
         default_str("", "Optional title (defaults to first line of body)"),
@@ -263,7 +297,7 @@ pub fn build_parser() -> Parser {
     p_put.add_argument(&["--as-of"], default_str("", "ISO 8601 timestamp override"));
     p_put.add_argument(
         &["--supersedes"],
-        comma("Old item id(s) this item supersedes"),
+        comma("Old item id(s) this item supersedes, separated by commas or spaces"),
     );
 
     let p_query = sub.add_parser(
@@ -330,6 +364,9 @@ pub fn build_parser() -> Parser {
         "amend",
         "Create a revised active copy of an item and supersede the old one",
     );
+    p_am.description = "Create a revised active copy of an item and supersede the old one; \
+                        exits 1 with \"No changes to apply\" when every value given matches the item"
+        .into();
     p_am.add_argument(&["id"], opt("Active item id to amend"));
     p_am.add_argument(&["--repo"], opt("Replace repo"));
     p_am.add_argument(
@@ -389,20 +426,8 @@ pub fn build_parser() -> Parser {
         &["--source"],
         comma("Filter by comma-separated source prefixes (case-sensitive)"),
     );
-    p_list.add_argument(
-        &["--since"],
-        default_str(
-            "",
-            "Keep items with as_of on or after ISO 8601 date or timestamp",
-        ),
-    );
-    p_list.add_argument(
-        &["--until"],
-        default_str(
-            "",
-            "Keep items with as_of on or before ISO 8601 date or timestamp (date-only includes full day)",
-        ),
-    );
+    p_list.add_argument(&["--since"], default_str("", SINCE_HELP));
+    p_list.add_argument(&["--until"], default_str("", UNTIL_HELP));
     let list_status = p_list.add_argument(
         &["--status"],
         choices(
@@ -421,13 +446,13 @@ pub fn build_parser() -> Parser {
         choices(
             &["brief", "text", "json"],
             Some("brief"),
-            "brief: one line per item; text: header and snippet; json (default: brief)",
+            "brief (default): one line per item; text: a header and a snippet per item; json: one JSON object with the items, total and paging",
         ),
     );
 
     let p_imp = sub.add_parser(
         "import",
-        "Import items from files (tasklog, handoff, legacy, proposal, automemory, sessions, catch-up)",
+        "Import items from files (tasklog, handoff, legacy, proposal, automemory, sessions, jsonl, catch-up)",
     );
     let mut imp_sub = Subparsers::new(p_imp, "source_kind", true);
     for kind in ["tasklog", "handoff", "legacy", "proposal"] {
@@ -440,7 +465,14 @@ pub fn build_parser() -> Parser {
             &["--dry-run"],
             flag("Print counts per repo and tag without writing"),
         );
-        p_kind.add_argument(&["--apply"], flag("Apply proposal JSONL into the store"));
+        p_kind.add_argument(
+            &["--apply"],
+            flag(if kind == "proposal" {
+                "Write the proposal rows into the store (without it a proposal import only counts them)"
+            } else {
+                "No effect for this source (only a proposal import needs it); the import writes without it"
+            }),
+        );
     }
     let p_am = imp_sub.add_parser(
         "automemory",
@@ -608,10 +640,12 @@ pub fn build_parser() -> Parser {
         choices(
             &HOOK_TARGETS.map(|(k, _)| k),
             None,
-            "Harness to print the hook for",
+            "Harness to print the hook for: claude-code, agy or mcp",
         ),
     );
+    name_by_choices(p_hp);
     p_hooks.add_subparsers(hooks_sub);
+    name_by_choices(p_hooks);
 
     sub.add_parser(
         "mcp",

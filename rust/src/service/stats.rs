@@ -714,6 +714,15 @@ fn days_us(days: f64) -> i128 {
     (int as i128) * US_PER_DAY + ((days - int) * 86_400_000_000.0).round_ties_even() as i128
 }
 
+/// `--days` as typed in an error: `0`, not `0.0`.
+fn days_text(days: f64) -> String {
+    if days.is_finite() {
+        days.to_string()
+    } else {
+        float_repr(days)
+    }
+}
+
 /// `run_stats(days=..., home=..., now=...)`: `now` (epoch seconds, default the clock) sets the
 /// log window and the stale cutoff.
 pub fn run_stats(days: f64, home: Option<&str>, now: Option<f64>) -> Result<Stats, SmError> {
@@ -721,13 +730,13 @@ pub fn run_stats(days: f64, home: Option<&str>, now: Option<f64>) -> Result<Stat
     if !(days > 0.0) {
         return Err(SmError::value(format!(
             "--days must be above 0, got {}",
-            float_repr(days)
+            days_text(days)
         )));
     }
     if days > MAX_DAYS as f64 {
         return Err(SmError::value(format!(
             "--days must be at most {MAX_DAYS}, got {}",
-            float_repr(days)
+            days_text(days)
         )));
     }
     let h = get_home(home)?;
@@ -1039,7 +1048,7 @@ mod tests {
         );
         assert_eq!(
             run_stats(0.0, h, None).unwrap_err().python_text(),
-            "ValueError: --days must be above 0, got 0.0"
+            "ValueError: --days must be above 0, got 0"
         );
         assert_eq!(
             run_stats(36_500.5, h, None).unwrap_err().python_text(),

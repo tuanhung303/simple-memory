@@ -14,6 +14,9 @@ pub fn run(ns: &Namespace, out: &mut Out) -> Result<i32, SmError> {
         ns.get_bool("imports"),
     );
     let doc = run_doctor(ns.get_bool("rebuild_fts"), backfill, dry_run, imports, None)?;
+    for line in crate::config::unknown_keys(None)? {
+        out.eprint(&line)?;
+    }
     let c = &doc.check;
     out.print(&format!(
         "integrity={} rebuilt_fts={} total={} active={} superseded={}",

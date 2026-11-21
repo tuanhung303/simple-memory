@@ -8,10 +8,22 @@ use crate::py::str::strip;
 use crate::service::put::{PutArgs, run_put};
 use crate::service::upkeep::put_overlaps;
 
+const STDIN_HINT: &str =
+    "sm put does not read stdin: give the text as an argument, as in sm put --tag <tag> \"<text>\"";
+
 pub fn run(ns: &Namespace, out: &mut Out) -> Result<i32, SmError> {
     let body_text = ns.get_str_list("body").join(" ");
+    let body = strip(&body_text);
+    if body == "-" {
+        return Err(SmError::value(format!(
+            "the body is \"-\", but {STDIN_HINT}"
+        )));
+    }
+    if body.is_empty() {
+        out.eprint(STDIN_HINT)?;
+    }
     let (item_id, created) = run_put(
-        strip(&body_text),
+        body,
         &PutArgs {
             tag: ns.get_str("tag"),
             kind: ns.get_str("kind"),
