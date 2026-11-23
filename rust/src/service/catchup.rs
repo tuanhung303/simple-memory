@@ -16,7 +16,9 @@ use crate::py::str::{isdecimal, slice, split, splitlines};
 use crate::py::value::PyValue;
 use crate::service::backup::{backup_age_hours, run_backup};
 use crate::service::capture::{Run, run_process};
-use crate::service::doctor::{import_lag, import_lag_by_repo, is_missing_entry, tasklog_repo_dirs};
+use crate::service::doctor::{
+    find_repo_dir, import_lag, import_lag_by_repo, is_missing_entry, tasklog_repo_dirs,
+};
 use crate::service::import_::{cfg_on, cfg2, float_of, run_automemory_import, run_import};
 use crate::store::connect::connect;
 use crate::store::items::retire_item;
@@ -82,12 +84,34 @@ fn git(repo_dir: &PyPath, args: &[&str]) -> Vec<String> {
 }
 
 fn in_git_repo(repo_dir: &PyPath) -> Result<bool, SmError> {
+    let has_git_marker = repo_dir.join(".git").to_os().symlink_metadata().is_ok();
     let r = Run {
         argv: git(repo_dir, &["rev-parse", "--git-dir"]),
         timeout: Some(10.0),
+        text: true,
         ..Default::default()
     };
-    Ok(run_process(&r)?.returncode == 0)
+    let res = run_process(&r)?;
+    if res.returncode == 0 {
+        return Ok(true);
+    }
+    if !has_git_marker
+        && res
+            .stderr
+            .to_ascii_lowercase()
+            .contains("not a git repository")
+    {
+        return Ok(false);
+    }
+    let err = crate::py::str::strip(&res.stderr);
+    Err(SmError::runtime(if err.is_empty() {
+        format!(
+            "git rev-parse failed in {repo_dir} with code {}",
+            res.returncode
+        )
+    } else {
+        format!("git rev-parse failed in {repo_dir}: {err}")
+    }))
 }
 
 /// The checkouts of the repo; none for a folder outside git.
@@ -177,11 +201,13 @@ pub fn task_id_match(s: &str) -> Option<(String, String, String, String)> {
 /// `_retire_missing`: retire each active task item whose file is gone from every checkout and
 /// branch of its repo.
 fn retire_missing(home: &PyPath, cfg: &PyValue, dry_run: bool) -> Result<Counts, SmError> {
-    let repo_dirs = tasklog_repo_dirs(
-        cfg2(cfg, "upkeep", "tasklog_roots")?,
-        &aliases(cfg),
-        Some(home.as_str()),
-    )?;
+    let tl_roots = cfg2(cfg, "upkeep", "tasklog_roots")?;
+    let al = aliases(cfg);
+    let mut repo_dirs: IndexMap<String, Option<PyPath>> =
+        tasklog_repo_dirs(tl_roots, &al, Some(home.as_str()))?
+            .into_iter()
+            .map(|(k, v)| (k, Some(v)))
+            .collect();
     let mut wts: IndexMap<String, Vec<PyPath>> = IndexMap::new();
     let mut refs: IndexMap<String, Vec<String>> = IndexMap::new();
     let mut c = counts(&[
@@ -194,6 +220,13 @@ fn retire_missing(home: &PyPath, cfg: &PyValue, dry_run: bool) -> Result<Counts,
     let conn = connect(get_db_path(Some(home.as_str()))?.as_str(), None)?;
     let (_, missing) = import_lag_by_repo(&conn, cfg, Some(home.as_str()))?;
     for (repo, source) in &missing {
+        let dir = if let Some(cached) = repo_dirs.get(repo) {
+            cached.clone()
+        } else {
+            let found = find_repo_dir(tl_roots, &al, Some(home.as_str()), repo)?;
+            repo_dirs.insert(repo.clone(), found.clone());
+            found
+        };
         let mut stmt = conn
             .prepare("SELECT id FROM items WHERE repo = ? AND source = ? AND status = 'active'")?;
         let ids = stmt
@@ -201,13 +234,13 @@ fn retire_missing(home: &PyPath, cfg: &PyValue, dry_run: bool) -> Result<Counts,
             .collect::<rusqlite::Result<Vec<_>>>()?;
         for id in ids {
             c["candidates"] += 1;
-            let Some(dir) = repo_dirs.get(repo) else {
+            let Some(dir) = dir.clone() else {
                 c["no_folder"] += 1;
                 continue;
             };
             if !wts.contains_key(repo) {
-                wts.insert(repo.clone(), worktrees(dir)?);
-                refs.insert(repo.clone(), branch_refs(dir)?);
+                wts.insert(repo.clone(), worktrees(&dir)?);
+                refs.insert(repo.clone(), branch_refs(&dir)?);
             }
             if let Some((y, m, d, rest)) =
                 task_id_match(source.strip_prefix("task:").unwrap_or(source))
@@ -229,7 +262,7 @@ fn retire_missing(home: &PyPath, cfg: &PyValue, dry_run: bool) -> Result<Counts,
                     continue;
                 }
                 let rel = format!("docs/tasklog/{y}-{m}-{d}/{name}");
-                if at_a_branch_tip(dir, &refs[repo], &rel)? {
+                if at_a_branch_tip(&dir, &refs[repo], &rel)? {
                     c["on_branch"] += 1;
                     continue;
                 }
@@ -662,5 +695,195 @@ mod tests {
         assert_eq!(task_rows(), vec![("active".to_string(), None)]);
         assert_eq!(retire_missing(&hp, &cfg, false).unwrap()["retired"], 1);
         assert_eq!(task_rows(), vec![("superseded".to_string(), None)]);
+    }
+
+    #[test]
+    fn retire_missing_retires_when_docs_tasklog_folder_was_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let tmp = std::fs::canonicalize(dir.path()).unwrap();
+        let gh = tmp.join("gh");
+        let repo = gh.join("r1");
+        let tl_dir = repo.join("docs/tasklog/2026-11-01");
+        std::fs::create_dir_all(&tl_dir).unwrap();
+        let init = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .arg(&repo)
+            .env("HOME", &tmp)
+            .output()
+            .unwrap();
+        assert!(init.status.success());
+        let home = tmp.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(
+            home.join("config.toml"),
+            format!(
+                "[upkeep]\ntasklog_roots = [\"{}\"]\nhandoff_dirs = []\n",
+                gh.display()
+            ),
+        )
+        .unwrap();
+        let t = tl_dir.join("090000-baba-y.yaml");
+        let id = "20261101-090000-baba-y";
+        std::fs::write(
+            &t,
+            format!("id: {id}\ntitle: T {id}\nas_of: 2026-11-01T09:00:00+00:00\nresults:\n  - done\n"),
+        )
+        .unwrap();
+        let h = home.to_str().unwrap();
+        run_import("tasklog", t.to_str().unwrap(), false, false, Some(h)).unwrap();
+        std::fs::remove_dir_all(repo.join("docs/tasklog")).unwrap();
+        let cfg = load_config(Some(h)).unwrap();
+        let c = retire_missing(&PyPath::new(h), &cfg, false).unwrap();
+        assert_eq!((c["candidates"], c["retired"], c["no_folder"]), (1, 1, 0));
+    }
+
+    #[test]
+    fn retire_missing_keeps_task_on_branch_when_docs_tasklog_folder_was_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let tmp = std::fs::canonicalize(dir.path()).unwrap();
+        let gh = tmp.join("gh");
+        let repo = gh.join("r1");
+        let tl_dir = repo.join("docs/tasklog/2026-11-01");
+        std::fs::create_dir_all(&tl_dir).unwrap();
+        let git_run = |args: &[&str]| {
+            let o = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .env("HOME", &tmp)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+                .unwrap();
+            assert!(o.status.success(), "{args:?}: {}", String::from_utf8_lossy(&o.stderr));
+        };
+        git_run(&["init", "-q"]);
+        let t = tl_dir.join("090000-baba-y.yaml");
+        let id = "20261101-090000-baba-y";
+        std::fs::write(
+            &t,
+            format!("id: {id}\ntitle: T {id}\nas_of: 2026-11-01T09:00:00+00:00\nresults:\n  - done\n"),
+        )
+        .unwrap();
+        git_run(&["add", "."]);
+        git_run(&["commit", "-qm", "keep on branch"]);
+        git_run(&["branch", "topic"]);
+        let home = tmp.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(
+            home.join("config.toml"),
+            format!(
+                "[upkeep]\ntasklog_roots = [\"{}\"]\nhandoff_dirs = []\n",
+                gh.display()
+            ),
+        )
+        .unwrap();
+        let h = home.to_str().unwrap();
+        run_import("tasklog", t.to_str().unwrap(), false, false, Some(h)).unwrap();
+        std::fs::remove_dir_all(repo.join("docs/tasklog")).unwrap();
+        git_run(&["add", "-A"]);
+        git_run(&["commit", "-qm", "drop docs/tasklog on main"]);
+        let cfg = load_config(Some(h)).unwrap();
+        let c = retire_missing(&PyPath::new(h), &cfg, false).unwrap();
+        assert_eq!(
+            (c["candidates"], c["retired"], c["on_branch"], c["no_folder"]),
+            (1, 0, 1, 0)
+        );
+    }
+
+    #[test]
+    fn retire_missing_fails_closed_when_git_errors_with_dot_git_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let tmp = std::fs::canonicalize(dir.path()).unwrap();
+        let gh = tmp.join("gh");
+        let repo = gh.join("r1");
+        let tl_dir = repo.join("docs/tasklog/2026-11-01");
+        std::fs::create_dir_all(&tl_dir).unwrap();
+        std::fs::create_dir_all(repo.join(".git")).unwrap(); // broken .git with no HEAD/objects
+        let home = tmp.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(
+            home.join("config.toml"),
+            format!(
+                "[upkeep]\ntasklog_roots = [\"{}\"]\nhandoff_dirs = []\n",
+                gh.display()
+            ),
+        )
+        .unwrap();
+        let t = tl_dir.join("090000-baba-y.yaml");
+        let id = "20261101-090000-baba-y";
+        std::fs::write(
+            &t,
+            format!("id: {id}\ntitle: T {id}\nas_of: 2026-11-01T09:00:00+00:00\nresults:\n  - done\n"),
+        )
+        .unwrap();
+        let h = home.to_str().unwrap();
+        run_import("tasklog", t.to_str().unwrap(), false, false, Some(h)).unwrap();
+        std::fs::remove_dir_all(repo.join("docs/tasklog")).unwrap();
+        let cfg = load_config(Some(h)).unwrap();
+        let err = retire_missing(&PyPath::new(h), &cfg, false).unwrap_err();
+        assert!(err.msg.contains("git rev-parse failed"), "{}", err.msg);
+        let conn = connect(&home.join("memory.db").to_string_lossy(), None).unwrap();
+        let status: String = conn
+            .query_row("SELECT status FROM items WHERE kind = 'task'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(status, "active");
+    }
+
+    #[test]
+    fn retire_missing_prefers_nested_git_repo_over_plain_container_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let tmp = std::fs::canonicalize(dir.path()).unwrap();
+        let gh = tmp.join("gh");
+        // Plain container `gh/acme` holds the actual git repo `gh/acme/acme`.
+        let repo = gh.join("acme/acme");
+        let tl_dir = repo.join("docs/tasklog/2026-11-01");
+        std::fs::create_dir_all(&tl_dir).unwrap();
+        let git_run = |cwd: &std::path::Path, args: &[&str]| {
+            let o = std::process::Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .env("HOME", &tmp)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+                .unwrap();
+            assert!(o.status.success(), "{args:?}: {}", String::from_utf8_lossy(&o.stderr));
+        };
+        git_run(&repo, &["init", "-q"]);
+        let t = tl_dir.join("090000-baba-y.yaml");
+        let id = "20261101-090000-baba-y";
+        std::fs::write(
+            &t,
+            format!("id: {id}\ntitle: T {id}\nas_of: 2026-11-01T09:00:00+00:00\nresults:\n  - done\n"),
+        )
+        .unwrap();
+        git_run(&repo, &["add", "."]);
+        git_run(&repo, &["commit", "-qm", "keep on branch"]);
+        git_run(&repo, &["branch", "topic"]);
+        let home = tmp.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(
+            home.join("config.toml"),
+            format!(
+                "[upkeep]\ntasklog_roots = [\"{}\"]\nhandoff_dirs = []\n",
+                gh.display()
+            ),
+        )
+        .unwrap();
+        let h = home.to_str().unwrap();
+        run_import("tasklog", t.to_str().unwrap(), false, false, Some(h)).unwrap();
+        std::fs::remove_dir_all(repo.join("docs/tasklog")).unwrap();
+        git_run(&repo, &["add", "-A"]);
+        git_run(&repo, &["commit", "-qm", "drop docs/tasklog on main"]);
+        let cfg = load_config(Some(h)).unwrap();
+        let c = retire_missing(&PyPath::new(h), &cfg, false).unwrap();
+        assert_eq!(
+            (c["candidates"], c["retired"], c["on_branch"], c["no_folder"]),
+            (1, 0, 1, 0)
+        );
     }
 }

@@ -620,6 +620,34 @@ fn supersede_first(conn: &Connection, old: &str, by: &str) -> Result<i64, SmErro
     )? as i64)
 }
 
+/// A stored row of a file-backed `source` in a concrete repo (`repo != 'unassigned'`), matching
+/// `doctor::import_lag_by_repo`: excludes cross-repo `hidden` rows where another repo's item of
+/// the same source replaced it, so a degraded/jailed scan never suppresses valid restoration while
+/// never inserting an `unassigned` duplicate over a known repo.
+fn stored_in_known_repo(conn: &Connection, source: &str) -> Result<Option<String>, SmError> {
+    bind_text(source)?;
+    let mut stmt = conn.prepare(
+        "SELECT i.id, i.status, i.superseded_by, i.tags FROM items i \
+         LEFT JOIN items b ON b.id = i.superseded_by \
+         WHERE i.source = ?1 AND i.repo != 'unassigned' \
+         AND (i.status = 'active' \
+              OR (i.superseded_by IS NOT NULL AND ifnull(b.source = i.source AND b.repo != i.repo, 0) = 0) \
+              OR i.tags LIKE '%retired:%') \
+         ORDER BY (i.status = 'active') DESC, i.rowid DESC",
+    )?;
+    let mut rows = stmt.query([source])?;
+    while let Some(r) = rows.next()? {
+        let id: String = r.get(0)?;
+        let status: String = r.get(1)?;
+        let superseded_by: Option<String> = r.get(2)?;
+        let tags: String = r.get(3)?;
+        if status == "active" || superseded_by.is_some() || has_retired_tag(&tags) {
+            return Ok(Some(id));
+        }
+    }
+    Ok(None)
+}
+
 /// One row of put_items_batch inside its savepoint: (inserted, deduped, superseded, missing, target).
 fn batch_row(
     conn: &Connection,
@@ -627,6 +655,12 @@ fn batch_row(
     apply_supersedes: bool,
 ) -> Result<(i64, i64, i64, i64, String), SmError> {
     validate_item(item)?;
+    if item.repo == "unassigned"
+        && file_backed(&item.source)
+        && let Some(known_id) = stored_in_known_repo(conn, &item.source)?
+    {
+        return Ok((0, 1, 0, 0, known_id));
+    }
     let (mut ins, mut dup, mut sup, mut missing) = (0, 0, 0, 0);
     let mut existing = active_by_hash(conn, &item.repo, &item.content_hash, &item.source, None)?;
     // a task log or handoff whose title, tags, tag, evidence, as_of or refs changed with its
@@ -1913,6 +1947,77 @@ mod tests {
             Some("m_1")
         );
         assert_eq!(get_item(&conn, "m_3").unwrap(), None);
+    }
+
+    #[test]
+    fn batch_unassigned_never_duplicates_or_overrides_known_repo() {
+        let (_d, conn) = store();
+        let ho = |id: &str, repo: &str, body: &str| Item {
+            source: "handoff:2026-01-01-alpha.md".into(),
+            kind: "handoff".into(),
+            ..it(id, repo, body, "derived")
+        };
+        let (ins, dup, sup, ..) =
+            put_items_batch(&conn, &[ho("m_alpha", "alpha", "v1")], false).unwrap();
+        assert_eq!((ins, dup, sup), (1, 0, 0));
+
+        // Even with changed body/hash, an unassigned import of the same file-backed source dedupes
+        // onto the concrete repo row and leaves it untouched.
+        let (ins, dup, sup, ..) =
+            put_items_batch(&conn, &[ho("m_bad", "unassigned", "v2")], false).unwrap();
+        assert_eq!((ins, dup, sup), (0, 1, 0));
+        assert_eq!(get_item(&conn, "m_bad").unwrap(), None);
+        assert_eq!(get_item(&conn, "m_alpha").unwrap().unwrap().status, "active");
+
+        // Same when the concrete repo row was already superseded by a newer item in that repo.
+        let sup_item = Item {
+            source: "handoff:2026-01-02-alpha.md".into(),
+            kind: "handoff".into(),
+            ..it("m_alpha2", "alpha", "newer", "derived")
+        };
+        put_item(&conn, &sup_item, Some(&["m_alpha".to_string()])).unwrap();
+        let (ins, dup, sup, ..) =
+            put_items_batch(&conn, &[ho("m_bad2", "unassigned", "v1")], false).unwrap();
+        assert_eq!((ins, dup, sup), (0, 1, 0));
+        assert_eq!(get_item(&conn, "m_bad2").unwrap(), None);
+
+        // Legacy cross-repo `hidden` row (`b.source = i.source AND b.repo != i.repo`): matches
+        // `doctor::import_lag_by_repo` so an updated file while jailed updates the active
+        // unassigned row instead of letting doctor loop on lag while batch_row dedupes onto old alpha.
+        let ho_cross = Item {
+            source: "handoff:2026-01-03-cross.md".into(),
+            kind: "handoff".into(),
+            ..it("m_cross_old", "alpha", "v1", "derived")
+        };
+        let ho_repl = Item {
+            source: "handoff:2026-01-03-cross.md".into(),
+            kind: "handoff".into(),
+            ..it("m_cross_unassigned", "unassigned", "v2", "derived")
+        };
+        insert_item(&conn, &ho_cross, "superseded", Some("m_cross_unassigned")).unwrap();
+        insert_item(&conn, &ho_repl, "active", None).unwrap();
+        let (ins, dup, sup, ..) = put_items_batch(
+            &conn,
+            &[Item {
+                source: "handoff:2026-01-03-cross.md".into(),
+                kind: "handoff".into(),
+                ..it("m_cross_new", "unassigned", "v3", "derived")
+            }],
+            false,
+        )
+        .unwrap();
+        assert_eq!((ins, dup, sup), (1, 0, 1));
+        assert_eq!(get_item(&conn, "m_cross_new").unwrap().unwrap().repo, "unassigned");
+
+        // Standalone unassigned handoffs with no concrete repo row still import normally.
+        let solo = Item {
+            source: "handoff:solo.md".into(),
+            kind: "handoff".into(),
+            ..it("m_solo", "unassigned", "standalone", "derived")
+        };
+        let (ins, dup, sup, ..) = put_items_batch(&conn, &[solo], false).unwrap();
+        assert_eq!((ins, dup, sup), (1, 0, 0));
+        assert_eq!(get_item(&conn, "m_solo").unwrap().unwrap().repo, "unassigned");
     }
 
     #[test]

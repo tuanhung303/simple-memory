@@ -491,7 +491,7 @@ fn card_from_haiku_has_the_frozen_shape() {
     let card = &got[0];
     assert_eq!(card.repo, "alpha");
     assert_eq!(card.kind, "episode");
-    assert_eq!(card.tag, "assumed");
+    assert_eq!(card.tag, "derived");
     assert_eq!(card.tags, "session-card");
     assert_eq!(card.source, format!("session:{SID_A}"));
     assert_eq!(card.evidence, path.to_str().unwrap());

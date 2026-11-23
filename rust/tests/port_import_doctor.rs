@@ -3336,3 +3336,59 @@ fn amend_drops_the_refs_a_match_touches_in_what_it_brings_in() {
         ]
     );
 }
+
+#[test]
+fn handoff_missing_repo_never_inserts_unassigned_over_known_repo() {
+    let (_d, tmp) = tmpdir();
+    let repos = tmp.join("repos");
+    let alpha = repos.join("alpha");
+    std::fs::create_dir_all(&alpha).unwrap();
+    let hdir = tmp.join("handoffs");
+    let key: String = alpha
+        .to_str()
+        .unwrap()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    let session_dir = hdir.join(key);
+    std::fs::create_dir_all(&session_dir).unwrap();
+    let hf = session_dir.join("20261101T0900Z-s1.md");
+    std::fs::write(
+        &hf,
+        "# Alpha handoff\n\n## Done\n- Kept concrete repo scope.\n",
+    )
+    .unwrap();
+    let home = tmp.join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let cfg_text = format!(
+        "[repos]\nroots = [\"{}\"]\n[automemory]\nenabled = false\n[upkeep]\ntasklog_roots = []\nhandoff_dirs = [\"{}\"]\n",
+        repos.display(),
+        hdir.display()
+    );
+    std::fs::write(home.join("config.toml"), &cfg_text).unwrap();
+
+    // 1) Normal import resolves concrete repo = alpha.
+    let res1 = import(&home, "handoff", &hf, false, false);
+    assert_eq!((res1.inserted, res1.by_repo.get("alpha").copied()), (1, Some(1)));
+
+    // 2) Hide alpha so RepoRoots::scan can no longer see it (simulating netjail deny_read_paths).
+    std::fs::remove_dir_all(&alpha).unwrap();
+
+    // Verify the probe itself proves the degraded scan parses this handoff as unassigned.
+    let probe_home = tmp.join("probe_home");
+    std::fs::create_dir_all(&probe_home).unwrap();
+    std::fs::write(probe_home.join("config.toml"), &cfg_text).unwrap();
+    let probe = import(&probe_home, "handoff", &hf, true, false);
+    assert_eq!(probe.by_repo.get("unassigned").copied(), Some(1));
+
+    // 3) Neither doctor import_lag nor run_import inserts or flags an unassigned duplicate.
+    let doc = run_doctor(false, false, false, true, home.to_str()).unwrap();
+    let lag = doc.lag.unwrap().0;
+    assert!(lag.not_stored.is_empty(), "{:?}", lag.not_stored);
+    let res2 = import(&home, "handoff", &hf, false, false);
+    assert_eq!((res2.inserted, res2.deduped), (0, 1));
+    assert_eq!(
+        common::column(&home, "SELECT repo || ':' || status FROM items ORDER BY rowid"),
+        vec!["alpha:active"]
+    );
+}

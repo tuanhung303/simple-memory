@@ -4,7 +4,7 @@ use indexmap::IndexMap;
 use rusqlite::{Connection, OpenFlags};
 
 use crate::cli::query::shlex_quote;
-use crate::config::{aliases, get_db_path, get_home, load_config, repo_roots};
+use crate::config::{Aliases, aliases, get_db_path, get_home, load_config, repo_roots};
 use crate::core::item::Item;
 use crate::core::redact::redact_for_store;
 use crate::core::tags::has_retired_tag;
@@ -24,7 +24,8 @@ use crate::sources::sorted_paths;
 use crate::sources::tasklog::{infer_tasklog_repo, parse_tasklog_file};
 use crate::store::connect::connect;
 use crate::store::items::{
-    CheckResult, FileRow, check_and_rebuild, file_items_are_current, file_row_holds, fill_refs,
+    CheckResult, FileRow, check_and_rebuild, file_backed, file_items_are_current, file_row_holds,
+    fill_refs,
 };
 
 const TASKLOG_GLOBS: [&str; 3] = ["*/docs/tasklog", "*/*/docs/tasklog", "*/*/*/docs/tasklog"];
@@ -123,6 +124,63 @@ pub fn tasklog_repo_dirs(
     Ok(found)
 }
 
+/// Fallback repo checkout lookup under `tasklog_roots` when `docs/tasklog` was removed from `repo`.
+pub fn find_repo_dir(
+    roots: &PyValue,
+    repo_aliases: &Aliases,
+    home: Option<&str>,
+    repo: &str,
+) -> Result<Option<PyPath>, SmError> {
+    if repo.is_empty()
+        || repo == "unassigned"
+        || repo == "global"
+        || repo == "."
+        || repo == ".."
+        || repo.contains('/')
+    {
+        return Ok(None);
+    }
+    let mut names = vec![repo.to_string()];
+    let mut alias_keys: Vec<String> = repo_aliases
+        .iter()
+        .filter_map(|(k, v)| {
+            (v == repo && k != repo && !k.is_empty() && !k.contains('/')).then(|| k.clone())
+        })
+        .collect();
+    alias_keys.sort();
+    names.extend(alias_keys);
+    let mut fallback: Option<PyPath> = None;
+    for raw_root in iterate(roots)? {
+        let root = config_dir(&raw_root, "tasklog_roots", home)?;
+        for name in &names {
+            let d = root.join(name);
+            if d.is_dir() && !in_worktree(&d, &root)? {
+                if d.join(".git").to_os().symlink_metadata().is_ok() {
+                    return Ok(Some(d));
+                }
+                fallback.get_or_insert(d);
+            }
+        }
+        for pat_prefix in ["*", "*/*"] {
+            for parent in root.glob(pat_prefix)? {
+                if !parent.is_dir() {
+                    continue;
+                }
+                for name in &names {
+                    let d = parent.join(name);
+                    if d.is_dir()
+                        && d.join(".git").to_os().symlink_metadata().is_ok()
+                        && !in_worktree(&d, &root)?
+                    {
+                        return Ok(Some(d));
+                    }
+                }
+            }
+        }
+    }
+    Ok(fallback)
+}
+
 /// The dict `import_lag` returns.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ImportLag {
@@ -192,6 +250,7 @@ pub(crate) fn import_lag_by_repo(
     let mut active_hashes: HashMap<(String, String, String), FileRow> = HashMap::new();
     let mut active_sources: HashSet<(String, String)> = HashSet::new();
     let mut stored_hashes: HashSet<(String, String, String)> = HashSet::new();
+    let mut known_stored_sources: HashSet<String> = HashSet::new();
     {
         let mut rows = stmt.query([])?;
         while let Some(r) = rows.next()? {
@@ -213,15 +272,24 @@ pub(crate) fn import_lag_by_repo(
                     refs: r.get(11)?,
                 };
                 active_hashes.insert(key.clone(), row);
-                active_sources.insert((repo, source));
+                active_sources.insert((repo.clone(), source.clone()));
             }
             if status == "active" || (superseded_by.is_some() && !hidden) || has_retired_tag(&tags)
             {
+                if repo != "unassigned" && file_backed(&source) {
+                    known_stored_sources.insert(source);
+                }
                 stored_hashes.insert(key);
             }
         }
     }
     let is_stored = |repo: &str, source: &str, red: &crate::core::item::Item| {
+        if repo == "unassigned"
+            && file_backed(source)
+            && known_stored_sources.contains(source)
+        {
+            return true;
+        }
         let key = (
             repo.to_string(),
             source.to_string(),
@@ -527,5 +595,69 @@ mod tests {
         assert!(in_worktree(&wt.join("docs"), &root).unwrap());
         std::fs::write(wt.join(".git").to_os(), "gitdir: /x/.git/modules/wt\n").unwrap();
         assert!(!in_worktree(&wt.join("docs"), &root).unwrap());
+    }
+
+    #[test]
+    fn find_repo_dir_handles_nested_worktree_aliases_and_plain_container() {
+        let dir = tempfile::tempdir().unwrap();
+        let tmp = std::fs::canonicalize(dir.path()).unwrap();
+        let gh = tmp.join("gh");
+        let gh2 = tmp.join("gh2");
+        std::fs::create_dir_all(&gh).unwrap();
+        std::fs::create_dir_all(&gh2).unwrap();
+
+        // Plain container dir `gh/acme` collides with real nested git repo `gh/acme/acme/.git`.
+        let nested = gh.join("acme/acme");
+        std::fs::create_dir_all(nested.join(".git")).unwrap();
+
+        // Linked worktree directly under `gh/beta` must be skipped in favor of `gh/org/group/beta/.git`.
+        let wt_beta = gh.join("beta");
+        std::fs::create_dir_all(&wt_beta).unwrap();
+        std::fs::write(wt_beta.join(".git"), "gitdir: /x/.git/worktrees/beta\n").unwrap();
+        let deep_beta = gh.join("org/group/beta");
+        std::fs::create_dir_all(deep_beta.join(".git")).unwrap();
+
+        // Alias `old-gamma` under `gh/team/old-gamma/.git` maps to canonical `gamma`.
+        let alias_gamma = gh.join("team/old-gamma");
+        std::fs::create_dir_all(alias_gamma.join(".git")).unwrap();
+
+        // Non-git fallback still works when no `.git` repo exists anywhere.
+        let plain = gh.join("plain-only");
+        std::fs::create_dir_all(&plain).unwrap();
+
+        // Plain dir in earlier root does not shadow `.git` repo in later root.
+        let shadow = gh.join("shadow");
+        std::fs::create_dir_all(&shadow).unwrap();
+        let real_shadow = gh2.join("shadow");
+        std::fs::create_dir_all(real_shadow.join(".git")).unwrap();
+
+        let roots = PyValue::List(vec![
+            PyValue::Str(gh.to_string_lossy().into_owned()),
+            PyValue::Str(gh2.to_string_lossy().into_owned()),
+        ]);
+        let mut al = Aliases::new();
+        al.insert("old-gamma".into(), "gamma".into());
+
+        assert_eq!(
+            find_repo_dir(&roots, &al, None, "acme").unwrap().unwrap().to_os(),
+            nested
+        );
+        assert_eq!(
+            find_repo_dir(&roots, &al, None, "beta").unwrap().unwrap().to_os(),
+            deep_beta
+        );
+        assert_eq!(
+            find_repo_dir(&roots, &al, None, "gamma").unwrap().unwrap().to_os(),
+            alias_gamma
+        );
+        assert_eq!(
+            find_repo_dir(&roots, &al, None, "shadow").unwrap().unwrap().to_os(),
+            real_shadow
+        );
+        assert_eq!(
+            find_repo_dir(&roots, &al, None, "plain-only").unwrap().unwrap().to_os(),
+            plain
+        );
+        assert_eq!(find_repo_dir(&roots, &al, None, "bad[name").unwrap(), None);
     }
 }

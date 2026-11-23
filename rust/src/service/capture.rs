@@ -835,7 +835,7 @@ pub fn build_card(
         source: format!("session:{}", scan.session_id),
         evidence: transcript.as_str().to_string(),
         as_of,
-        ..Item::bare(&new_item_id(None), repo, "episode", title, &body, "assumed")
+        ..Item::bare(&new_item_id(None), repo, "episode", title, &body, "derived")
     }
     .post_init())
 }
