@@ -164,5 +164,18 @@ else
     bad "install.sh installs from CARGO_TARGET_DIR when set" "rc=$rc3 out='$inst_ct'"
 fi
 
+# skills/memory-maintenance/scripts/test_audit.py
+if command -v python3 > /dev/null; then
+    audit_out=$(python3 -B -m unittest discover -s "$repo/skills/memory-maintenance/scripts" -p 'test_*.py' 2>&1)
+    rc_audit=$?
+    if [[ $rc_audit == 0 ]]; then
+        ok "memory-maintenance audit unit tests pass"
+    else
+        bad "memory-maintenance audit unit tests pass" "rc=$rc_audit out='$(tail -n 5 <<< "$audit_out")'"
+    fi
+else
+    bad "memory-maintenance audit unit tests" "no python3 on PATH"
+fi
+
 echo "$((n - failed)) passed, $failed failed"
 [[ $failed == 0 ]]

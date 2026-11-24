@@ -215,6 +215,8 @@ sm upkeep --report      # read-only report of near-duplicates and stale planned/
 sm backup               # verified SQLite backup copy in ~/.simple-memory/backups/
 ```
 
+For repeatable cleanup, deduplication, and recall-noise audits, see the [memory-maintenance skill](skills/memory-maintenance/SKILL.md) (run `python3 skills/memory-maintenance/scripts/audit.py`, or symlink `skills/memory-maintenance` into your agent's skills directory).
+
 A copy made by hand with `sm backup` has the same `memory-<time>-auto.db` name as the automatic ones, so `--keep N` (default 7) and catch-up rotate it too: copy a file you want to keep somewhere else. To restore, move `memory.db` (and any `memory.db-wal` and `memory.db-shm` beside it) aside, then copy the backup file to `memory.db`.
 
 ## Extending simple-memory
