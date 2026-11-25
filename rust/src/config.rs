@@ -355,9 +355,7 @@ pub fn toml_key(key: &str) -> String {
     {
         return key.to_string();
     }
-    let mut out = String::new();
-    crate::py::json::encode_str(key, false, &mut out);
-    out
+    toml_key_json(key)
 }
 
 /// `_toml_value`: bool, int, float (repr), str (JSON), list; any other value is a TypeError.
