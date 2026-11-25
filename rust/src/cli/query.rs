@@ -235,6 +235,10 @@ fn footer_lines(lk: &Lookup, ns: &Namespace, limit: &LimitText) -> Vec<String> {
     let (scope, filters) = query_flags(ns);
     let with = |a: &[String], b: &[String]| -> Vec<String> { a.iter().chain(b).cloned().collect() };
     let narrow = narrowing_flags(&query_args(ns, None));
+    let other_flags = with(&["--all".to_string()], &filters);
+    // a missing term that is the whole query would repeat the more: line's other repos command
+    let whole = (!lk.other_repos.is_empty())
+        .then(|| crate::core::fold::fold(Some(py::str::strip(&lk.query))));
     let mut lines = Vec::new();
     if !lk.missing.is_empty() {
         let parts: Vec<String> = lk
@@ -243,7 +247,7 @@ fn footer_lines(lk: &Lookup, ns: &Namespace, limit: &LimitText) -> Vec<String> {
             .map(|(term, n)| {
                 // a stopword gets no suggested query
                 let cmd = |flags: &[String]| {
-                    if is_stopword(term) {
+                    if is_stopword(term) || (whole.as_ref() == Some(term) && flags == other_flags) {
                         String::new()
                     } else {
                         format!(" -> {}", query_cmd(term, flags))
@@ -315,7 +319,7 @@ fn footer_lines(lk: &Lookup, ns: &Namespace, limit: &LimitText) -> Vec<String> {
             .join(" ");
         more.push(format!(
             "other repos {counts} -> {}",
-            query_cmd(&lk.query, &with(&["--all".to_string()], &filters))
+            query_cmd(&lk.query, &other_flags)
         ));
     }
     if !more.is_empty() {

@@ -1890,11 +1890,12 @@ fn missing_names_a_term_that_only_other_repos_hold_after_the_other_repos_line() 
         "more: other repos billing=2 -> sm query \"stripe webhook\" --all\n\
          missing: stripe: 2 in other repos -> sm query \"stripe\" --all; webhook: 2 in other repos -> sm query \"webhook\" --all\n"
     );
-    // the filters go along to the other repos
+    // the filters go along to the other repos; a term that is the whole query names the more:
+    // line's command once (E2)
     assert_eq!(
         q(&["stripe", "--repo", "etl", "--kind", "fact"]),
         "more: other repos billing=2 -> sm query \"stripe\" --all --kind fact\n\
-         missing: stripe: 2 in other repos -> sm query \"stripe\" --all --kind fact\n"
+         missing: stripe: 2 in other repos\n"
     );
     // held in another repo but outside --kind: say so, never term=0 (which means no item holds it)
     assert_eq!(
@@ -1911,6 +1912,35 @@ fn missing_names_a_term_that_only_other_repos_hold_after_the_other_repos_line() 
             {"term": "stripe", "in_scope": 0, "in_other_repos": 2},
             {"term": "webhook", "in_scope": 0, "in_other_repos": 2}
         ])
+    );
+}
+
+#[test]
+fn missing_keeps_an_identifier_from_the_query_as_one_term() {
+    let (_d, home) = scratch();
+    write(&home.join("config.toml"), "[catch_up]\nenabled = false\n");
+    for (repo, body) in [
+        ("a", "The nightly job runs on Composer"),
+        ("b", "Read the blast-radius notes first"),
+    ] {
+        put_item_cli(
+            &home,
+            &[
+                "--kind", "fact", "--tag", "verified", "--repo", repo, "--", body,
+            ],
+        );
+    }
+    let out = query_ok(&home, &["composer blast-radius (ticket-x9)", "--repo", "a"]);
+    let missing: Vec<&str> = out.lines().filter(|l| l.starts_with("missing:")).collect();
+    assert_eq!(
+        missing,
+        ["missing: blast-radius: 1 in other repos -> sm query \"blast-radius\" --all; ticket-x9=0"]
+    );
+    // the identifier alone: the more: line holds its command, so missing does not repeat it
+    assert_eq!(
+        query_ok(&home, &["Blast-Radius", "--repo", "a"]),
+        "more: other repos b=1 -> sm query \"Blast-Radius\" --all\n\
+         missing: blast-radius: 1 in other repos\n"
     );
 }
 
