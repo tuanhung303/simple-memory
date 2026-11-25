@@ -110,23 +110,15 @@ pub fn near_duplicate_pairs(rows: &[TitleRow]) -> Result<Vec<Pair>, SmError> {
             )
         })
         .collect();
-    let mut df: HashMap<String, i64> = HashMap::new();
+    let mut df: HashMap<String, usize> = HashMap::new();
     for toks in tokens.values() {
         for t in toks.iter().collect::<HashSet<_>>() {
             *df.entry(t.clone()).or_default() += 1;
         }
     }
-    let n = rows.len() as i64;
-    let mut idf_cache: HashMap<String, f64> = HashMap::new();
-    let mut idf_of = |t: &str| -> Result<f64, SmError> {
-        if let Some(v) = idf_cache.get(t) {
-            return Ok(*v);
-        }
-        let v = idf(df.get(t).copied().unwrap_or(0), n)?;
-        idf_cache.insert(t.to_string(), v);
-        Ok(v)
-    };
-    let theta = idf(VETO_DF + 1, n)?;
+    let n = rows.len();
+    let idf_of = |t: &str| idf(df.get(t).copied().unwrap_or(0), n);
+    let theta = idf(VETO_DF + 1, n);
     let mut by_repo: IndexMap<&str, Vec<&TitleRow>> = IndexMap::new();
     for r in rows {
         by_repo.entry(r.repo.as_str()).or_default().push(r);
@@ -163,7 +155,7 @@ pub fn near_duplicate_pairs(rows: &[TitleRow]) -> Result<Vec<Pair>, SmError> {
             }
             let ta: Vec<&str> = tokens[a].iter().map(String::as_str).collect();
             let tb: Vec<&str> = tokens[b].iter().map(String::as_str).collect();
-            if let Some(score) = near_duplicate_score(&ta, &tb, &mut idf_of, theta)? {
+            if let Some(score) = near_duplicate_score(&ta, &tb, idf_of, theta) {
                 pairs.push(Pair {
                     score: round_ndigits(score, 3)?,
                     a: a.into(),
