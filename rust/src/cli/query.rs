@@ -249,12 +249,15 @@ fn footer_lines(lk: &Lookup, ns: &Namespace, limit: &LimitText) -> Vec<String> {
                     }
                 };
                 if let Some(h) = lk.hidden.get(term) {
-                    let mut flags = if h.other_repos {
-                        with(&["--all".to_string()], &filters)
-                    } else if h.filtered {
-                        with(&scope, &filters[narrow.len()..])
+                    let rest = if h.filtered {
+                        &filters[narrow.len()..]
                     } else {
-                        with(&scope, &filters)
+                        &filters[..]
+                    };
+                    let mut flags = if h.other_repos {
+                        with(&["--all".to_string()], rest)
+                    } else {
+                        with(&scope, rest)
                     };
                     if h.retired {
                         flags.push("--include-history".into());

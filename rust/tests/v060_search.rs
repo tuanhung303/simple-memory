@@ -1896,6 +1896,11 @@ fn missing_names_a_term_that_only_other_repos_hold_after_the_other_repos_line() 
         "more: other repos billing=2 -> sm query \"stripe\" --all --kind fact\n\
          missing: stripe: 2 in other repos -> sm query \"stripe\" --all --kind fact\n"
     );
+    // held in another repo but outside --kind: say so, never term=0 (which means no item holds it)
+    assert_eq!(
+        q(&["stripe", "--repo", "etl", "--kind", "decision"]),
+        "missing: stripe: 2 outside --kind decision, in other repos -> sm query \"stripe\" --all\n"
+    );
     // held nowhere: term=0 stays, and --all names no other repo
     assert_eq!(q(&["airbyte", "--all"]), "missing: airbyte=0\n");
     let v: Value =
