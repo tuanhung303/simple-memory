@@ -143,9 +143,8 @@ pub fn find_repo_dir(
     let mut names = vec![repo.to_string()];
     let mut alias_keys: Vec<String> = repo_aliases
         .iter()
-        .filter_map(|(k, v)| {
-            (v == repo && k != repo && !k.is_empty() && !k.contains('/')).then(|| k.clone())
-        })
+        .filter(|(k, v)| *v == repo && *k != repo && !k.is_empty() && !k.contains('/'))
+        .map(|(k, _)| k.clone())
         .collect();
     alias_keys.sort();
     names.extend(alias_keys);
