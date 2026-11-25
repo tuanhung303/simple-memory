@@ -1284,7 +1284,7 @@ fn start_catch_up(home: &PyPath, cfg: &PyValue, harness: &str) -> Result<(), SmE
         Ok(())
     })();
     match started {
-        Err(e) if e.is(Base::Os) || e.is(Base::Value) || e.class == "SubprocessError" => {
+        Err(e) if e.is(Base::Os) || e.is(Base::Value) => {
             let mut row = Row::new();
             row.insert("harness".into(), s(harness));
             row.insert(
@@ -1840,12 +1840,7 @@ pub fn run_prompt_hook(
     let rewrite_ms = rewrite_started.elapsed().as_millis() as i64;
     let query = match result {
         Ok(q) => q,
-        Err(e)
-            if e.is(Base::Os)
-                || e.is(Base::Runtime)
-                || e.class == "TimeoutExpired"
-                || e.class == "SubprocessError" =>
-        {
+        Err(e) if e.is(Base::Os) || e.is(Base::Runtime) || e.class == "TimeoutExpired" => {
             let timed_out = e.class == "TimeoutExpired";
             let error = if timed_out {
                 format!("rewrite timed out after {} s", py::float::repr(timeout))

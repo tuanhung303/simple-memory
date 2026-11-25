@@ -470,12 +470,10 @@ pub fn run_process(r: &Run) -> Result<Completed, SmError> {
     })
 }
 
-/// `except subprocess.SubprocessError` (TimeoutExpired and CalledProcessError are subclasses).
+/// `except subprocess.SubprocessError`: TimeoutExpired and CalledProcessError are the only
+/// subclasses sm raises.
 pub fn is_subprocess_error(e: &SmError) -> bool {
-    matches!(
-        &*e.class,
-        "SubprocessError" | "TimeoutExpired" | "CalledProcessError"
-    )
+    matches!(&*e.class, "TimeoutExpired" | "CalledProcessError")
 }
 
 // ---------------------------------------------------------------- state file
