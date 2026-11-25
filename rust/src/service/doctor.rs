@@ -283,10 +283,7 @@ pub(crate) fn import_lag_by_repo(
         }
     }
     let is_stored = |repo: &str, source: &str, red: &crate::core::item::Item| {
-        if repo == "unassigned"
-            && file_backed(source)
-            && known_stored_sources.contains(source)
-        {
+        if repo == "unassigned" && file_backed(source) && known_stored_sources.contains(source) {
             return true;
         }
         let key = (
@@ -583,12 +580,18 @@ mod tests {
         make("memory-20261101-000000-auto.db", 3);
         make("memory-20261102-000000-auto.db", 0);
         let steps = restore_steps(h.to_str()).unwrap();
-        assert!(steps[0].ends_with("memory-20261101-000000-auto.db:"), "{steps:?}");
+        assert!(
+            steps[0].ends_with("memory-20261101-000000-auto.db:"),
+            "{steps:?}"
+        );
         assert!(steps[0].contains("holds items"), "{steps:?}");
         // every backup empty: the newest that passes quick_check, as before
         std::fs::remove_file(h.join("backups/memory-20261101-000000-auto.db")).unwrap();
         let steps = restore_steps(h.to_str()).unwrap();
-        assert!(steps[0].ends_with("memory-20261102-000000-auto.db:"), "{steps:?}");
+        assert!(
+            steps[0].ends_with("memory-20261102-000000-auto.db:"),
+            "{steps:?}"
+        );
         assert!(!steps[0].contains("holds items"), "{steps:?}");
     }
 
@@ -695,23 +698,38 @@ mod tests {
         al.insert("old-gamma".into(), "gamma".into());
 
         assert_eq!(
-            find_repo_dir(&roots, &al, None, "acme").unwrap().unwrap().to_os(),
+            find_repo_dir(&roots, &al, None, "acme")
+                .unwrap()
+                .unwrap()
+                .to_os(),
             nested
         );
         assert_eq!(
-            find_repo_dir(&roots, &al, None, "beta").unwrap().unwrap().to_os(),
+            find_repo_dir(&roots, &al, None, "beta")
+                .unwrap()
+                .unwrap()
+                .to_os(),
             deep_beta
         );
         assert_eq!(
-            find_repo_dir(&roots, &al, None, "gamma").unwrap().unwrap().to_os(),
+            find_repo_dir(&roots, &al, None, "gamma")
+                .unwrap()
+                .unwrap()
+                .to_os(),
             alias_gamma
         );
         assert_eq!(
-            find_repo_dir(&roots, &al, None, "shadow").unwrap().unwrap().to_os(),
+            find_repo_dir(&roots, &al, None, "shadow")
+                .unwrap()
+                .unwrap()
+                .to_os(),
             real_shadow
         );
         assert_eq!(
-            find_repo_dir(&roots, &al, None, "plain-only").unwrap().unwrap().to_os(),
+            find_repo_dir(&roots, &al, None, "plain-only")
+                .unwrap()
+                .unwrap()
+                .to_os(),
             plain
         );
         assert_eq!(find_repo_dir(&roots, &al, None, "bad[name").unwrap(), None);
