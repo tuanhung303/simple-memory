@@ -34,6 +34,7 @@ use crate::service::query::{
     LocalFound, QueryArgs, StrList, default_bias_from_cfg, keyword_aliases, resolve_scope_biases,
     run_local_query, run_query, scope_df,
 };
+use crate::sources::value_get;
 use crate::store::connect::connect;
 use crate::store::search::{
     Filters, SearchOpts, count_scope, head as search_head, ids_matching, search_scored,
@@ -348,19 +349,8 @@ pub fn local_candidates(
     local_candidates_with_extra(prompt, projects, &std::collections::HashSet::new())
 }
 
-/// `cfg.get(key)` on a config dict.
-fn get<'a>(d: &'a PyValue, key: &str) -> Option<&'a PyValue> {
-    match d {
-        PyValue::Dict(p) => p
-            .iter()
-            .find(|(k, _)| matches!(k, PyValue::Str(s) if s == key))
-            .map(|(_, v)| v),
-        _ => None,
-    }
-}
-
 fn get_or_none<'a>(d: &'a PyValue, key: &str) -> &'a PyValue {
-    get(d, key).unwrap_or(&PyValue::None)
+    value_get(d, key).unwrap_or(&PyValue::None)
 }
 
 /// `x or default` for a config value.
@@ -627,7 +617,7 @@ pub fn last_agy_user_input(transcript_path: &str) -> Result<String, SmError> {
             Err(e) => return Err(e),
         };
         if let PyValue::Dict(_) = entry
-            && matches!(get(&entry, "type"), Some(PyValue::Str(t)) if t == "USER_INPUT")
+            && matches!(value_get(&entry, "type"), Some(PyValue::Str(t)) if t == "USER_INPUT")
         {
             let src = str_of(get_or_none(&entry, "source"));
             if !src.is_empty() && src != "USER_EXPLICIT" {
@@ -644,12 +634,12 @@ pub fn last_agy_user_input(transcript_path: &str) -> Result<String, SmError> {
 }
 
 pub fn extract_prompt(payload: &PyValue) -> Result<String, SmError> {
-    if let Some(PyValue::Str(v)) = get(payload, "prompt")
+    if let Some(PyValue::Str(v)) = value_get(payload, "prompt")
         && !strip(v).is_empty()
     {
         return Ok(strip(v).to_string());
     }
-    if let Some(PyValue::Str(v)) = get(payload, "lastUserInput") {
+    if let Some(PyValue::Str(v)) = value_get(payload, "lastUserInput") {
         let unwrapped = unwrap_agy_user_input(v);
         if !unwrapped.is_empty() {
             return Ok(unwrapped.to_string());
@@ -1263,7 +1253,7 @@ fn st_mtime(p: &PyPath) -> Result<Option<f64>, SmError> {
 
 /// Touch the stamp, then start the catch-up detached: no wait, no inherited pipes.
 fn start_catch_up(home: &PyPath, cfg: &PyValue, harness: &str) -> Result<(), SmError> {
-    if !get(cfg, "enabled").is_none_or(crate::sources::truthy) {
+    if !value_get(cfg, "enabled").is_none_or(crate::sources::truthy) {
         return Ok(());
     }
     let stamp = home.join("hook").join("catchup.stamp");
@@ -1370,14 +1360,15 @@ pub fn catch_up_failure_line(home: &PyPath) -> Result<String, SmError> {
         ]),
         Err(e) => return Err(e),
     };
-    if !matches!(row, PyValue::Dict(_)) || get(&row, "ok").is_some_and(crate::sources::truthy) {
+    if !matches!(row, PyValue::Dict(_)) || value_get(&row, "ok").is_some_and(crate::sources::truthy)
+    {
         return Ok(String::new());
     }
     let mut errors = Vec::new();
-    if let Some(PyValue::Dict(parts)) = get(&row, "parts") {
+    if let Some(PyValue::Dict(parts)) = value_get(&row, "parts") {
         for (_, p) in parts {
             if let PyValue::Dict(_) = p
-                && let Some(e) = get(p, "error").filter(|e| crate::sources::truthy(e))
+                && let Some(e) = value_get(p, "error").filter(|e| crate::sources::truthy(e))
             {
                 errors.push(e.py_str());
             }
@@ -1419,7 +1410,7 @@ fn ids_value(items: &[Item]) -> PyValue {
 /// None; rejects booleans, non-finite floats, negative numbers, and non-numeric values.
 pub fn haiku_min_idf(hook_cfg: &PyValue) -> Result<f64, SmError> {
     const ERR: &str = "[prompt_hook] min_idf must be a finite number >= 0";
-    match get(hook_cfg, "min_idf") {
+    match value_get(hook_cfg, "min_idf") {
         None | Some(PyValue::None) => Ok(DEFAULT_HAIKU_MIN_IDF),
         Some(PyValue::Bool(_)) => Err(SmError::value(ERR)),
         Some(v) => {
@@ -1576,7 +1567,7 @@ pub fn run_prompt_hook(
     let harness = if agy { "agy" } else { "claude" };
     start_catch_up(&home_path, get_or_none(&cfg, "catch_up"), harness)?;
     let hook_cfg = get_or_none(&cfg, "prompt_hook");
-    if !get(hook_cfg, "enabled").is_none_or(crate::sources::truthy) {
+    if !value_get(hook_cfg, "enabled").is_none_or(crate::sources::truthy) {
         return Ok(None);
     }
     let prompt = extract_prompt(payload)?;
@@ -1702,7 +1693,7 @@ pub fn run_prompt_hook(
         Ok(None)
     };
 
-    let agy_workspace = match get(payload, "workspacePaths") {
+    let agy_workspace = match value_get(payload, "workspacePaths") {
         Some(PyValue::List(w)) if !w.is_empty() => w[0].clone(),
         _ => s(""),
     };
@@ -2161,7 +2152,7 @@ mod tests {
     }
 
     fn field(row: &PyValue, key: &str) -> String {
-        get(row, key).map_or("-".into(), PyValue::py_repr)
+        value_get(row, key).map_or("-".into(), PyValue::py_repr)
     }
 
     #[test]
@@ -2402,7 +2393,7 @@ mod tests {
         holder.join().unwrap();
         assert_eq!(got.map(|g| g.items.len()), Some(1));
         let r = &rows(&h)[0];
-        let ms = |k: &str| match get(r, k) {
+        let ms = |k: &str| match value_get(r, k) {
             Some(PyValue::Int(t)) => t.parse::<i64>().unwrap(),
             other => panic!("{k}: {other:?}"),
         };

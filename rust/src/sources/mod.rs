@@ -184,8 +184,17 @@ pub(crate) fn iterate(v: &PyValue) -> Result<Vec<Cow<'_, PyValue>>, SmError> {
 
 /// `data.get(key)` on a str key.
 pub(crate) fn dict_get<'a>(data: &'a [(PyValue, PyValue)], key: &str) -> Option<&'a PyValue> {
-    let k = PyValue::Str(key.into());
-    data.iter().find(|(dk, _)| dk.key_eq(&k)).map(|(_, v)| v)
+    data.iter()
+        .find(|(k, _)| matches!(k, PyValue::Str(s) if s == key))
+        .map(|(_, v)| v)
+}
+
+/// `value.get(key)` on a str key; None when `value` is not a dict.
+pub(crate) fn value_get<'a>(v: &'a PyValue, key: &str) -> Option<&'a PyValue> {
+    match v {
+        PyValue::Dict(d) => dict_get(d, key),
+        _ => None,
+    }
 }
 
 /// `value.get(key)` where `value` must be a dict (`(row.get("message") or {}).get(...)`):

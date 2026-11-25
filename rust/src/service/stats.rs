@@ -14,7 +14,7 @@ use crate::py::value::PyValue;
 use crate::service::backup::{auto_backups, backup_age_hours};
 use crate::service::upkeep::{STALE_DAYS, STALE_TAGS, run_stale};
 use crate::service::usage::USAGE_LOG;
-use crate::sources::{dict_get, get_attr, iterate, truthy};
+use crate::sources::{dict_get, get_attr, iterate, truthy, value_get};
 use crate::store::connect::connect;
 use crate::store::search::{Filters, count_scope};
 use crate::store::stats::{item_labels, store_counts};
@@ -92,13 +92,6 @@ pub fn read_rows(path: &PyPath) -> Result<(Rows, i64), SmError> {
     Ok((rows, bad))
 }
 
-fn get<'a>(r: &'a PyValue, key: &str) -> Option<&'a PyValue> {
-    match r {
-        PyValue::Dict(d) => dict_get(d, key),
-        _ => None,
-    }
-}
-
 fn is_str(v: Option<&PyValue>, s: &str) -> bool {
     matches!(v, Some(PyValue::Str(x)) if x == s)
 }
@@ -109,19 +102,19 @@ fn truthy_opt(v: Option<&PyValue>) -> bool {
 
 /// `str(v)` of `r.get(key)`.
 fn str_get(r: &PyValue, key: &str) -> String {
-    get(r, key).map_or_else(|| "None".to_string(), PyValue::py_str)
+    value_get(r, key).map_or_else(|| "None".to_string(), PyValue::py_str)
 }
 
 /// `for i in r.get(key) or []`, each as `str(i)`.
 fn ids_of(r: &PyValue, key: &str) -> Result<Vec<String>, SmError> {
-    match get(r, key).filter(|v| truthy(v)) {
+    match value_get(r, key).filter(|v| truthy(v)) {
         None => Ok(Vec::new()),
         Some(v) => Ok(iterate(v)?.iter().map(|x| x.py_str()).collect()),
     }
 }
 
 fn path_of(r: &PyValue) -> &'static str {
-    if is_str(get(r, "path"), "local") {
+    if is_str(value_get(r, "path"), "local") {
         "local"
     } else {
         "haiku"
@@ -203,10 +196,10 @@ fn recall(home: &PyPath, since: i64) -> Result<(Recall, IndexMap<String, i64>), 
     let mut failed: IndexMap<String, i64> = IndexMap::new();
     for (_, r) in &runs {
         let path_in = matches!(r, PyValue::Dict(d) if dict_get(d, "path").is_some());
-        if is_str(get(r, "path"), "error")
-            || (!path_in && truthy_opt(get(r, "error")) && !truthy_opt(get(r, "ids")))
+        if is_str(value_get(r, "path"), "error")
+            || (!path_in && truthy_opt(value_get(r, "error")) && !truthy_opt(value_get(r, "ids")))
         {
-            let e = get(r, "error");
+            let e = value_get(r, "error");
             bump(
                 &mut failed,
                 if is_str(e, "budget") || is_str(e, "lock") {
@@ -218,8 +211,8 @@ fn recall(home: &PyPath, since: i64) -> Result<(Recall, IndexMap<String, i64>), 
         }
     }
     for (_, r) in &runs {
-        if truthy_opt(get(r, "local_error")) {
-            let e = get(r, "local_error");
+        if truthy_opt(value_get(r, "local_error")) {
+            let e = value_get(r, "local_error");
             bump(
                 &mut failed,
                 if is_str(e, "budget") || is_str(e, "lock") {
@@ -232,7 +225,7 @@ fn recall(home: &PyPath, since: i64) -> Result<(Recall, IndexMap<String, i64>), 
     }
     let mut fallback: IndexMap<String, i64> = IndexMap::new();
     for (_, r) in &runs {
-        if is_str(get(r, "path"), "local") {
+        if is_str(value_get(r, "path"), "local") {
             bump(&mut fallback, str_get(r, "fallback"));
         }
     }
@@ -244,7 +237,7 @@ fn recall(home: &PyPath, since: i64) -> Result<(Recall, IndexMap<String, i64>), 
     }
     let mut shown: HashMap<String, Vec<i64>> = HashMap::new();
     for (t, r) in &usage_rows {
-        if is_str(get(r, "cmd"), "show") {
+        if is_str(value_get(r, "cmd"), "show") {
             for i in ids_of(r, "ids")? {
                 shown.entry(i).or_default().push(t.timestamp_micros());
             }
@@ -283,7 +276,7 @@ fn recall(home: &PyPath, since: i64) -> Result<(Recall, IndexMap<String, i64>), 
             PathCounts {
                 with_injection: runs
                     .iter()
-                    .filter(|(_, r)| truthy_opt(get(r, "ids")) && path_of(r) == path)
+                    .filter(|(_, r)| truthy_opt(value_get(r, "ids")) && path_of(r) == path)
                     .count() as i64,
                 tracked_ids: tracked.len() as i64,
                 opened_ids: n_opened as i64,
@@ -302,7 +295,7 @@ fn recall(home: &PyPath, since: i64) -> Result<(Recall, IndexMap<String, i64>), 
             hook_runs: runs.len() as i64,
             with_injection: runs
                 .iter()
-                .filter(|(_, r)| truthy_opt(get(r, "ids")))
+                .filter(|(_, r)| truthy_opt(value_get(r, "ids")))
                 .count() as i64,
             injections: injections.len() as i64,
             injected_ids: injected.len() as i64,
@@ -338,7 +331,7 @@ fn catch_up(home: &PyPath, since: i64) -> Result<CatchUp, SmError> {
         .collect();
     let mut parts: IndexMap<String, i64> = IndexMap::new();
     for (_, r) in &recent {
-        let Some(p) = get(r, "parts").filter(|v| truthy(v)) else {
+        let Some(p) = value_get(r, "parts").filter(|v| truthy(v)) else {
             continue;
         };
         let PyValue::Dict(items) = p else {
@@ -357,7 +350,7 @@ fn catch_up(home: &PyPath, since: i64) -> Result<CatchUp, SmError> {
             }
         }
     }
-    let is_true = |r: &PyValue| matches!(get(r, "ok"), Some(PyValue::Bool(true)));
+    let is_true = |r: &PyValue| matches!(value_get(r, "ok"), Some(PyValue::Bool(true)));
     Ok(CatchUp {
         runs: recent.len() as i64,
         failed: recent.iter().filter(|(_, r)| !is_true(r)).count() as i64,

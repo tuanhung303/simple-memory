@@ -24,6 +24,7 @@ use crate::error::SmError;
 use crate::py;
 use crate::py::value::PyValue;
 use crate::service::recall::{HAIKU_FLOOR_MIN_SCOPE, is_stopword};
+use crate::sources::value_get;
 use crate::store::connect::connect;
 use crate::store::search::{
     Filters, KeywordAliases, SearchOpts, count_matches, count_scope, head, ids_matching, search,
@@ -145,20 +146,10 @@ impl Default for QueryArgs<'_> {
     }
 }
 
-fn cfg_get<'a>(d: &'a PyValue, key: &str) -> Option<&'a PyValue> {
-    match d {
-        PyValue::Dict(p) => p
-            .iter()
-            .find(|(k, _)| matches!(k, PyValue::Str(s) if s == key))
-            .map(|(_, v)| v),
-        _ => None,
-    }
-}
-
 /// `cfg.get("keyword_aliases")` in the form `build_fts_query` takes: each target as the value
 /// tomllib gave, so a target Python cannot iterate raises its TypeError there.
 pub fn keyword_aliases(cfg: &PyValue) -> Option<KeywordAliases> {
-    let PyValue::Dict(pairs) = cfg_get(cfg, "keyword_aliases")? else {
+    let PyValue::Dict(pairs) = value_get(cfg, "keyword_aliases")? else {
         return None;
     };
     Some(pairs.iter().map(|(k, v)| (k.py_str(), v.clone())).collect())
@@ -166,13 +157,13 @@ pub fn keyword_aliases(cfg: &PyValue) -> Option<KeywordAliases> {
 
 /// `[query] default_bias`: override the built-in default bias list from config.toml.
 pub fn default_bias_from_cfg(cfg: &PyValue) -> Result<Vec<String>, SmError> {
-    let Some(query_val) = cfg_get(cfg, "query") else {
+    let Some(query_val) = value_get(cfg, "query") else {
         return parse_bias_list(None);
     };
     let PyValue::Dict(_) = query_val else {
         return Err(SmError::value("[query]: expected a table"));
     };
-    let Some(raw) = cfg_get(query_val, "default_bias") else {
+    let Some(raw) = value_get(query_val, "default_bias") else {
         return parse_bias_list(None);
     };
     match raw {
@@ -478,10 +469,10 @@ fn over_floor_at(
 /// rejects booleans, non-finite floats, negative numbers, and non-numeric values.
 pub fn local_min_idf_from_cfg(cfg: &PyValue) -> Result<f64, SmError> {
     const ERR: &str = "[prompt_hook] local_min_idf must be a finite number >= 0";
-    let Some(hook_cfg) = cfg_get(cfg, "prompt_hook") else {
+    let Some(hook_cfg) = value_get(cfg, "prompt_hook") else {
         return Ok(LOCAL_TAU);
     };
-    let Some(val) = cfg_get(hook_cfg, "local_min_idf") else {
+    let Some(val) = value_get(hook_cfg, "local_min_idf") else {
         return Ok(LOCAL_TAU);
     };
     match val {
@@ -1281,7 +1272,7 @@ mod tests {
         if let PyValue::Dict(p) = &mut root {
             for (k, v) in p.iter_mut() {
                 if matches!(k, PyValue::Str(s) if s == "keyword_aliases") {
-                    *v = cfg_get(&cfg, "keyword_aliases").unwrap().clone();
+                    *v = value_get(&cfg, "keyword_aliases").unwrap().clone();
                 }
             }
         }
