@@ -123,15 +123,6 @@ fn qualified_name(class: &str) -> &str {
         "SubprocessError" => "subprocess.SubprocessError",
         "TimeoutExpired" => "subprocess.TimeoutExpired",
         "CalledProcessError" => "subprocess.CalledProcessError",
-        "YAMLError" => "yaml.error.YAMLError",
-        "MarkedYAMLError" => "yaml.error.MarkedYAMLError",
-        "ScannerError" => "yaml.scanner.ScannerError",
-        "ParserError" => "yaml.parser.ParserError",
-        "ComposerError" => "yaml.composer.ComposerError",
-        "ConstructorError" => "yaml.constructor.ConstructorError",
-        "ReaderError" => "yaml.reader.ReaderError",
-        "JSONDecodeError" => "json.decoder.JSONDecodeError",
-        "UnsupportedOperation" => "io.UnsupportedOperation",
         other => other,
     }
 }

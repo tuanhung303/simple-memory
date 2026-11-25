@@ -446,7 +446,7 @@ mod tests {
         assert_eq!(SmError::key("x").to_string(), "'x'");
         assert!(SmError::from_python("JSONDecodeError", "m").is(Base::Value));
         assert!(SmError::from_python("TimeoutError", "m").is(Base::Os));
-        assert!(SmError::from_python("ScannerError", "m").is(Base::Other));
+        assert!(SmError::from_python("AttributeError", "m").is(Base::Other));
         assert!(SmError::from_python("TimeoutExpired", "m").is(Base::Other));
         assert!(SmError::from_python("OperationalError", "m").is(Base::Sqlite));
         assert!(!SmError::overflow("date value out of range").is(Base::Value));
