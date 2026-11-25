@@ -120,7 +120,6 @@ fn one_line(msg: &str) -> String {
 /// (`traceback.format_exception_only`).
 fn qualified_name(class: &str) -> &str {
     match class {
-        "SubprocessError" => "subprocess.SubprocessError",
         "TimeoutExpired" => "subprocess.TimeoutExpired",
         "CalledProcessError" => "subprocess.CalledProcessError",
         other => other,
