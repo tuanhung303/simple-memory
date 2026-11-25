@@ -189,6 +189,16 @@ pub(crate) fn dict_get<'a>(data: &'a [(PyValue, PyValue)], key: &str) -> Option<
         .map(|(_, v)| v)
 }
 
+/// A Python str.
+pub(crate) fn s(v: &str) -> PyValue {
+    PyValue::Str(v.into())
+}
+
+/// A str-keyed dict.
+pub(crate) fn dict(pairs: Vec<(&str, PyValue)>) -> PyValue {
+    PyValue::Dict(pairs.into_iter().map(|(k, v)| (s(k), v)).collect())
+}
+
 /// `value.get(key)` on a str key; None when `value` is not a dict.
 pub(crate) fn value_get<'a>(v: &'a PyValue, key: &str) -> Option<&'a PyValue> {
     match v {

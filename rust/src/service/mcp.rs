@@ -26,7 +26,7 @@ use crate::service::show::run_show_many;
 use crate::service::supersede::run_supersede;
 use crate::service::upkeep::put_overlaps;
 use crate::service::usage::log_usage;
-use crate::sources::value_get;
+use crate::sources::{dict, s, value_get};
 use crate::store::items::AmendPatch;
 use crate::store::search::StatusFilter;
 
@@ -240,14 +240,6 @@ impl From<SmError> for Fail {
     fn from(e: SmError) -> Self {
         Fail::Stop(e)
     }
-}
-
-fn s(v: &str) -> PyValue {
-    PyValue::Str(v.to_string())
-}
-
-fn dict(pairs: Vec<(&str, PyValue)>) -> PyValue {
-    PyValue::Dict(pairs.into_iter().map(|(k, v)| (s(k), v)).collect())
 }
 
 /// Tool arguments with their schema defaults: `{**defaults, **args}`.

@@ -34,7 +34,7 @@ use crate::service::query::{
     LocalFound, QueryArgs, StrList, default_bias_from_cfg, keyword_aliases, resolve_scope_biases,
     run_local_query, run_query, scope_df,
 };
-use crate::sources::value_get;
+use crate::sources::{s, value_get};
 use crate::store::connect::connect;
 use crate::store::search::{
     Filters, SearchOpts, count_scope, head as search_head, ids_matching, search_scored,
@@ -907,10 +907,6 @@ pub struct Backoff {
     pub rewrite_cmd: Option<String>,
     pub rewrite_model: Option<String>,
     pub rewrite_timeout: Option<f64>,
-}
-
-fn s(v: &str) -> PyValue {
-    PyValue::Str(v.to_string())
 }
 
 fn strs_value(v: &[String]) -> PyValue {
@@ -1984,6 +1980,7 @@ pub(crate) mod port_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sources::dict;
     use std::cell::RefCell;
 
     use crate::store::connect::connect;
@@ -2287,19 +2284,24 @@ mod tests {
         let t = d.path().join("t.jsonl");
         std::fs::write(&t, "{\"type\":\"USER_INPUT\",\"content\":\" first \"}\nnot json\n{\"type\":\"USER_INPUT\",\"content\":\"last one\"}\n{\"type\":\"USER_INPUT\",\"content\":\"\"}\n").unwrap();
         let tp = t.to_str().unwrap();
-        let p = |pairs: Vec<(&str, PyValue)>| {
-            PyValue::Dict(pairs.into_iter().map(|(k, v)| (s(k), v)).collect())
-        };
         assert_eq!(
-            extract_prompt(&p(vec![("prompt", s("  hi  ")), ("lastUserInput", s("x"))])).unwrap(),
+            extract_prompt(&dict(vec![
+                ("prompt", s("  hi  ")),
+                ("lastUserInput", s("x"))
+            ]))
+            .unwrap(),
             "hi"
         );
         assert_eq!(
-            extract_prompt(&p(vec![("prompt", s(" ")), ("lastUserInput", s(" agy "))])).unwrap(),
+            extract_prompt(&dict(vec![
+                ("prompt", s(" ")),
+                ("lastUserInput", s(" agy "))
+            ]))
+            .unwrap(),
             "agy"
         );
         assert_eq!(
-            extract_prompt(&p(vec![
+            extract_prompt(&dict(vec![
                 ("prompt", PyValue::int(5)),
                 ("transcriptPath", s(tp))
             ]))
@@ -2307,11 +2309,11 @@ mod tests {
             "last one"
         );
         assert_eq!(
-            extract_prompt(&p(vec![("transcript_path", s("/nonexistent-sm-r/t"))])).unwrap(),
+            extract_prompt(&dict(vec![("transcript_path", s("/nonexistent-sm-r/t"))])).unwrap(),
             ""
         );
         assert_eq!(
-            extract_prompt(&p(vec![("transcriptPath", s("a\0b"))]))
+            extract_prompt(&dict(vec![("transcriptPath", s("a\0b"))]))
                 .unwrap_err()
                 .msg,
             "embedded null byte"

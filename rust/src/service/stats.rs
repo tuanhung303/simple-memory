@@ -14,7 +14,7 @@ use crate::py::value::PyValue;
 use crate::service::backup::{auto_backups, backup_age_hours};
 use crate::service::upkeep::{STALE_DAYS, STALE_TAGS, run_stale};
 use crate::service::usage::USAGE_LOG;
-use crate::sources::{dict_get, get_attr, iterate, truthy, value_get};
+use crate::sources::{dict_get, get_attr, iterate, s, truthy, value_get};
 use crate::store::connect::connect;
 use crate::store::search::{Filters, count_scope};
 use crate::store::stats::{item_labels, store_counts};
@@ -482,10 +482,6 @@ pub fn run_stats(days: f64, home: Option<&str>, now: Option<f64>) -> Result<Stat
         backups: (count, age.map(|a| round_ndigits(a, 1)).transpose()?),
         scopes: scope_counts,
     })
-}
-
-fn s(x: &str) -> PyValue {
-    PyValue::Str(x.into())
 }
 
 fn counts_value<K: AsRef<str>>(m: &IndexMap<K, i64>) -> PyValue {
