@@ -6,7 +6,7 @@ use std::collections::{BTreeSet, HashSet};
 use unicode_normalization::UnicodeNormalization;
 
 use crate::core::fold::fold;
-use crate::core::terms::word_runs;
+use crate::core::terms::folded_words;
 use crate::py;
 
 pub const COSINE_THRESHOLD: f64 = 0.8;
@@ -128,21 +128,13 @@ pub fn near_duplicate_score(
     (score >= COSINE_THRESHOLD && !veto_fires(a, b, &mut idf_of, theta)).then_some(score)
 }
 
-/// `distinct_words(text)`.
-pub fn distinct_words(text: Option<&str>) -> HashSet<String> {
-    word_runs(&fold(text))
-        .into_iter()
-        .map(String::from)
-        .collect()
-}
-
 /// `word_overlap(new_text, other_text)`: share of the new text's distinct words the other holds.
 pub fn word_overlap(new_text: &str, other_text: &str) -> f64 {
-    let new_words = distinct_words(Some(new_text));
+    let new_words: HashSet<String> = folded_words(new_text);
     if new_words.is_empty() {
         return 0.0;
     }
-    let other = distinct_words(Some(other_text));
+    let other: HashSet<String> = folded_words(other_text);
     new_words.intersection(&other).count() as f64 / new_words.len() as f64
 }
 
@@ -162,7 +154,7 @@ mod tests {
         );
         assert_eq!(normalize_title(None), "");
         assert!(title_tokens(Some(" !! ")).is_empty());
-        let mut words: Vec<String> = distinct_words(Some("Café Đorđe café ĐORĐE x_y"))
+        let mut words: Vec<String> = folded_words::<HashSet<String>>("Café Đorđe café ĐORĐE x_y")
             .into_iter()
             .collect();
         words.sort();

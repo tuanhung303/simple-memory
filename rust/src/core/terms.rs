@@ -133,6 +133,14 @@ pub fn quote_fts_term(word: &str) -> String {
     }
 }
 
+/// `re.findall(r"\w+", fold(text))` as owned words.
+pub fn folded_words<C: FromIterator<String>>(text: &str) -> C {
+    word_runs(&fold(Some(text)))
+        .into_iter()
+        .map(String::from)
+        .collect()
+}
+
 /// `re.findall(r"\w+", text)`.
 pub fn word_runs(text: &str) -> Vec<&str> {
     let mut out = Vec::new();
