@@ -15,6 +15,7 @@ use crate::error::SmError;
 use crate::parity::Call;
 use crate::py::str::{ci_literal, repr, strip, translate};
 use crate::py::tables;
+use crate::py::value::days_in_month;
 
 const CROCKFORD: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 
@@ -106,15 +107,6 @@ fn digit_value(c: char) -> Option<u32> {
         .iter()
         .find(|&&(a, b)| a <= cp && cp <= b)
         .map(|&(a, _)| (cp - a) % 10)
-}
-
-fn days_in_month(y: i32, m: u32) -> u32 {
-    match m {
-        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-        4 | 6 | 9 | 11 => 30,
-        _ if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 => 29,
-        _ => 28,
-    }
 }
 
 /// `datetime.strptime(s, "%Y-%m-%d")` for an s that fullmatches `\d{4}-\d{2}-\d{2}`: `%Y` takes
@@ -220,7 +212,7 @@ fn fromisoformat(s: &str) -> Option<(NaiveDateTime, Option<i32>)> {
             return None;
         }
         NaiveDate::from_ymd_opt(y, m, d)?.and_time(NaiveTime::MIN)
-    } else if hour > 23 || year < 1 || day < 1 || day > days_in_month(year, month) {
+    } else if hour > 23 || year < 1 {
         return None;
     } else {
         NaiveDate::from_ymd_opt(year, month, day)?.and_hms_micro_opt(hour, minute, second, micro)?
@@ -820,6 +812,24 @@ mod tests {
             naive_local_iso(1, 1, 1, 0, 0, 0)
         );
         assert!(v("2026-02-29T24:00", false).is_err());
+        // below 24:00 chrono checks the day and the month length; year 0 is ours to refuse
+        for bad in [
+            "2026-01-00T10:00",
+            "2026-04-31T10:00",
+            "2026-02-29T10:00",
+            "0000-01-01T10:00",
+        ] {
+            assert_eq!(
+                v(bad, false).unwrap_err(),
+                format!(
+                    "ValueError: Invalid ISO 8601 timestamp '{bad}', for example 2026-11-21T09:30:00Z"
+                )
+            );
+        }
+        assert_eq!(
+            v("2026-04-30T10:00", false).unwrap(),
+            naive_local_iso(2026, 4, 30, 10, 0, 0)
+        );
         assert_eq!(
             v("2024-02-29T24:00", false).unwrap(),
             naive_local_iso(2024, 3, 1, 0, 0, 0)
