@@ -12,6 +12,7 @@ use crate::service::list::{
 };
 use crate::service::query::{StrList, item_text, split_list};
 use crate::service::usage::log_usage;
+use crate::sources::s;
 use crate::store::search::StatusFilter;
 
 fn int_text(v: &Value) -> String {
@@ -20,10 +21,6 @@ fn int_text(v: &Value) -> String {
         Value::BigInt(s) => s.clone(),
         other => panic!("expected an int value, got {other:?}"),
     }
-}
-
-fn s(v: &str) -> PyValue {
-    PyValue::Str(v.to_string())
 }
 
 fn list_filter_flags(ns: &Namespace) -> Vec<String> {

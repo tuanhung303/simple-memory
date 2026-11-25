@@ -17,6 +17,7 @@ use crate::service::query::{
 };
 use crate::service::recall::is_stopword;
 use crate::service::usage::log_usage;
+use crate::sources::s;
 use crate::store::search::repo_names;
 
 pub const MAX_TOTAL_CHARS: usize = 2400;
@@ -492,10 +493,6 @@ fn print_query(
         format_query_text(lk, &footer)
     };
     out.print(&text)
-}
-
-fn s(v: &str) -> PyValue {
-    PyValue::Str(v.to_string())
 }
 
 fn join_query_tokens(parts: &[String]) -> String {

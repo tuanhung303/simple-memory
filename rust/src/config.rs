@@ -15,6 +15,7 @@ use crate::error::{Base, SmError};
 use crate::parity::Call;
 use crate::py::path::{Errors, PyPath};
 use crate::py::value::PyValue;
+use crate::sources::{dict, s, value_get as get};
 
 /// `get_home(home)`: `home`, else `$SIMPLE_MEMORY_HOME` when set and not empty, else
 /// `~/.simple-memory`, each through `expanduser`.
@@ -31,14 +32,6 @@ pub fn get_home(home: Option<&str>) -> Result<PyPath, SmError> {
 /// `get_db_path(home)`: `<home>/memory.db`.
 pub fn get_db_path(home: Option<&str>) -> Result<PyPath, SmError> {
     Ok(get_home(home)?.join("memory.db"))
-}
-
-fn s(v: &str) -> PyValue {
-    PyValue::Str(v.into())
-}
-
-fn dict(pairs: Vec<(&str, PyValue)>) -> PyValue {
-    PyValue::Dict(pairs.into_iter().map(|(k, v)| (s(k), v)).collect())
 }
 
 fn float(x: f64) -> PyValue {
@@ -209,16 +202,6 @@ fn note(key: &str) -> Option<&'static str> {
 /// `tomllib.loads(text)` as a dict (`crate::py::toml`, a port of tomllib).
 pub fn toml_loads(text: &str) -> Result<PyValue, SmError> {
     crate::py::toml::loads(text)
-}
-
-fn get<'a>(d: &'a PyValue, key: &str) -> Option<&'a PyValue> {
-    match d {
-        PyValue::Dict(p) => p
-            .iter()
-            .find(|(k, _)| matches!(k, PyValue::Str(s) if s == key))
-            .map(|(_, v)| v),
-        _ => None,
-    }
 }
 
 /// The path of a home's config.toml and the tables it holds, or None when there is no file. A file
