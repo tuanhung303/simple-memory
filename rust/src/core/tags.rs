@@ -1,9 +1,4 @@
-#[cfg(any(test, feature = "parity"))]
-use serde_json::Value;
-
 use crate::error::SmError;
-#[cfg(any(test, feature = "parity"))]
-use crate::parity::{Call, Reply};
 use crate::py::str::{lower, repr, strip};
 
 pub const VALID_TAGS: [&str; 8] = [
@@ -146,34 +141,6 @@ pub fn strip_retired_tags(tags: &str) -> String {
         .filter(|t| !t.is_empty() && !t.starts_with(RETIRED_TAG_PREFIX))
         .collect::<Vec<_>>()
         .join(", ")
-}
-
-#[cfg(any(test, feature = "parity"))]
-pub fn parity(f: &str, call: &Call) -> Option<Reply> {
-    Some(match f {
-        "core.tags.map_legacy_tag" => (|| {
-            let (a, b) = map_legacy_tag(call.opt_str(0, "raw_tag")?);
-            Ok(Value::from(vec![
-                Value::from(a),
-                b.map_or(Value::Null, Value::from),
-            ]))
-        })(),
-        "core.tags.validate_tag" => (|| {
-            let evidence = match call.arg(1, "evidence") {
-                None => Some(""),
-                Some(_) => call.opt_str(1, "evidence")?,
-            };
-            let allow_na = call.opt_bool(2, "allow_na")?.unwrap_or(false);
-            validate_tag(call.opt_str(0, "tag")?, evidence, allow_na).map(Value::from)
-        })(),
-        "core.tags.validate_kind" => {
-            (|| validate_kind(call.opt_str(0, "kind")?).map(Value::from))()
-        }
-        "core.tags.append_tag" => {
-            (|| Ok(append_tag(call.opt_str(0, "tags")?, call.str(1, "new_tag")?).into()))()
-        }
-        _ => return None,
-    })
 }
 
 #[cfg(test)]
