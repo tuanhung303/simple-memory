@@ -1,0 +1,43 @@
+id: 20261125-093226-bc1b241c-sm-simplify-24d2
+title: Simplify sm modules (Group A refactor, legacy import removal, redact ASCII)
+  and fix open bugs E1/E2
+state: wip
+repo: simple-memory
+superproject: null
+session: bc1b241c-b53b-4b86-bab0-fb58d54351d9
+as_of: 2026-11-25T09:32+07:00
+commits:
+- e3d8185
+wip_branch: wip/bc1b241c
+continues: null
+superseded_by: null
+handoff: /Users/__blitzzz/Documents/GitHub/agentic/tmp/handoffs/-Users---blitzzz-Documents-GitHub-agentic/20261125-022913-bc1b241c-b53b-4b86-bab0-fb58d54351d9.md
+wip_dir: /Users/__blitzzz/Documents/GitHub/simple-memory/tmp/wip/2026-11-25/093204-bc1b241c-sm-bugfix-footer-a745
+results:
+- 'Review of 66k-line rust/src by 3 read-only lanes: no dead code; 21 simplification
+  items (~-500 net lines) listed in the session transcript; py/ yaml/argparse/toml
+  kept (output parity)'
+- 'Bug E1(a) fixed: doctor restore skips an empty backup when an older one has items
+  (e3d8185, local main, not reviewed or pushed)'
+- 'Lane branches, unmerged: simplify-cli 3e40186+3efffa3 (items 1-4, 75 integration
+  tests pass), simplify-core aeee57a+8a7cd44 (items 9-10), simplify-svc 3b43c09 (item
+  16); net -508 lines in rust/src'
+- 'Bugs E1(c)/E2 footer fix in progress, unverified: parked as wip/bc1b241c fff3ded
+  and changes.patch in the wip dir'
+directions:
+- 'Do not run cargo fmt in this crate: it is not fmt-clean and cargo fmt -- <file>
+  reformats the whole crate; use rustfmt --edition <ed> <file>'
+- 'Tests the lanes changed (reviewer must check): core item 9 busy_timeout expectation
+  5000->0; core item 10 removed 3 idf error assertions; svc item 16 non-string ts
+  now unreadable'
+- capture.rs poll loop out of scope (owner kept it); py/yaml, argparse, toml replacement
+  ruled out (changes error text and YAML 1.1 parsing)
+open:
+- 'Items not started: cli 5-8, core 11-15, svc 17-21 (17/18 plan in the parked lane-svc
+  notes)'
+- 3 hook_catchup timing tests fail on simplify-cli (tests/hook_catchup.rs:360,376,434);
+  not checked at base 2c4427e
+- Clippy (default and --features parity) and port_upkeep tests not run; E1(d) not
+  reproduced yet
+next: Restore the parked patch on main, finish items, merge the 3 branches onto main,
+  run full cargo test, one fresh rei-reviewer pass, then push
