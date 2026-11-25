@@ -519,7 +519,19 @@ pub fn restore_steps(home: Option<&str>) -> Result<Vec<String>, SmError> {
             .replace('#', "%23");
         format!("file:{path}?mode=ro&immutable=1")
     };
-    let Some(backup) = found.iter().rev().find(|p| passes_quick_check(uri(p), ro)) else {
+    let good: Vec<&PyPath> = found
+        .iter()
+        .rev()
+        .filter(|p| passes_quick_check(uri(p), ro))
+        .collect();
+    // an empty copy restores nothing, so an older copy that holds items wins over it
+    let holds_items = |p: &PyPath| {
+        Connection::open_with_flags(uri(p), ro)
+            .and_then(|c| c.query_row("SELECT count(*) FROM items", [], |r| r.get::<_, i64>(0)))
+            .is_ok_and(|n| n > 0)
+    };
+    let full = good.iter().copied().find(|p| holds_items(p));
+    let Some(backup) = full.or(good.first().copied()) else {
         return Ok(vec![if found.is_empty() {
             format!("{db} looks damaged and {bdir} holds no backup to restore")
         } else {
@@ -527,10 +539,14 @@ pub fn restore_steps(home: Option<&str>) -> Result<Vec<String>, SmError> {
         }]);
     };
     let (q, aside) = (|p: &PyPath| shlex_quote(p.as_str()), h.join("damaged"));
+    // name the item rule only when it passed over a newer empty copy
+    let which = if good.first() == Some(&backup) {
+        "the newest backup that passes quick_check"
+    } else {
+        "the newest backup that passes quick_check and holds items"
+    };
     Ok(vec![
-        format!(
-            "{db} looks damaged; to restore the newest backup that passes quick_check, {backup}:"
-        ),
+        format!("{db} looks damaged; to restore {which}, {backup}:"),
         format!(
             "  1. mkdir -p {} && mv {}/memory.db* {}/",
             q(&aside),
@@ -549,6 +565,32 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("catchup.log"), text).unwrap();
         dir
+    }
+
+    #[test]
+    fn restore_steps_skip_an_empty_backup_when_an_older_one_holds_items() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = dir.path();
+        std::fs::write(h.join("memory.db"), b"not a database at all").unwrap();
+        std::fs::create_dir(h.join("backups")).unwrap();
+        let make = |name: &str, rows: i64| {
+            let c = Connection::open(h.join("backups").join(name)).unwrap();
+            c.execute_batch("CREATE TABLE items (id TEXT)").unwrap();
+            for i in 0..rows {
+                c.execute("INSERT INTO items VALUES (?1)", [i.to_string()])
+                    .unwrap();
+            }
+        };
+        make("memory-20261101-000000-auto.db", 3);
+        make("memory-20261102-000000-auto.db", 0);
+        let steps = restore_steps(h.to_str()).unwrap();
+        assert!(steps[0].ends_with("memory-20261101-000000-auto.db:"), "{steps:?}");
+        assert!(steps[0].contains("holds items"), "{steps:?}");
+        // every backup empty: the newest that passes quick_check, as before
+        std::fs::remove_file(h.join("backups/memory-20261101-000000-auto.db")).unwrap();
+        let steps = restore_steps(h.to_str()).unwrap();
+        assert!(steps[0].ends_with("memory-20261102-000000-auto.db:"), "{steps:?}");
+        assert!(!steps[0].contains("holds items"), "{steps:?}");
     }
 
     #[test]

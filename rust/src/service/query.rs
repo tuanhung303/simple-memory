@@ -70,7 +70,7 @@ pub struct Hidden {
     pub retired: bool,
     /// Outside `--tag`, `--kind`, `--source`, `--since` or `--until`.
     pub filtered: bool,
-    /// Active items in other repos that pass the filters: `--all` shows them.
+    /// In other repos: `--all` shows them (with `retired` and `filtered` as above).
     pub other_repos: bool,
     /// What hid them, as the footer says it: `retired or superseded`, `outside --kind fact`.
     pub by: String,
@@ -810,7 +810,8 @@ pub fn run_lookup(query_text: &str, a: &QueryArgs) -> Result<Lookup, SmError> {
 }
 
 /// The items that match `fts` but that the status or the filters `narrow` of `f` hid, when no
-/// item `f` keeps matches it; else, with `other_scope`, the ones in other repos.
+/// item `f` keeps matches it; else, with `other_scope`, the ones in other repos, under the same
+/// status and filters first.
 fn hidden_matches(
     conn: &Connection,
     fts: &str,
@@ -830,46 +831,49 @@ fn hidden_matches(
         include_history: true,
         ..g.clone()
     };
+    let all_repos = |g: &Filters| Filters {
+        include_all_repos: true,
+        ..g.clone()
+    };
     let filtered = unfiltered != *f;
-    let wider = [
-        (!f.include_history).then(|| (with_history(f), true, false)),
-        filtered.then(|| (unfiltered.clone(), false, true)),
-        (filtered && !f.include_history).then(|| (with_history(&unfiltered), true, true)),
-    ];
-    for (g, retired, filtered) in wider.into_iter().flatten() {
+    // first this scope, then other repos: the query's own status and filters, then wider ones
+    let scopes = std::iter::once((f.clone(), unfiltered.clone(), false))
+        .chain(other_scope.then(|| (all_repos(f), all_repos(&unfiltered), true)));
+    let mut tries = Vec::new();
+    for (base, unf, other) in scopes {
+        if other {
+            tries.push((base.clone(), false, false, true));
+        }
+        if !f.include_history {
+            tries.push((with_history(&base), true, false, other));
+        }
+        if filtered {
+            tries.push((unf.clone(), false, true, other));
+        }
+        if filtered && !f.include_history {
+            tries.push((with_history(&unf), true, true, other));
+        }
+    }
+    for (g, retired, filtered, other_repos) in tries {
         let n = count_matches(conn, fts, &g)?;
         if n > 0 {
             let outside = format!("outside {}", narrow.join(" "));
-            let by = match (retired, filtered) {
-                (true, false) => "retired or superseded".to_string(),
-                (false, _) => outside,
-                (true, true) => format!("retired or superseded, {outside}"),
-            };
+            let parts = [
+                retired.then_some("retired or superseded"),
+                filtered.then_some(outside.as_str()),
+                other_repos.then_some("in other repos"),
+            ];
+            let by = parts.into_iter().flatten().collect::<Vec<_>>().join(", ");
             return Ok(Some(Hidden {
                 n,
                 retired,
                 filtered,
-                other_repos: false,
+                other_repos,
                 by,
             }));
         }
     }
-    let all = Filters {
-        include_all_repos: true,
-        ..f.clone()
-    };
-    let n = if other_scope {
-        count_matches(conn, fts, &all)?
-    } else {
-        0
-    };
-    Ok((n > 0).then(|| Hidden {
-        n,
-        retired: false,
-        filtered: false,
-        other_repos: true,
-        by: "in other repos".to_string(),
-    }))
+    Ok(None)
 }
 
 /// `item_tokens`: title and body characters / 4, rounded up.
