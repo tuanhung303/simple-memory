@@ -15,6 +15,7 @@ use crate::error::SmError;
 use crate::parity::Call;
 use crate::py::str::{ci_literal, repr, strip, translate};
 use crate::py::tables;
+use crate::py::value::days_in_month;
 
 const CROCKFORD: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 
@@ -106,15 +107,6 @@ fn digit_value(c: char) -> Option<u32> {
         .iter()
         .find(|&&(a, b)| a <= cp && cp <= b)
         .map(|&(a, _)| (cp - a) % 10)
-}
-
-fn days_in_month(y: i32, m: u32) -> u32 {
-    match m {
-        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-        4 | 6 | 9 | 11 => 30,
-        _ if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 => 29,
-        _ => 28,
-    }
 }
 
 /// `datetime.strptime(s, "%Y-%m-%d")` for an s that fullmatches `\d{4}-\d{2}-\d{2}`: `%Y` takes
@@ -220,7 +212,7 @@ fn fromisoformat(s: &str) -> Option<(NaiveDateTime, Option<i32>)> {
             return None;
         }
         NaiveDate::from_ymd_opt(y, m, d)?.and_time(NaiveTime::MIN)
-    } else if hour > 23 || year < 1 || day < 1 || day > days_in_month(year, month) {
+    } else if hour > 23 || year < 1 {
         return None;
     } else {
         NaiveDate::from_ymd_opt(year, month, day)?.and_hms_micro_opt(hour, minute, second, micro)?
@@ -463,47 +455,22 @@ fn fromtimestamp_local(ts: f64) -> Result<(NaiveDateTime, i32), SmError> {
         frac += 1e6;
         intpart -= 1.0;
     }
-    // time_t is i64: [-2^63, 2^63).
-    if !(-(2f64.powi(63))..2f64.powi(63)).contains(&intpart) {
-        return Err(SmError::overflow(
-            "timestamp out of range for platform time_t",
-        ));
-    }
-    let secs = intpart as i64;
-    let days = secs.div_euclid(86400);
-    let year = civil_year(days);
-    if year - 1900 > i32::MAX as i64 || year - 1900 < i32::MIN as i64 {
-        return Err(SmError::from_python(
-            "OSError",
-            "[Errno 84] Value too large to be stored in data type",
-        ));
-    }
-    if !(1..=9999).contains(&year) {
+    // `as` saturates, and chrono refuses what is past its +-262143 years
+    let utc = DateTime::from_timestamp(intpart as i64, frac as u32 * 1000)
+        .ok_or_else(|| SmError::overflow(clock::TIME_T_RANGE))?
+        .naive_utc();
+    if !(1..=9999).contains(&utc.year()) {
         return Err(SmError::value(format!(
-            "year must be in 1..9999, not {year}"
+            "year must be in 1..9999, not {}",
+            utc.year()
         )));
     }
-    let utc = DateTime::from_timestamp(secs, frac as u32 * 1000)
-        .expect("a year in 1..9999 is a valid time")
-        .naive_utc();
     let local_off = clock::local_offset_seconds_at(utc.and_utc().timestamp());
     let local = utc
         .checked_add_signed(Duration::seconds(local_off as i64))
         .filter(in_range)
         .ok_or_else(|| SmError::overflow("date value out of range"))?;
     Ok((local, local_off))
-}
-
-/// The proleptic Gregorian year of a day count from 1970-01-01 (Hinnant's civil_from_days).
-fn civil_year(days: i64) -> i64 {
-    let z = days as i128 + 719468;
-    let era = z.div_euclid(146097);
-    let doe = z - era * 146097;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    (yoe + era * 400 + i128::from(m <= 2)) as i64
 }
 
 /// `epoch_to_as_of(ts)`.
@@ -820,6 +787,24 @@ mod tests {
             naive_local_iso(1, 1, 1, 0, 0, 0)
         );
         assert!(v("2026-02-29T24:00", false).is_err());
+        // below 24:00 chrono checks the day and the month length; year 0 is ours to refuse
+        for bad in [
+            "2026-01-00T10:00",
+            "2026-04-31T10:00",
+            "2026-02-29T10:00",
+            "0000-01-01T10:00",
+        ] {
+            assert_eq!(
+                v(bad, false).unwrap_err(),
+                format!(
+                    "ValueError: Invalid ISO 8601 timestamp '{bad}', for example 2026-11-21T09:30:00Z"
+                )
+            );
+        }
+        assert_eq!(
+            v("2026-04-30T10:00", false).unwrap(),
+            naive_local_iso(2026, 4, 30, 10, 0, 0)
+        );
         assert_eq!(
             v("2024-02-29T24:00", false).unwrap(),
             naive_local_iso(2024, 3, 1, 0, 0, 0)
@@ -897,9 +882,10 @@ mod tests {
                 utc_to_local_iso(9999, 12, 31, 17, 0, 0)
             );
         }
+        // by hand: 0000-01-01 is day -719528, so day -729166.7 falls 26.4 years before it
         assert_eq!(
-            epoch_to_as_of(1e17).unwrap_err().python_text(),
-            "OSError: [Errno 84] Value too large to be stored in data type"
+            epoch_to_as_of(-6.3e10).unwrap_err().python_text(),
+            "ValueError: year must be in 1..9999, not -27"
         );
         assert_eq!(
             epoch_to_as_of(f64::INFINITY).unwrap_err().python_text(),

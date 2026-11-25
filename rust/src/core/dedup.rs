@@ -6,12 +6,11 @@ use std::collections::{BTreeSet, HashSet};
 use unicode_normalization::UnicodeNormalization;
 
 use crate::core::fold::fold;
-use crate::core::terms::word_runs;
-use crate::error::SmError;
+use crate::core::terms::folded_words;
 use crate::py;
 
 pub const COSINE_THRESHOLD: f64 = 0.8;
-pub const VETO_DF: i64 = 10;
+pub const VETO_DF: usize = 10;
 pub const MIN_SHARED_TOKENS: usize = 2;
 pub const OVERLAP_WARN_SHARE: f64 = 0.5;
 
@@ -41,17 +40,10 @@ pub fn title_tokens(title: Option<&str>) -> Vec<String> {
         .collect()
 }
 
-/// `idf(df, n)` = `math.log(1 + n / (df + 0.5))`, with Python's errors.
-pub fn idf(df: i64, n: i64) -> Result<f64, SmError> {
-    // an int df + 0.5 is never 0, so Python's ZeroDivisionError cannot happen here
-    let x = 1.0 + n as f64 / (df as f64 + 0.5);
-    if x <= 0.0 {
-        return Err(SmError::value(format!(
-            "expected a positive input, got {}",
-            py::float::repr(x)
-        )));
-    }
-    Ok(x.ln())
+/// `idf(df, n)` = `math.log(1 + n / (df + 0.5))`. Counts are never negative, so the log's input
+/// is at least 1 and Python's ValueError and ZeroDivisionError cannot happen.
+pub fn idf(df: usize, n: usize) -> f64 {
+    (1.0 + n as f64 / (df as f64 + 0.5)).ln()
 }
 
 /// Distinct tokens in first-seen order. Python iterates `set(a)` in hash order, which changes
@@ -88,54 +80,40 @@ fn py_sum<I: IntoIterator<Item = f64>>(items: I) -> f64 {
 }
 
 /// `tfidf_cosine(a, b, idf_of)`.
-pub fn tfidf_cosine<F>(a: &[&str], b: &[&str], mut idf_of: F) -> Result<f64, SmError>
-where
-    F: FnMut(&str) -> Result<f64, SmError>,
-{
-    let va: Vec<(&str, f64)> = distinct(a.iter().copied())
-        .into_iter()
-        .map(|t| Ok((t, idf_of(t)?)))
-        .collect::<Result<_, SmError>>()?;
-    let vb: Vec<(&str, f64)> = distinct(b.iter().copied())
-        .into_iter()
-        .map(|t| Ok((t, idf_of(t)?)))
-        .collect::<Result<_, SmError>>()?;
+pub fn tfidf_cosine<'a>(a: &[&'a str], b: &[&'a str], mut idf_of: impl FnMut(&str) -> f64) -> f64 {
+    let mut weigh = |s: &[&'a str]| -> Vec<(&'a str, f64)> {
+        distinct(s.iter().copied())
+            .into_iter()
+            .map(|t| (t, idf_of(t)))
+            .collect()
+    };
+    let va = weigh(a);
+    let vb = weigh(b);
     let weight_b = |t: &str| vb.iter().find(|(u, _)| *u == t).map(|(_, w)| *w);
     let dot = py_sum(va.iter().filter_map(|(t, w)| weight_b(t).map(|wb| w * wb)));
     let na = py_sum(va.iter().map(|(_, w)| w * w));
     let nb = py_sum(vb.iter().map(|(_, w)| w * w));
     if na == 0.0 || nb == 0.0 {
-        return Ok(0.0);
+        return 0.0;
     }
-    Ok(dot / (na * nb).sqrt())
+    dot / (na * nb).sqrt()
 }
 
 /// `veto_fires(a, b, idf_of, theta)`: a token only one side holds, rarer than theta.
-pub fn veto_fires<F>(a: &[&str], b: &[&str], mut idf_of: F, theta: f64) -> Result<bool, SmError>
-where
-    F: FnMut(&str) -> Result<f64, SmError>,
-{
+pub fn veto_fires(a: &[&str], b: &[&str], mut idf_of: impl FnMut(&str) -> f64, theta: f64) -> bool {
     let sa: BTreeSet<&str> = a.iter().copied().collect();
     let sb: BTreeSet<&str> = b.iter().copied().collect();
-    for t in sa.symmetric_difference(&sb) {
-        if idf_of(t)? > theta {
-            return Ok(true);
-        }
-    }
-    Ok(false)
+    sa.symmetric_difference(&sb).any(|t| idf_of(t) > theta)
 }
 
 /// `near_duplicate_score(a, b, idf_of, theta)`: the cosine when the pair is a near-duplicate
 /// candidate, else None.
-pub fn near_duplicate_score<F>(
+pub fn near_duplicate_score(
     a: &[&str],
     b: &[&str],
-    mut idf_of: F,
+    mut idf_of: impl FnMut(&str) -> f64,
     theta: f64,
-) -> Result<Option<f64>, SmError>
-where
-    F: FnMut(&str) -> Result<f64, SmError>,
-{
+) -> Option<f64> {
     let sa: HashSet<&str> = a.iter().copied().collect();
     let shared = b
         .iter()
@@ -144,30 +122,19 @@ where
         .intersection(&sa)
         .count();
     if shared < MIN_SHARED_TOKENS {
-        return Ok(None);
+        return None;
     }
-    let score = tfidf_cosine(a, b, &mut idf_of)?;
-    if score < COSINE_THRESHOLD || veto_fires(a, b, &mut idf_of, theta)? {
-        return Ok(None);
-    }
-    Ok(Some(score))
-}
-
-/// `distinct_words(text)`.
-pub fn distinct_words(text: Option<&str>) -> HashSet<String> {
-    word_runs(&fold(text))
-        .into_iter()
-        .map(String::from)
-        .collect()
+    let score = tfidf_cosine(a, b, &mut idf_of);
+    (score >= COSINE_THRESHOLD && !veto_fires(a, b, &mut idf_of, theta)).then_some(score)
 }
 
 /// `word_overlap(new_text, other_text)`: share of the new text's distinct words the other holds.
 pub fn word_overlap(new_text: &str, other_text: &str) -> f64 {
-    let new_words = distinct_words(Some(new_text));
+    let new_words: HashSet<String> = folded_words(new_text);
     if new_words.is_empty() {
         return 0.0;
     }
-    let other = distinct_words(Some(other_text));
+    let other: HashSet<String> = folded_words(other_text);
     new_words.intersection(&other).count() as f64 / new_words.len() as f64
 }
 
@@ -175,14 +142,8 @@ pub fn word_overlap(new_text: &str, other_text: &str) -> f64 {
 mod tests {
     use super::*;
 
-    fn table<'a>(pairs: &'a [(&'a str, f64)]) -> impl Fn(&str) -> Result<f64, SmError> + 'a {
-        move |t| {
-            pairs
-                .iter()
-                .find(|(k, _)| *k == t)
-                .map(|(_, v)| *v)
-                .ok_or_else(|| SmError::key(t))
-        }
+    fn table<'a>(pairs: &'a [(&'a str, f64)]) -> impl Fn(&str) -> f64 + 'a {
+        move |t| pairs.iter().find(|(k, _)| *k == t).unwrap().1
     }
 
     #[test]
@@ -193,7 +154,7 @@ mod tests {
         );
         assert_eq!(normalize_title(None), "");
         assert!(title_tokens(Some(" !! ")).is_empty());
-        let mut words: Vec<String> = distinct_words(Some("Café Đorđe café ĐORĐE x_y"))
+        let mut words: Vec<String> = folded_words::<HashSet<String>>("Café Đorđe café ĐORĐE x_y")
             .into_iter()
             .collect();
         words.sort();
@@ -203,60 +164,47 @@ mod tests {
     }
 
     #[test]
-    fn idf_values_and_errors() {
-        assert_eq!(idf(0, 0).unwrap(), 0.0);
-        assert_eq!(idf(1, 10).unwrap(), (1.0f64 + 10.0 / 1.5).ln());
-        assert_eq!(
-            idf(-1, 1).unwrap_err().python_text(),
-            "ValueError: expected a positive input, got -1.0"
-        );
-        assert_eq!(idf(0, 1).unwrap(), 1.0986122886681098);
-        // 1 + 0 / -0.5 is 1 + -0.0
-        assert_eq!(idf(-1, 0).unwrap(), 0.0);
+    fn idf_values() {
+        assert_eq!(idf(0, 0), 0.0);
+        assert_eq!(idf(1, 10), (1.0f64 + 10.0 / 1.5).ln());
+        assert_eq!(idf(0, 1), 1.0986122886681098);
     }
 
     #[test]
     fn cosine_veto_and_near_duplicates() {
         let t = [("a", 1.0), ("b", 2.0), ("c", 2.0)];
         assert_eq!(
-            tfidf_cosine(&["a", "b", "b"], &["b", "c"], table(&t)).unwrap(),
+            tfidf_cosine(&["a", "b", "b"], &["b", "c"], table(&t)),
             0.6324555320336759
         );
-        assert_eq!(tfidf_cosine(&[], &["b"], table(&t)).unwrap(), 0.0);
-        assert_eq!(
-            tfidf_cosine(&["a", "z"], &["a"], table(&t))
-                .unwrap_err()
-                .python_text(),
-            "KeyError: 'z'"
-        );
+        assert_eq!(tfidf_cosine(&[], &["b"], table(&t)), 0.0);
         let v = [("a", 1.0), ("b", 0.5), ("c", 3.0)];
-        assert!(veto_fires(&["a", "b"], &["a", "c"], table(&v), 2.0).unwrap());
-        assert!(!veto_fires(&["a", "b"], &["a", "b"], table(&v), 2.0).unwrap());
+        assert!(veto_fires(&["a", "b"], &["a", "c"], table(&v), 2.0));
+        assert!(!veto_fires(&["a", "b"], &["a", "b"], table(&v), 2.0));
         let n = [("a", 1.0), ("b", 2.0), ("c", 0.5), ("d", 0.5)];
         assert_eq!(
-            near_duplicate_score(&["a", "b", "c"], &["a", "b", "c", "c"], table(&n), 9.0).unwrap(),
+            near_duplicate_score(&["a", "b", "c"], &["a", "b", "c", "c"], table(&n), 9.0),
             Some(1.0)
         );
         // one shared token is below MIN_SHARED_TOKENS
         assert_eq!(
-            near_duplicate_score(&["a", "b"], &["a", "c"], table(&n), 9.0).unwrap(),
+            near_duplicate_score(&["a", "b"], &["a", "c"], table(&n), 9.0),
             None
         );
         // one shared token, though the cosine (100 / sqrt(101 * 100) = 0.995) passes
         assert_eq!(
-            near_duplicate_score(&["a", "b"], &["a"], table(&[("a", 10.0), ("b", 1.0)]), 9.0)
-                .unwrap(),
+            near_duplicate_score(&["a", "b"], &["a"], table(&[("a", 10.0), ("b", 1.0)]), 9.0),
             None
         );
         // two shared, no veto, but the cosine is 2 / 3
         let ones = [("a", 1.0), ("b", 1.0), ("c", 1.0), ("d", 1.0)];
         assert_eq!(
-            near_duplicate_score(&["a", "b", "c"], &["a", "b", "d"], table(&ones), 9.0).unwrap(),
+            near_duplicate_score(&["a", "b", "c"], &["a", "b", "d"], table(&ones), 9.0),
             None
         );
         // the cosine passes (5 / 5.25 = 0.95) but c and d are rarer than theta: veto
         assert_eq!(
-            near_duplicate_score(&["a", "b", "c"], &["a", "b", "d"], table(&n), 0.25).unwrap(),
+            near_duplicate_score(&["a", "b", "c"], &["a", "b", "d"], table(&n), 0.25),
             None
         );
     }

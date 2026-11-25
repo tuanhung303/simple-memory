@@ -23,8 +23,6 @@ const ENTRIES: &[Entry] = &[
     crate::clock::parity,
     crate::core::item::parity,
     crate::py::str::parity,
-    crate::core::fold::parity,
-    crate::core::tags::parity,
 ];
 
 /// The reply of the first module that owns `f`, or None when no module does.
@@ -166,6 +164,7 @@ pub fn serve() -> i32 {
 
 // ---------------------------------------------------------------- value encoding
 
+#[cfg(test)]
 impl Call {
     /// Argument `i`, or keyword `name` when fewer positional arguments came.
     pub fn arg(&self, i: usize, name: &str) -> Option<&Value> {
@@ -323,12 +322,12 @@ mod tests {
     #[test]
     fn reply_line_shapes() {
         assert_eq!(
-            reply_line(r#"{"fn": "core.fold.fold", "args": ["Đorđ"]}"#),
-            r#"{"ok":"dord"}"#
+            reply_line(r#"{"fn": "py.str.lower", "args": ["ĐORĐ"]}"#),
+            r#"{"ok":"đorđ"}"#
         );
         assert_eq!(
-            reply_line(r#"{"fn": "core.tags.validate_kind", "args": ["note"]}"#),
-            r#"{"err":"ValueError: Invalid kind 'note'; expected one of fact, decision, learning, episode, task, handoff"}"#
+            reply_line(r#"{"fn": "core.item.validate_as_of", "args": ["0000-01-01"]}"#),
+            r#"{"err":"ValueError: Invalid ISO 8601 timestamp '0000-01-01', for example 2026-11-21T09:30:00Z"}"#
         );
         assert_eq!(
             reply_line(r#"{"fn": "nope.x", "args": []}"#),

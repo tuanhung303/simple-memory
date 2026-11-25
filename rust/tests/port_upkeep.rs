@@ -12,7 +12,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use common::sm;
 use simple_memory::core::dedup::{idf, near_duplicate_score, normalize_title, word_overlap};
 use simple_memory::core::item::{Item, epoch_to_as_of};
-use simple_memory::error::SmError;
 use simple_memory::store::connect::connect;
 use simple_memory::store::items::{get_item, put_item};
 
@@ -60,7 +59,7 @@ fn normalize_title_and_near_duplicate_rules() {
     );
     assert_eq!(normalize_title(Some("!!! --- ")), "");
     let n = 1000;
-    let df = |t: &str| -> Result<f64, SmError> {
+    let df = |t: &str| -> f64 {
         let d = match t {
             "x1" | "x2" | "x3" => 20,
             "rare10" => 10,
@@ -70,35 +69,29 @@ fn normalize_title_and_near_duplicate_rules() {
         };
         idf(d, n)
     };
-    let theta = idf(11, n).unwrap(); // a token in 10 or fewer titles is rare
+    let theta = idf(11, n); // a token in 10 or fewer titles is rare
     let shared = ["x1", "x2", "x3"];
     let with = |extra: &'static str| -> Vec<&'static str> {
         shared.iter().copied().chain([extra]).collect()
     };
     // by hand: idf(20) = ln(1 + 1000/20.5) = 3.908, idf(11) = 4.477, so cosine = 0.834
-    let score = near_duplicate_score(&shared, &with("df11"), df, theta)
-        .unwrap()
-        .expect("a score");
+    let score = near_duplicate_score(&shared, &with("df11"), df, theta).expect("a score");
     assert_eq!((score * 1000.0).round() as i64, 834);
     // idf(10) = 4.566 > theta: cosine 0.829 clears 0.8, but the one-sided rare token vetoes it
     assert_eq!(
-        near_duplicate_score(&shared, &with("rare10"), df, theta).unwrap(),
+        near_duplicate_score(&shared, &with("rare10"), df, theta),
         None
     );
     // one shared token is noise, whatever the cosine
     assert_eq!(
-        near_duplicate_score(&["x1", "common"], &["x1"], df, theta).unwrap(),
+        near_duplicate_score(&["x1", "common"], &["x1"], df, theta),
         None
     );
     // two shared tokens plus one common word (idf 1.252): sqrt(30.54 / (30.54 + 1.57)) = 0.975
-    assert!(
-        near_duplicate_score(&["x1", "x2"], &["x1", "x2", "common"], df, theta)
-            .unwrap()
-            .is_some()
-    );
+    assert!(near_duplicate_score(&["x1", "x2"], &["x1", "x2", "common"], df, theta).is_some());
     // x3 and df11 on one side only: sqrt(30.54 / (30.54 + 15.27 + 20.05)) = 0.681, under 0.8
     assert_eq!(
-        near_duplicate_score(&["x1", "x2"], &["x1", "x2", "x3", "df11"], df, theta).unwrap(),
+        near_duplicate_score(&["x1", "x2"], &["x1", "x2", "x3", "df11"], df, theta),
         None
     );
 }

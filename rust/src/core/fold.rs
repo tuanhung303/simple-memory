@@ -5,8 +5,6 @@
 use unicode_normalization::UnicodeNormalization;
 use unicode_normalization::char::canonical_combining_class;
 
-#[cfg(any(test, feature = "parity"))]
-use crate::parity::{Call, Reply};
 use crate::py::str::lower;
 
 /// `fold(text)`; None and "" give "".
@@ -29,15 +27,6 @@ pub fn has_accents(text: Option<&str>) -> bool {
     };
     text.nfd()
         .any(|c| c == 'đ' || c == 'Đ' || canonical_combining_class(c) != 0)
-}
-
-#[cfg(any(test, feature = "parity"))]
-pub fn parity(f: &str, call: &Call) -> Option<Reply> {
-    Some(match f {
-        "core.fold.fold" => call.opt_str(0, "text").map(|t| fold(t).into()),
-        "core.fold.has_accents" => call.opt_str(0, "text").map(|t| has_accents(t).into()),
-        _ => return None,
-    })
 }
 
 #[cfg(test)]

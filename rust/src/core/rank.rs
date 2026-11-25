@@ -6,7 +6,9 @@ use crate::core::fold::{fold, has_accents};
 use crate::core::item::{Item, parse_as_of_epoch};
 use crate::core::refs::{RefsArg, extract_refs, split_refs};
 use crate::core::tags::{VALID_KINDS, VALID_TAGS};
-use crate::core::terms::{Aliases, expand_aliases, search_word_literal, stands_as_word, word_runs};
+use crate::core::terms::{
+    Aliases, expand_aliases, folded_words, search_word_literal, stands_as_word, word_runs,
+};
 use crate::error::SmError;
 use crate::py;
 
@@ -338,11 +340,7 @@ pub fn term_alias_targets(
         if exps.is_empty() {
             continue;
         }
-        let key_folded = fold(Some(py::str::strip(&entry.0)));
-        let key_words: Vec<String> = word_runs(&key_folded)
-            .into_iter()
-            .map(String::from)
-            .collect();
+        let key_words: Vec<String> = folded_words(py::str::strip(&entry.0));
         let mut target_words: Vec<String> = Vec::new();
         for exp in exps {
             let exp_folded = fold(Some(&exp));
@@ -368,11 +366,10 @@ pub fn term_alias_targets(
 }
 
 fn haystack_words(item: &Item) -> Vec<String> {
-    let text = fold(Some(&format!(
+    folded_words(&format!(
         "{} {} {} {}",
         item.refs, item.title, item.tags, item.body
-    )));
-    word_runs(&text).into_iter().map(String::from).collect()
+    ))
 }
 
 fn simple_word_matches(qw: &str, haystack: &[&str]) -> bool {
@@ -472,21 +469,13 @@ fn alias_word_groups(
     let mut groups = Vec::new();
     for entry in aliases.into_iter().flatten() {
         let exps = expand_aliases(query, Some(&vec![entry.clone()]))?;
-        let key_words: Vec<String> = word_runs(&fold(Some(py::str::strip(&entry.0))))
-            .into_iter()
-            .map(String::from)
-            .collect();
+        let key_words: Vec<String> = folded_words(py::str::strip(&entry.0));
         if !key_words.iter().all(|w| q_words.contains(w)) {
             continue;
         }
         let targets: Vec<Vec<String>> = exps
             .iter()
-            .map(|e| {
-                word_runs(&fold(Some(e)))
-                    .into_iter()
-                    .map(String::from)
-                    .collect::<Vec<_>>()
-            })
+            .map(|e| folded_words::<Vec<String>>(e))
             .filter(|t| !t.is_empty())
             .collect();
         groups.push((key_words, targets));
@@ -836,14 +825,14 @@ fn find_earliest_match_span(
         return None;
     }
     let check_tok = |tok: &str| -> bool {
-        let t_fold = fold(Some(tok));
         if !folded_terms.is_empty() {
-            let runs: Vec<String> = word_runs(&t_fold).into_iter().map(String::from).collect();
+            let runs: Vec<String> = folded_words(tok);
             if folded_terms.iter().any(|term| word_matches(term, &runs)) {
                 return true;
             }
         }
         if !folded_refs.is_empty() {
+            let t_fold = fold(Some(tok));
             let trimmed = t_fold.trim_matches(|c| {
                 matches!(
                     c,

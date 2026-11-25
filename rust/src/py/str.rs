@@ -31,21 +31,9 @@ pub fn isspace(c: char) -> bool {
     in_ranges(tables::ISSPACE, c)
 }
 
-/// `c.isdigit()`.
-#[cfg(any(test, feature = "parity"))]
-pub fn isdigit(c: char) -> bool {
-    in_ranges(tables::ISDIGIT, c)
-}
-
 /// `c.isdecimal()`.
 pub fn isdecimal(c: char) -> bool {
     in_ranges(tables::ISDECIMAL, c)
-}
-
-/// `c.isalnum()`.
-#[cfg(any(test, feature = "parity"))]
-pub fn isalnum(c: char) -> bool {
-    in_ranges(tables::ISALNUM, c)
 }
 
 /// `c.isalpha()`.
@@ -104,12 +92,6 @@ pub fn rstrip(s: &str) -> &str {
 /// `s.strip(chars)`.
 pub fn strip_chars<'a>(s: &'a str, chars: &str) -> &'a str {
     s.trim_matches(|c| chars.contains(c))
-}
-
-/// `s.lstrip(chars)`.
-#[cfg(any(test, feature = "parity"))]
-pub fn lstrip_chars<'a>(s: &'a str, chars: &str) -> &'a str {
-    s.trim_start_matches(|c| chars.contains(c))
 }
 
 /// `s.rstrip(chars)`.
@@ -1075,7 +1057,7 @@ impl PyRegex {
     }
 
     /// `pattern.split(text)` for a pattern with no groups (a group's text would join the list).
-    #[cfg(any(test, feature = "parity"))]
+    #[cfg(test)]
     pub fn split<'t>(&self, text: &'t str) -> Result<Vec<&'t str>, SmError> {
         let groups = self.re.captures_len() - 1 - usize::from(self.trail.is_some());
         if groups > 0 {
@@ -1104,107 +1086,14 @@ fn arg_str(call: &Call, i: usize) -> Result<&str, SmError> {
         .ok_or_else(|| SmError::type_(format!("parity: argument {i} must be a str")))
 }
 
-#[cfg(any(test, feature = "parity"))]
-fn arg_opt_usize(call: &Call, i: usize) -> Option<usize> {
-    call.args
-        .get(i)
-        .and_then(|v| v.as_i64())
-        .and_then(|n| usize::try_from(n).ok())
-}
-
-#[cfg(any(test, feature = "parity"))]
-fn strs(v: Vec<&str>) -> serde_json::Value {
-    serde_json::Value::from(v.into_iter().map(String::from).collect::<Vec<_>>())
-}
-
-#[cfg(any(test, feature = "parity"))]
-fn cached_regex(pat: &str) -> Result<PyRegex, SmError> {
-    thread_local! {
-        static CACHE: std::cell::RefCell<std::collections::HashMap<String, PyRegex>> = Default::default();
-    }
-    CACHE.with(|c| {
-        let mut c = c.borrow_mut();
-        if let Some(r) = c.get(pat) {
-            return Ok(r.clone());
-        }
-        let r = PyRegex::new(pat)?;
-        c.insert(pat.to_string(), r.clone());
-        Ok(r)
-    })
-}
-
 /// Parity names `py.str.<method>`: the receiver is args[0], as in `str.<method>(s, ...)`.
 #[cfg(any(test, feature = "parity"))]
 pub fn parity(f: &str, call: &Call) -> Option<Reply> {
     use serde_json::Value;
-    let pred = |p: fn(char) -> bool| -> Reply { Ok(Value::Bool(all_chars(arg_str(call, 0)?, p))) };
     Some(match f {
-        "py.str.isspace" => pred(isspace),
-        "py.str.isdigit" => pred(isdigit),
-        "py.str.isdecimal" => pred(isdecimal),
-        "py.str.isalnum" => pred(isalnum),
-        "py.str.isalpha" => pred(isalpha),
-        "py.str.isprintable" => arg_str(call, 0).map(|s| Value::Bool(s.chars().all(isprintable))),
         "py.str.lower" => arg_str(call, 0).map(|s| Value::from(lower(s))),
         "py.str.repr" => arg_str(call, 0).map(|s| Value::from(repr(s))),
-        "py.str.strip" | "py.str.lstrip" | "py.str.rstrip" => (|| {
-            let s = arg_str(call, 0)?;
-            let chars = call.args.get(1).and_then(|v| v.as_str());
-            Ok(Value::from(match (f, chars) {
-                ("py.str.strip", None) => strip(s),
-                ("py.str.lstrip", None) => lstrip(s),
-                ("py.str.rstrip", None) => rstrip(s),
-                ("py.str.strip", Some(c)) => strip_chars(s, c),
-                ("py.str.lstrip", Some(c)) => lstrip_chars(s, c),
-                (_, Some(c)) => rstrip_chars(s, c),
-                _ => unreachable!(),
-            }))
-        })(),
-        "py.str.split" => (|| {
-            let s = arg_str(call, 0)?;
-            let max = arg_opt_usize(call, 2);
-            match call.args.get(1).and_then(|v| v.as_str()) {
-                None => Ok(strs(split_ws(s, max))),
-                Some(sep) => split_sep(s, sep, max).map(strs),
-            }
-        })(),
-        "py.str.splitlines" => (|| {
-            let s = arg_str(call, 0)?;
-            let keep = call.args.get(1).and_then(|v| v.as_bool()).unwrap_or(false);
-            Ok(strs(splitlines(s, keep)))
-        })(),
         "py.str.len" => arg_str(call, 0).map(|s| Value::from(len(s))),
-        // `[m.group(0) for m in re.finditer(pattern, s)]`, `re.sub(pattern, lambda m: repl, s)`
-        // and `re.split(pattern, s)`, with the pattern through `PyRegex`.
-        "py.str.re_findall" | "py.str.re_sub" | "py.str.re_split" => (|| {
-            let re = cached_regex(arg_str(call, 0)?)?;
-            let s = arg_str(call, 1)?;
-            Ok(match f {
-                "py.str.re_findall" => strs(re.finditer(s).iter().map(|m| m.as_str()).collect()),
-                "py.str.re_sub" => Value::from(re.sub(s, arg_str(call, 2)?, 0)),
-                _ => strs(re.split(s)?),
-            })
-        })(),
-        // `[m.group(0) for m in re.finditer(re.escape(lit), s, re.I)]`.
-        "py.str.ci_literal_findall" => (|| {
-            let re = cached_regex(&ci_literal(arg_str(call, 0)?))?;
-            Ok(strs(
-                re.finditer(arg_str(call, 1)?)
-                    .iter()
-                    .map(|m| m.as_str())
-                    .collect(),
-            ))
-        })(),
-        // `[m.group(0) for m in re.finditer("[" + "".join(map(re.escape, members)) + "]", s, re.I)]`.
-        "py.str.ci_class_findall" => (|| {
-            let re = cached_regex(&ci_class(arg_str(call, 0)?.chars()))?;
-            Ok(strs(
-                re.finditer(arg_str(call, 1)?)
-                    .iter()
-                    .map(|m| m.as_str())
-                    .collect(),
-            ))
-        })(),
         _ => return None,
     })
 }
