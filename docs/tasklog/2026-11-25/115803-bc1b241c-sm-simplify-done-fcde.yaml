@@ -1,0 +1,32 @@
+id: 20261125-115803-bc1b241c-sm-simplify-done-fcde
+title: 'Simplify sm modules and fix open bugs E1/E2: done'
+state: done
+repo: simple-memory
+superproject: null
+session: bc1b241c-b53b-4b86-bab0-fb58d54351d9
+as_of: 2026-11-25T11:58+07:00
+commits: []
+wip_branch: null
+continues: 20261125-093226-bc1b241c-sm-simplify-24d2
+superseded_by: null
+handoff: null
+wip_dir: null
+results:
+- 21 simplification items, sm import legacy removed, redact ASCII-only, bugs E1(a)(c)(d)
+  and E2 fixed; rei-reviewer PASS on 2c4427e..abaa568; 10 fix rows closed in abaa568..4de9e4f
+- 'rust/src vs 2c4427e: 39 files, +776/-3901; full cargo test 1056 passed; clippy
+  default and parity clean; dead_code_scan 0'
+- New sm installed at ~/.local/share/simple-memory-rs/bin/sm (via ~/.local/bin/sm
+  symlink); old binary backed up at ~/.local/bin/sm.bak-20261125
+directions:
+- Never run cargo fmt here (crate not fmt-clean); use rustfmt --edition 2024 <file>
+- hook_catchup and redaction timing tests fail under heavy load at base too; re-run
+  alone before calling a regression
+open:
+- rust/tools/gen_pytables.py is not in the repo; tables.rs header notes that a regeneration
+  must drop ISDIGIT/ISALNUM
+- 'Dead SubprocessError checks at service/recall.rs (2) and service/capture.rs (1):
+  no code builds that class'
+- cli/backup.rs now names a non-dict section's real type instead of 'NoneType'; not
+  checked whether load_config can return one
+next: null
