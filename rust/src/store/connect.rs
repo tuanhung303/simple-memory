@@ -107,17 +107,8 @@ pub fn execute_waiting_for_lock(
     sql: &str,
     deadline: Option<Instant>,
 ) -> Result<(), SmError> {
-    execute_waiting_capped(conn, sql, deadline, WRITE_LOCK_WAIT_S)
-}
-
-fn execute_waiting_capped(
-    conn: &Connection,
-    sql: &str,
-    deadline: Option<Instant>,
-    cap_s: f64,
-) -> Result<(), SmError> {
     let start = Instant::now();
-    let capped = start + Duration::from_secs_f64(cap_s);
+    let capped = start + Duration::from_secs_f64(WRITE_LOCK_WAIT_S);
     let until = match deadline {
         Some(d) if d < capped => d,
         _ => capped,
@@ -167,19 +158,10 @@ pub fn transaction<T>(
     deadline: Option<Instant>,
     f: impl FnOnce(&Connection) -> Result<T, SmError>,
 ) -> Result<T, SmError> {
-    transaction_capped(conn, deadline, WRITE_LOCK_WAIT_S, f)
-}
-
-fn transaction_capped<T>(
-    conn: &Connection,
-    deadline: Option<Instant>,
-    cap_s: f64,
-    f: impl FnOnce(&Connection) -> Result<T, SmError>,
-) -> Result<T, SmError> {
     if !conn.is_autocommit() {
         return f(conn);
     }
-    execute_waiting_capped(conn, "BEGIN IMMEDIATE", deadline, cap_s)?;
+    execute_waiting_for_lock(conn, "BEGIN IMMEDIATE", deadline)?;
     match f(conn) {
         Ok(v) => {
             execute(conn, "COMMIT").map_err(|e| {
@@ -207,16 +189,7 @@ fn user_version(conn: &Connection) -> Result<i64, SmError> {
 }
 
 /// `apply_migrations(conn, deadline=...)`: the user_version after every newer migration ran.
-#[cfg(test)]
-pub fn apply_migrations(conn: &Connection, deadline: Option<Instant>) -> Result<i64, SmError> {
-    apply_migrations_capped(conn, deadline, WRITE_LOCK_WAIT_S)
-}
-
-fn apply_migrations_capped(
-    conn: &Connection,
-    deadline: Option<Instant>,
-    cap_s: f64,
-) -> Result<i64, SmError> {
+fn apply_migrations(conn: &Connection, deadline: Option<Instant>) -> Result<i64, SmError> {
     let Some(&(latest, _)) = MIGRATIONS.last() else {
         return Ok(0);
     };
@@ -224,17 +197,13 @@ fn apply_migrations_capped(
     if current >= latest {
         return Ok(current);
     }
-    migrate_under_lock(conn, deadline, cap_s)
+    migrate_under_lock(conn, deadline)
 }
 
 /// The locked half of `apply_migrations`: the version is read again after
 /// BEGIN IMMEDIATE, since another process may have migrated between the unlocked read and the lock.
-fn migrate_under_lock(
-    conn: &Connection,
-    deadline: Option<Instant>,
-    cap_s: f64,
-) -> Result<i64, SmError> {
-    transaction_capped(conn, deadline, cap_s, |conn| {
+fn migrate_under_lock(conn: &Connection, deadline: Option<Instant>) -> Result<i64, SmError> {
+    transaction(conn, deadline, |conn| {
         let mut current = user_version(conn)?;
         for &(version, sql) in MIGRATIONS {
             if version <= current {
@@ -325,14 +294,6 @@ impl std::error::Error for Raised {}
 
 /// `connect(db_path, deadline=...)`: the store in WAL mode with every migration applied.
 pub fn connect(db_path: &str, deadline: Option<Instant>) -> Result<Connection, SmError> {
-    connect_capped(db_path, deadline, WRITE_LOCK_WAIT_S)
-}
-
-fn connect_capped(
-    db_path: &str,
-    deadline: Option<Instant>,
-    cap_s: f64,
-) -> Result<Connection, SmError> {
     // `str(db_path)`: a str goes to sqlite as given (no expanduser), only the parent folder is made.
     let target = db_path;
     if target != ":memory:" && !target.starts_with("file:") {
@@ -355,9 +316,9 @@ fn connect_capped(
         register_fold(&conn)?;
         register_word(&conn)?;
         register_epoch(&conn)?;
-        execute_waiting_capped(&conn, "PRAGMA journal_mode = WAL", deadline, cap_s)?;
+        execute_waiting_for_lock(&conn, "PRAGMA journal_mode = WAL", deadline)?;
         execute(&conn, "PRAGMA foreign_keys = ON")?;
-        apply_migrations_capped(&conn, deadline, cap_s)?;
+        apply_migrations(&conn, deadline)?;
         Ok(conn)
     })();
     // A file SQLite cannot open, write or read as a database: say which file.
@@ -475,10 +436,7 @@ mod tests {
                 [],
             )
             .unwrap();
-        assert_eq!(
-            migrate_under_lock(&loser, None, WRITE_LOCK_WAIT_S).unwrap(),
-            3
-        );
+        assert_eq!(migrate_under_lock(&loser, None).unwrap(), 3);
         assert!(loser.is_autocommit());
         assert_eq!(
             loser
@@ -569,7 +527,7 @@ mod tests {
     }
 
     #[test]
-    fn transaction_gives_up_on_a_held_write_lock_after_the_cap() {
+    fn transaction_gives_up_on_a_held_write_lock_at_the_deadline() {
         let d = tempfile::tempdir().unwrap();
         let db = d.path().join("lock.db").to_string_lossy().into_owned();
         let conn = connect(&db, None).unwrap();
@@ -578,20 +536,22 @@ mod tests {
         rx.recv().unwrap();
         let reference = busy_reference(&db, 1000);
         let started = Instant::now();
-        let err = transaction_capped(&conn, None, 1.0, |_| Ok(())).unwrap_err();
+        let err =
+            transaction(&conn, Some(started + Duration::from_secs(1)), |_| Ok(())).unwrap_err();
         let waited = started.elapsed().as_secs_f64();
         let reference = reference.join().unwrap();
         assert_eq!(
             err.python_text(),
             "OperationalError: database is locked: another sm process holds the write lock (waited 1 s); try again"
         );
-        // Python bounds 0.9 <= waited < 2.0, the 1 s cap plus 1 s, on a host where 1 s of busy
-        // handler takes 1 s.
+        // Python bounds 0.9 <= waited < 2.0, the 1 s deadline plus 1 s, on a host where 1 s of
+        // busy handler takes 1 s.
         assert!(
             (0.9..reference + 1.0).contains(&waited),
             "{waited} {reference}"
         );
-        assert_eq!(pragma(&conn, "busy_timeout"), "5000");
+        // Restored to busy_ms of the passed deadline; the last try set it to 1.
+        assert_eq!(pragma(&conn, "busy_timeout"), "0");
         h.join().unwrap();
     }
 
@@ -648,7 +608,10 @@ mod tests {
         let (h, rx) = hold_lock(&db, 0.5);
         rx.recv().unwrap();
         let started = Instant::now();
-        transaction_capped(&conn, None, 3.0, |c| Ok(execute(c, "CREATE TABLE t (x)")?)).unwrap();
+        transaction(&conn, Some(started + Duration::from_secs(3)), |c| {
+            Ok(execute(c, "CREATE TABLE t (x)")?)
+        })
+        .unwrap();
         let waited = started.elapsed().as_secs_f64();
         assert!((0.4..2.0).contains(&waited), "{waited}");
         h.join().unwrap();
