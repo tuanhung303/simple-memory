@@ -12,7 +12,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use common::sm;
 use simple_memory::core::dedup::{idf, near_duplicate_score, normalize_title, word_overlap};
 use simple_memory::core::item::{Item, epoch_to_as_of};
-use simple_memory::error::SmError;
 use simple_memory::store::connect::connect;
 use simple_memory::store::items::{get_item, put_item};
 
