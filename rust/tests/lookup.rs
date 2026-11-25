@@ -564,7 +564,7 @@ fn query_with_no_hit_in_scope_prints_only_where_the_matches_are() {
         o.lines(),
         [
             "more: other repos b=1 -> sm query \"another\" --all",
-            "missing: another: 1 in other repos -> sm query \"another\" --all"
+            "missing: another: 1 in other repos"
         ]
     );
     assert_eq!(
