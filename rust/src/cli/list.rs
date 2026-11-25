@@ -6,7 +6,7 @@ use crate::cli::query::{
     HEADER_REFS_CHARS, HOOK_TITLE_CHARS, MAX_TOTAL_CHARS, MIN_TEXT_CHARS, compact_refs,
     refs_without_source, shlex_quote, status_marker,
 };
-use crate::core::rank::match_snippet;
+use crate::core::rank::{clip, match_snippet};
 use crate::error::SmError;
 use crate::py;
 use crate::py::argparse::{Namespace, Value};
@@ -119,17 +119,7 @@ pub fn format_list_brief(page: &ListPage, footer: &[String]) -> String {
     let mut lines: Vec<String> = Vec::new();
     for (i, it) in page.items.iter().enumerate() {
         let rank = page.offset as i128 + i as i128 + 1;
-        let mut title = py::str::split(&it.title).join(" ");
-        if py::str::len(&title) > HOOK_TITLE_CHARS {
-            title = format!(
-                "{}...",
-                py::str::rstrip(py::str::slice(
-                    &title,
-                    None,
-                    Some(HOOK_TITLE_CHARS as isize - 3)
-                ))
-            );
-        }
+        let title = clip(&py::str::split(&it.title).join(" "), HOOK_TITLE_CHARS);
         let marker = status_marker(it).map_or_else(String::new, |m| format!(" [{m}]"));
         lines.push(format!(
             "[{}] #{rank} {} {} {} {} ~{} tok{marker}: {title}",

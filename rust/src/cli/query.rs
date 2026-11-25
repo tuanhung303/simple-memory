@@ -3,7 +3,7 @@
 
 use std::collections::BTreeSet;
 
-use crate::core::rank::{Why, match_snippet};
+use crate::core::rank::{Why, clip, match_snippet};
 use crate::core::tags::retired_label;
 use crate::error::SmError;
 use crate::py;
@@ -426,17 +426,7 @@ pub fn format_query_brief(lk: &Lookup, footer: &[String]) -> String {
     let mut lines: Vec<String> = Vec::new();
     for (i, s) in lk.hits.iter().enumerate() {
         let it = &s.item;
-        let mut title = py::str::split(&it.title).join(" ");
-        if py::str::len(&title) > HOOK_TITLE_CHARS {
-            title = format!(
-                "{}...",
-                py::str::rstrip(py::str::slice(
-                    &title,
-                    None,
-                    Some(HOOK_TITLE_CHARS as isize - 3)
-                ))
-            );
-        }
+        let title = clip(&py::str::split(&it.title).join(" "), HOOK_TITLE_CHARS);
         let marker = status_marker(it).map_or_else(String::new, |m| format!(" [{m}]"));
         lines.push(format!(
             "[{}] #{} {} {} {} {} ~{} tok{marker}: {title}",
@@ -694,6 +684,17 @@ mod tests {
         assert!(format_query_text(&lookup(vec![manual]), &[]).contains("retired: manual"));
         gone.item.superseded_by = Some("m_5".into());
         assert!(format_query_text(&lookup(vec![gone]), &[]).contains("superseded_by=m_5"));
+    }
+
+    #[test]
+    fn clip_keeps_short_text_and_cuts_on_chars() {
+        assert_eq!(clip("abc", 5), "abc");
+        // exactly at the cap: no "..."
+        assert_eq!(clip("abcde", 5), "abcde");
+        // 17 chars, cap 10: the first 7 chars, then "..."
+        assert_eq!(clip("Tiếng Việt có dấu", 10), "Tiếng V...");
+        // cap 9: the first 6 chars "Tiếng " lose the trailing space
+        assert_eq!(clip("Tiếng Việt có dấu", 9), "Tiếng...");
     }
 
     #[test]

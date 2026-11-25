@@ -2,6 +2,7 @@
 
 use crate::cli::query::{HEADER_REFS_CHARS, HOOK_TITLE_CHARS, compact_refs};
 use crate::core::item::Item;
+use crate::core::rank::clip;
 use crate::error::SmError;
 use crate::py;
 use crate::py::argparse::Namespace;
@@ -53,18 +54,7 @@ pub fn format_related(target: &Item, related: &[Related], skipped: &[String], fm
             parts.push(format!("status={}", it.status));
         }
         let text = item_text(it);
-        let snippet = if py::str::len(&text) <= RELATED_SNIPPET_CHARS {
-            text
-        } else {
-            format!(
-                "{}...",
-                py::str::rstrip(py::str::slice(
-                    &text,
-                    None,
-                    Some(RELATED_SNIPPET_CHARS as isize - 3)
-                ))
-            )
-        };
+        let snippet = clip(&text, RELATED_SNIPPET_CHARS);
         lines.push(parts.join(" "));
         lines.push(format!("  {snippet}"));
     }

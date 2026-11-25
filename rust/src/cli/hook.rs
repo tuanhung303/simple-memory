@@ -6,6 +6,7 @@ use crate::cli::query::{
     HOOK_REFS_CHARS, HOOK_TITLE_CHARS, compact_refs, refs_without_source, shlex_quote,
 };
 use crate::config::load_config;
+use crate::core::rank::clip;
 use crate::core::item::Item;
 use crate::error::SmError;
 use crate::py;
@@ -19,17 +20,7 @@ use crate::service::recall::{Runner, run_prompt_hook, subprocess_run};
 pub fn format_recall_lines(items: &[Item]) -> String {
     let mut lines = Vec::new();
     for it in items {
-        let mut title = py::str::split(&it.title).join(" ");
-        if py::str::len(&title) > HOOK_TITLE_CHARS {
-            title = format!(
-                "{}...",
-                py::str::rstrip(py::str::slice(
-                    &title,
-                    None,
-                    Some(HOOK_TITLE_CHARS as isize - 3)
-                ))
-            );
-        }
+        let title = clip(&py::str::split(&it.title).join(" "), HOOK_TITLE_CHARS);
         let refs = refs_without_source(it);
         let refs_part = if refs.is_empty() {
             String::new()

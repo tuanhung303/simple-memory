@@ -904,6 +904,18 @@ fn snap_win_start(chars: &[char], win_start: usize, start_char: usize) -> usize 
     }
 }
 
+/// `text` when it fits in `cap` characters, else its first `cap - 3` characters, right-trimmed,
+/// plus `...`.
+pub fn clip(text: &str, cap: usize) -> String {
+    if py::str::len(text) <= cap {
+        return text.to_string();
+    }
+    format!(
+        "{}...",
+        py::str::rstrip(py::str::slice(text, None, Some(cap as isize - 3)))
+    )
+}
+
 /// Build a snippet of at most `cap` characters, centering on the earliest matched term or ref
 /// when it falls past the prefix cut; short and front matches keep the prefix cut.
 pub fn match_snippet(text: &str, terms: &[String], ref_hits: &[String], cap: usize) -> String {
@@ -914,12 +926,7 @@ pub fn match_snippet(text: &str, terms: &[String], ref_hits: &[String], cap: usi
     if cap <= 3 {
         return py::str::slice(text, None, Some(cap as isize)).to_string();
     }
-    let prefix_cut = || {
-        format!(
-            "{}...",
-            py::str::rstrip(py::str::slice(text, None, Some((cap - 3) as isize)))
-        )
-    };
+    let prefix_cut = || clip(text, cap);
     if cap <= 6 {
         return prefix_cut();
     }
