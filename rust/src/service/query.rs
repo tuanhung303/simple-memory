@@ -697,6 +697,31 @@ fn other_repos(
 }
 
 /// `run_lookup`: `run_query` plus why per hit and the footer counts.
+/// A query token cut to the identifier it holds: the punctuation around it goes (`(ticket-x9)`
+/// gives `ticket-x9`), but a bracket that pairs with one inside it stays (`e1(c)`, `[a]b`).
+fn identifier_term(tok: &str) -> &str {
+    const PAIRS: [(char, char); 3] = [('(', ')'), ('[', ']'), ('{', '}')];
+    let not_word = |c: char| !py::str::is_word(c);
+    let mut lo = tok.len() - tok.trim_start_matches(not_word).len();
+    let mut hi = tok.trim_end_matches(not_word).len();
+    // openers minus closers of one pair
+    let open =
+        |s: &str, (o, c): (char, char)| s.matches(o).count() as i64 - s.matches(c).count() as i64;
+    while let Some(ch) = tok[hi..].chars().next() {
+        match PAIRS.iter().find(|p| p.1 == ch) {
+            Some(&p) if open(&tok[lo..hi], p) > 0 => hi += ch.len_utf8(),
+            _ => break,
+        }
+    }
+    while let Some(ch) = tok[..lo].chars().next_back() {
+        match PAIRS.iter().find(|p| p.0 == ch) {
+            Some(&p) if open(&tok[lo..hi], p) < 0 => lo -= ch.len_utf8(),
+            _ => break,
+        }
+    }
+    &tok[lo..hi]
+}
+
 pub fn run_lookup(query_text: &str, a: &QueryArgs) -> Result<Lookup, SmError> {
     let (filters, bias_list, scope_biases, cfg) = prepare(a, None)?;
     let ka = keyword_aliases(&cfg);
@@ -759,9 +784,7 @@ pub fn run_lookup(query_text: &str, a: &QueryArgs) -> Result<Lookup, SmError> {
         let t = match pieces[..] {
             [] => continue,
             [p] if lacks(p) => p,
-            [_, _, ..] if pieces.iter().any(|p| lacks(p)) => {
-                tok.trim_matches(|c| !py::str::is_word(c))
-            }
+            [_, _, ..] if pieces.iter().any(|p| lacks(p)) => identifier_term(tok),
             _ => continue,
         };
         if !footer_terms.iter().any(|f| f == t) {
@@ -958,7 +981,13 @@ pub fn lookup_json(lk: &Lookup) -> Value {
         "missing": lk.missing.iter().map(|(t, n)| {
             let mut entry = json!({"term": t, "in_scope": n});
             match lk.hidden.get(t) {
-                Some(h) if h.other_repos => entry["in_other_repos"] = json!(h.n),
+                Some(h) if h.other_repos => {
+                    entry["in_other_repos"] = json!(h.n);
+                    // as the text footer: what hid them besides the repo scope
+                    if h.retired || h.filtered {
+                        entry["hidden_by"] = json!(h.by);
+                    }
+                }
                 Some(h) => {
                     entry["hidden"] = json!(h.n);
                     entry["hidden_by"] = json!(h.by);

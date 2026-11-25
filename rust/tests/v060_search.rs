@@ -1913,6 +1913,46 @@ fn missing_names_a_term_that_only_other_repos_hold_after_the_other_repos_line() 
             {"term": "webhook", "in_scope": 0, "in_other_repos": 2}
         ])
     );
+    // as the text line: what hid them besides the repo scope, a filter or the status
+    let missing = |args: &[&str]| -> Value {
+        serde_json::from_str::<Value>(&q(args)).unwrap()["missing"].clone()
+    };
+    assert_eq!(
+        missing(&[
+            "stripe", "--repo", "etl", "--kind", "decision", "--format", "json"
+        ]),
+        json!([{"term": "stripe", "in_scope": 0, "in_other_repos": 2,
+                "hidden_by": "outside --kind decision, in other repos"}])
+    );
+    assert_eq!(
+        missing(&["fivetran", "--repo", "billing", "--format", "json"]),
+        json!([{"term": "fivetran", "in_scope": 0, "in_other_repos": 1,
+                "hidden_by": "retired or superseded, in other repos"}])
+    );
+}
+
+#[test]
+fn missing_keeps_the_history_command_of_a_whole_query_term_retired_in_scope() {
+    let (_d, home, _) = etl_store();
+    put_item_cli(
+        &home,
+        &[
+            "--kind",
+            "fact",
+            "--tag",
+            "verified",
+            "--repo",
+            "billing",
+            "--",
+            "Fivetran syncs the invoices",
+        ],
+    );
+    // the more: line names the other repo; the retired copy in scope keeps its own command (E2)
+    assert_eq!(
+        query_ok(&home, &["fivetran", "--repo", "etl"]),
+        "more: other repos billing=1 -> sm query \"fivetran\" --all\n\
+         missing: fivetran: 1 retired or superseded -> sm query \"fivetran\" --repo etl --include-history\n"
+    );
 }
 
 #[test]
@@ -1936,6 +1976,10 @@ fn missing_keeps_an_identifier_from_the_query_as_one_term() {
         missing,
         ["missing: blast-radius: 1 in other repos -> sm query \"blast-radius\" --all; ticket-x9=0"]
     );
+    // a bracket the identifier opens stays; the punctuation around it goes
+    let out = query_ok(&home, &["e1(c) stripe [ab]cd,", "--repo", "a"]);
+    let missing: Vec<&str> = out.lines().filter(|l| l.starts_with("missing:")).collect();
+    assert_eq!(missing, ["missing: e1(c)=0; stripe=0; [ab]cd=0"]);
     // the identifier alone: the more: line holds its command, so missing does not repeat it
     assert_eq!(
         query_ok(&home, &["Blast-Radius", "--repo", "a"]),
