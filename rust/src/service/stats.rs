@@ -14,7 +14,7 @@ use crate::py::value::PyValue;
 use crate::service::backup::{auto_backups, backup_age_hours};
 use crate::service::upkeep::{STALE_DAYS, STALE_TAGS, run_stale};
 use crate::service::usage::USAGE_LOG;
-use crate::sources::{dict_get, get_attr, iterate, truthy};
+use crate::sources::{dict_get, get_attr, iterate, s, truthy, value_get};
 use crate::store::connect::connect;
 use crate::store::search::{Filters, count_scope};
 use crate::store::stats::{item_labels, store_counts};
@@ -24,363 +24,40 @@ pub const NEVER_OPENED_TOP: usize = 10;
 /// 100 years: a larger window overflows datetime.
 pub const MAX_DAYS: i64 = 36_500;
 
-// ---------------------------------------------------------------- datetime.fromisoformat
+// ---------------------------------------------------------------- timestamps
 
-/// An aware datetime: the wall fields and the UTC offset (seconds and microseconds, same sign).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Dt {
-    pub year: i32,
-    pub month: u32,
-    pub day: u32,
-    pub hour: u32,
-    pub minute: u32,
-    pub second: u32,
-    pub microsecond: u32,
-    pub off_s: i64,
-    pub off_us: i64,
-}
+/// A log row's time, with the offset it was written with.
+type Ts = chrono::DateTime<chrono::FixedOffset>;
 
-const US_PER_DAY: i128 = 86_400_000_000;
+const US_PER_DAY: i64 = 86_400_000_000;
 
-impl Dt {
-    /// The instant in microseconds since 0001-01-01 UTC, which aware datetimes compare by.
-    pub fn instant(&self) -> i128 {
-        use chrono::Datelike;
-        let date =
-            chrono::NaiveDate::from_ymd_opt(self.year, self.month, self.day).expect("a valid date");
-        let days = i128::from(date.num_days_from_ce() - 1);
-        let wall = days * US_PER_DAY
-            + i128::from(self.hour * 3600 + self.minute * 60 + self.second) * 1_000_000
-            + i128::from(self.microsecond);
-        wall - (i128::from(self.off_s) * 1_000_000 + i128::from(self.off_us))
-    }
-
-    /// The datetime at an instant, in UTC.
-    pub fn from_instant(us: i128) -> Option<Dt> {
-        let days = us.div_euclid(US_PER_DAY);
-        let rest = us.rem_euclid(US_PER_DAY);
-        let date = chrono::NaiveDate::from_num_days_from_ce_opt(i32::try_from(days + 1).ok()?)?;
-        use chrono::Datelike;
-        if !(1..=9999).contains(&date.year()) {
-            return None;
-        }
-        let secs = (rest / 1_000_000) as u32;
-        Some(Dt {
-            year: date.year(),
-            month: date.month(),
-            day: date.day(),
-            hour: secs / 3600,
-            minute: secs / 60 % 60,
-            second: secs % 60,
-            microsecond: (rest % 1_000_000) as u32,
-            off_s: 0,
-            off_us: 0,
-        })
-    }
-
-    fn wall(&self, sep: char, micro: bool) -> String {
-        let mut s = format!(
-            "{:04}-{:02}-{:02}{sep}{:02}:{:02}:{:02}",
-            self.year, self.month, self.day, self.hour, self.minute, self.second
-        );
-        if micro && self.microsecond != 0 {
-            s.push_str(&format!(".{:06}", self.microsecond));
-        }
-        s
-    }
-
-    fn offset(&self) -> String {
-        let total = i128::from(self.off_s) * 1_000_000 + i128::from(self.off_us);
-        let sign = if total < 0 { '-' } else { '+' };
-        let a = total.abs();
-        let (secs, us) = ((a / 1_000_000) as u64, (a % 1_000_000) as u64);
-        let mut s = format!("{sign}{:02}:{:02}", secs / 3600, secs / 60 % 60);
-        if secs % 60 != 0 || us != 0 {
-            s.push_str(&format!(":{:02}", secs % 60));
-            if us != 0 {
-                s.push_str(&format!(".{us:06}"));
-            }
-        }
-        s
-    }
-
-    /// `isoformat()`.
-    pub fn isoformat(&self) -> String {
-        format!("{}{}", self.wall('T', true), self.offset())
-    }
-
-    /// `isoformat(timespec="seconds")`.
-    pub fn isoformat_seconds(&self) -> String {
-        format!("{}{}", self.wall('T', false), self.offset())
-    }
-}
-
-fn digits(b: &[u8], at: usize, n: usize) -> Option<i64> {
-    let mut v = 0i64;
-    for i in 0..n {
-        let c = *b.get(at + i)?;
-        if !c.is_ascii_digit() {
-            return None;
-        }
-        v = v * 10 + i64::from(c - b'0');
-    }
-    Some(v)
-}
-
-/// `_find_isoformat_datetime_separator` (Modules/_datetimemodule.c), on the UTF-8 bytes.
-fn separator_location(b: &[u8], len: usize) -> Option<usize> {
-    if len == 7 {
-        return Some(7);
-    }
-    let at = |i: usize| b.get(i).copied().unwrap_or(0);
-    if at(4) == b'-' {
-        if at(5) == b'W' {
-            if len < 8 {
-                return None;
-            }
-            if len > 8 && at(8) == b'-' {
-                if len == 9 {
-                    return None;
-                }
-                if len > 10 && at(10).is_ascii_digit() {
-                    return Some(8);
-                }
-                return Some(10);
-            }
-            return Some(8);
-        }
-        return Some(10);
-    }
-    if at(4) == b'W' {
-        let mut idx = 7;
-        while idx < len && at(idx).is_ascii_digit() {
-            idx += 1;
-        }
-        if idx < 9 {
-            return Some(idx);
-        }
-        return Some(if idx % 2 == 0 { 7 } else { 8 });
-    }
-    Some(8)
-}
-
-/// `parse_isoformat_date` and `iso_to_ymd`: (year, month, day), unchecked except the ISO week.
-fn parse_date(b: &[u8], len: usize) -> Option<(i64, i64, i64)> {
-    let at = |i: usize| b.get(i).copied().unwrap_or(0);
-    let year = digits(b, 0, 4)?;
-    let mut p = 4;
-    let sep = at(p) == b'-';
-    if sep {
-        p += 1;
-    }
-    if at(p) == b'W' {
-        p += 1;
-        let week = digits(b, p, 2)?;
-        p += 2;
-        let day = if p < len {
-            if sep {
-                if at(p) != b'-' {
-                    return None;
-                }
-                p += 1;
-            }
-            digits(b, p, 1)?
-        } else {
-            1
-        };
-        if !(1..=9999).contains(&year) {
-            return None;
-        }
-        let jan1 = chrono::NaiveDate::from_ymd_opt(year as i32, 1, 1)?;
-        if week <= 0 || week >= 53 {
-            use chrono::Datelike;
-            let first = jan1.weekday().num_days_from_monday();
-            let leap = chrono::NaiveDate::from_ymd_opt(year as i32, 2, 29).is_some();
-            if !(week == 53 && (first == 3 || (first == 2 && leap))) {
-                return None;
-            }
-        }
-        if !(1..=7).contains(&day) {
-            return None;
-        }
-        use chrono::Datelike;
-        let jan4 = chrono::NaiveDate::from_ymd_opt(year as i32, 1, 4)?;
-        let monday =
-            jan4 - chrono::Duration::days(i64::from(jan4.weekday().num_days_from_monday()));
-        let d = monday + chrono::Duration::days((week - 1) * 7 + day - 1);
-        return Some((
-            i64::from(d.year()),
-            i64::from(d.month()),
-            i64::from(d.day()),
-        ));
-    }
-    let month = digits(b, p, 2)?;
-    p += 2;
-    if sep {
-        if at(p) != b'-' {
-            return None;
-        }
-        p += 1;
-    }
-    let day = digits(b, p, 2)?;
-    Some((year, month, day))
-}
-
-/// `parse_hh_mm_ss_ff(tstr, tstr_end)`: Ok(0) at the end of the string, Ok(1) when bytes are left.
-fn parse_hms(b: &[u8], start: usize, end: usize) -> Result<(i32, [i64; 4]), ()> {
-    let at = |i: usize| b.get(i).copied().unwrap_or(0);
-    let mut vals = [0i64; 4];
-    let mut p = start;
-    let mut has_sep = true;
-    let mut fraction = false;
-    for i in 0..3 {
-        vals[i] = digits(b, p, 2).ok_or(())?;
-        p += 2;
-        let c = at(p);
-        p += 1;
-        if i == 0 {
-            has_sep = c == b':';
-        }
-        if p >= end {
-            return Ok((i32::from(c != 0), vals));
-        } else if has_sep && c == b':' {
-            if i == 2 {
-                return Err(());
-            }
-            continue;
-        } else if c == b'.' || c == b',' {
-            if i < 2 {
-                return Err(());
-            }
-            fraction = true;
-            break;
-        } else if !has_sep {
-            p -= 1;
-        } else {
-            return Err(());
-        }
-    }
-    let _ = fraction;
-    let to_parse = (end - p).min(6);
-    let us = digits(b, p, to_parse).ok_or(())?;
-    if to_parse == 0 {
-        return Err(());
-    }
-    vals[3] = us * [100_000, 10_000, 1000, 100, 10, 1][to_parse - 1];
-    p += to_parse;
-    while at(p).is_ascii_digit() {
-        p += 1;
-    }
-    Ok((i32::from(at(p) != 0), vals))
-}
-
-/// `datetime.fromisoformat(s)` (the C implementation of Python 3.15), with a naive result as
-/// UTC (`_ts`); None for any string Python rejects.
-pub fn fromisoformat_utc(s: &str) -> Option<Dt> {
-    // Python 3.15 takes any one code point as the separator, and a non-ASCII code point anywhere
-    // else fails; one 0x80 byte per non-ASCII code point keeps byte and code point indexes equal
-    let mut b: Vec<u8> = s
-        .chars()
-        .map(|c| if c.is_ascii() { c as u8 } else { 0x80 })
-        .collect();
-    let len = b.len();
-    b.extend_from_slice(&[0; 16]);
-    let sep = separator_location(&b, len)?;
-    let (mut y, mut mo, mut d) = parse_date(&b, sep)?;
-    let (mut h, mut mi, mut se, mut us) = (0i64, 0i64, 0i64, 0i64);
-    let mut tz: Option<(i64, i64)> = None;
-    if len > sep {
-        let start = sep + 1;
-        let end = len;
-        let mut tzpos = start;
-        loop {
-            let c = b[tzpos];
-            if c == b'Z' || c == b'+' || c == b'-' {
-                break;
-            }
-            tzpos += 1;
-            if tzpos >= end {
-                break;
-            }
-        }
-        let (rv, v) = parse_hms(&b, start, tzpos).ok()?;
-        [h, mi, se, us] = v;
-        if tzpos >= end {
-            if rv == 1 && tzpos == end {
-                return None;
-            }
-            if tzpos > end {
-                return None;
-            }
-        } else if b[tzpos] == b'Z' {
-            if b[tzpos + 1] != 0 {
-                return None;
-            }
-            tz = Some((0, 0));
-        } else {
-            let sign = if b[tzpos] == b'-' { -1 } else { 1 };
-            let (rv, t) = parse_hms(&b, tzpos + 1, end).ok()?;
-            if rv != 0 {
-                return None;
-            }
-            tz = Some((sign * (t[0] * 3600 + t[1] * 60 + t[2]), sign * t[3]));
-        }
-    }
-    if h == 24 && (1..=12).contains(&mo) {
-        // the month and the top of the day range are checked first; day 0 becomes day 1
-        let dim = i64::from(crate::py::value::days_in_month(y as i32, mo as u32));
-        if d <= dim {
-            if mi != 0 || se != 0 || us != 0 {
-                return None;
-            }
-            h = 0;
-            d += 1;
-            if d > dim {
-                d = 1;
-                mo += 1;
-                if mo > 12 {
-                    mo = 1;
-                    y += 1;
-                }
-            }
-        }
-    }
-    if !(1..=9999).contains(&y) || !(1..=12).contains(&mo) {
+/// The `ts` of a log row as sm writes it: RFC 3339 (`+00:00` or `Z`, any fraction), or with no
+/// offset, read as UTC; None for any other value.
+fn ts_of(value: Option<&PyValue>) -> Option<Ts> {
+    let Some(PyValue::Str(s)) = value else {
         return None;
-    }
-    let dim = i64::from(crate::py::value::days_in_month(y as i32, mo as u32));
-    if !(1..=dim).contains(&d)
-        || !(0..24).contains(&h)
-        || !(0..60).contains(&mi)
-        || !(0..60).contains(&se)
-    {
-        return None;
-    }
-    let (off_s, off_us) = tz.unwrap_or((0, 0));
-    if (off_s * 1_000_000 + off_us).abs() >= 86_400_000_000 {
-        return None;
-    }
-    Some(Dt {
-        year: y as i32,
-        month: mo as u32,
-        day: d as u32,
-        hour: h as u32,
-        minute: mi as u32,
-        second: se as u32,
-        microsecond: us as u32,
-        off_s,
-        off_us,
+    };
+    chrono::DateTime::parse_from_rfc3339(s).ok().or_else(|| {
+        chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f")
+            .ok()
+            .map(|n| n.and_utc().fixed_offset())
     })
 }
 
-/// `datetime.fromisoformat(str(value))`, naive read as UTC; None when invalid.
-pub fn ts_of(value: Option<&PyValue>) -> Option<Dt> {
-    fromisoformat_utc(&value.map_or_else(|| "None".to_string(), PyValue::py_str))
+/// Python's `isoformat()`: the microseconds only when they are not 0.
+fn isoformat(t: &Ts) -> String {
+    let us = t.timestamp_subsec_micros();
+    let frac = if us == 0 {
+        String::new()
+    } else {
+        format!(".{us:06}")
+    };
+    format!("{}{frac}{}", t.format("%Y-%m-%dT%H:%M:%S"), t.format("%:z"))
 }
 
 // ---------------------------------------------------------------- logs
 
-type Rows = Vec<(Dt, PyValue)>;
+type Rows = Vec<(Ts, PyValue)>;
 
 /// (rows with a readable ts, oldest first as written; count of lines that are
 /// not such a row).
@@ -404,7 +81,7 @@ pub fn read_rows(path: &PyPath) -> Result<(Rows, i64), SmError> {
             Err(e) => return Err(e),
         };
         let ts = match &row {
-            PyValue::Dict(d) => ts_of(Some(dict_get(d, "ts").unwrap_or(&PyValue::None))),
+            PyValue::Dict(d) => ts_of(dict_get(d, "ts")),
             _ => None,
         };
         match ts {
@@ -413,13 +90,6 @@ pub fn read_rows(path: &PyPath) -> Result<(Rows, i64), SmError> {
         }
     }
     Ok((rows, bad))
-}
-
-fn get<'a>(r: &'a PyValue, key: &str) -> Option<&'a PyValue> {
-    match r {
-        PyValue::Dict(d) => dict_get(d, key),
-        _ => None,
-    }
 }
 
 fn is_str(v: Option<&PyValue>, s: &str) -> bool {
@@ -432,19 +102,19 @@ fn truthy_opt(v: Option<&PyValue>) -> bool {
 
 /// `str(v)` of `r.get(key)`.
 fn str_get(r: &PyValue, key: &str) -> String {
-    get(r, key).map_or_else(|| "None".to_string(), PyValue::py_str)
+    value_get(r, key).map_or_else(|| "None".to_string(), PyValue::py_str)
 }
 
 /// `for i in r.get(key) or []`, each as `str(i)`.
 fn ids_of(r: &PyValue, key: &str) -> Result<Vec<String>, SmError> {
-    match get(r, key).filter(|v| truthy(v)) {
+    match value_get(r, key).filter(|v| truthy(v)) {
         None => Ok(Vec::new()),
         Some(v) => Ok(iterate(v)?.iter().map(|x| x.py_str()).collect()),
     }
 }
 
 fn path_of(r: &PyValue) -> &'static str {
-    if is_str(get(r, "path"), "local") {
+    if is_str(value_get(r, "path"), "local") {
         "local"
     } else {
         "haiku"
@@ -503,33 +173,33 @@ fn sorted_most_first(m: IndexMap<String, i64>) -> IndexMap<String, i64> {
 }
 
 /// (recall counts, injections per id never opened).
-fn recall(home: &PyPath, since: i128) -> Result<(Recall, IndexMap<String, i64>), SmError> {
+fn recall(home: &PyPath, since: i64) -> Result<(Recall, IndexMap<String, i64>), SmError> {
     let (hook_rows, hook_bad) = read_rows(&home.join("hook.log"))?;
     let (usage_all, usage_bad) = read_rows(&home.join(USAGE_LOG))?;
-    let usage_rows: Vec<&(Dt, PyValue)> = usage_all
+    let usage_rows: Vec<&(Ts, PyValue)> = usage_all
         .iter()
-        .filter(|(t, _)| t.instant() >= since)
+        .filter(|(t, _)| t.timestamp_micros() >= since)
         .collect();
-    let runs: Vec<&(Dt, PyValue)> = hook_rows
+    let runs: Vec<&(Ts, PyValue)> = hook_rows
         .iter()
         .filter(|(t, r)| {
-            t.instant() >= since
+            t.timestamp_micros() >= since
                 && !matches!(r, PyValue::Dict(d) if dict_get(d, "catch_up_error").is_some())
         })
         .collect();
-    let mut injections: Vec<(i128, String, &'static str)> = Vec::new();
+    let mut injections: Vec<(i64, String, &'static str)> = Vec::new();
     for (t, r) in &runs {
         for i in ids_of(r, "ids")? {
-            injections.push((t.instant(), i, path_of(r)));
+            injections.push((t.timestamp_micros(), i, path_of(r)));
         }
     }
     let mut failed: IndexMap<String, i64> = IndexMap::new();
     for (_, r) in &runs {
         let path_in = matches!(r, PyValue::Dict(d) if dict_get(d, "path").is_some());
-        if is_str(get(r, "path"), "error")
-            || (!path_in && truthy_opt(get(r, "error")) && !truthy_opt(get(r, "ids")))
+        if is_str(value_get(r, "path"), "error")
+            || (!path_in && truthy_opt(value_get(r, "error")) && !truthy_opt(value_get(r, "ids")))
         {
-            let e = get(r, "error");
+            let e = value_get(r, "error");
             bump(
                 &mut failed,
                 if is_str(e, "budget") || is_str(e, "lock") {
@@ -541,8 +211,8 @@ fn recall(home: &PyPath, since: i128) -> Result<(Recall, IndexMap<String, i64>),
         }
     }
     for (_, r) in &runs {
-        if truthy_opt(get(r, "local_error")) {
-            let e = get(r, "local_error");
+        if truthy_opt(value_get(r, "local_error")) {
+            let e = value_get(r, "local_error");
             bump(
                 &mut failed,
                 if is_str(e, "budget") || is_str(e, "lock") {
@@ -555,28 +225,28 @@ fn recall(home: &PyPath, since: i128) -> Result<(Recall, IndexMap<String, i64>),
     }
     let mut fallback: IndexMap<String, i64> = IndexMap::new();
     for (_, r) in &runs {
-        if is_str(get(r, "path"), "local") {
+        if is_str(value_get(r, "path"), "local") {
             bump(&mut fallback, str_get(r, "fallback"));
         }
     }
-    let mut tracked_since: Option<&Dt> = None;
+    let mut tracked_since: Option<&Ts> = None;
     for (t, _) in &usage_rows {
-        if tracked_since.is_none_or(|m| t.instant() < m.instant()) {
+        if tracked_since.is_none_or(|m| t.timestamp_micros() < m.timestamp_micros()) {
             tracked_since = Some(t);
         }
     }
-    let mut shown: HashMap<String, Vec<i128>> = HashMap::new();
+    let mut shown: HashMap<String, Vec<i64>> = HashMap::new();
     for (t, r) in &usage_rows {
-        if is_str(get(r, "cmd"), "show") {
+        if is_str(value_get(r, "cmd"), "show") {
             for i in ids_of(r, "ids")? {
-                shown.entry(i).or_default().push(t.instant());
+                shown.entry(i).or_default().push(t.timestamp_micros());
             }
         }
     }
-    let mut first_tracked: IndexMap<String, (i128, &'static str)> = IndexMap::new();
+    let mut first_tracked: IndexMap<String, (i64, &'static str)> = IndexMap::new();
     let mut tracked_count: IndexMap<String, i64> = IndexMap::new();
     if let Some(ts) = tracked_since {
-        let ts = ts.instant();
+        let ts = ts.timestamp_micros();
         for (t, i, p) in &injections {
             if *t >= ts {
                 first_tracked.entry(i.clone()).or_insert((*t, p));
@@ -606,7 +276,7 @@ fn recall(home: &PyPath, since: i128) -> Result<(Recall, IndexMap<String, i64>),
             PathCounts {
                 with_injection: runs
                     .iter()
-                    .filter(|(_, r)| truthy_opt(get(r, "ids")) && path_of(r) == path)
+                    .filter(|(_, r)| truthy_opt(value_get(r, "ids")) && path_of(r) == path)
                     .count() as i64,
                 tracked_ids: tracked.len() as i64,
                 opened_ids: n_opened as i64,
@@ -625,12 +295,12 @@ fn recall(home: &PyPath, since: i128) -> Result<(Recall, IndexMap<String, i64>),
             hook_runs: runs.len() as i64,
             with_injection: runs
                 .iter()
-                .filter(|(_, r)| truthy_opt(get(r, "ids")))
+                .filter(|(_, r)| truthy_opt(value_get(r, "ids")))
                 .count() as i64,
             injections: injections.len() as i64,
             injected_ids: injected.len() as i64,
             usage_rows: usage_rows.len() as i64,
-            tracked_since: tracked_since.map(Dt::isoformat),
+            tracked_since: tracked_since.map(isoformat),
             tracked_ids: first_tracked.len() as i64,
             opened_ids: opened.len() as i64,
             opened_share: share(opened.len(), first_tracked.len())?,
@@ -653,12 +323,15 @@ pub struct CatchUp {
     pub bad_rows: i64,
 }
 
-fn catch_up(home: &PyPath, since: i128) -> Result<CatchUp, SmError> {
+fn catch_up(home: &PyPath, since: i64) -> Result<CatchUp, SmError> {
     let (rows, bad) = read_rows(&home.join("catchup.log"))?;
-    let recent: Vec<&(Dt, PyValue)> = rows.iter().filter(|(t, _)| t.instant() >= since).collect();
+    let recent: Vec<&(Ts, PyValue)> = rows
+        .iter()
+        .filter(|(t, _)| t.timestamp_micros() >= since)
+        .collect();
     let mut parts: IndexMap<String, i64> = IndexMap::new();
     for (_, r) in &recent {
-        let Some(p) = get(r, "parts").filter(|v| truthy(v)) else {
+        let Some(p) = value_get(r, "parts").filter(|v| truthy(v)) else {
             continue;
         };
         let PyValue::Dict(items) = p else {
@@ -677,12 +350,12 @@ fn catch_up(home: &PyPath, since: i128) -> Result<CatchUp, SmError> {
             }
         }
     }
-    let is_true = |r: &PyValue| matches!(get(r, "ok"), Some(PyValue::Bool(true)));
+    let is_true = |r: &PyValue| matches!(value_get(r, "ok"), Some(PyValue::Bool(true)));
     Ok(CatchUp {
         runs: recent.len() as i64,
         failed: recent.iter().filter(|(_, r)| !is_true(r)).count() as i64,
         part_failures: sorted_most_first(parts),
-        last: rows.last().map(|(t, r)| (t.isoformat(), is_true(r))),
+        last: rows.last().map(|(t, r)| (isoformat(t), is_true(r))),
         bad_rows: bad,
     })
 }
@@ -709,9 +382,9 @@ pub struct Stats {
 
 /// `timedelta(days=days)` in microseconds: the int part exactly, the fraction rounded half to
 /// even (Modules/_datetimemodule.c `accum`).
-fn days_us(days: f64) -> i128 {
+fn days_us(days: f64) -> i64 {
     let int = days.trunc();
-    (int as i128) * US_PER_DAY + ((days - int) * 86_400_000_000.0).round_ties_even() as i128
+    (int as i64) * US_PER_DAY + ((days - int) * 86_400_000_000.0).round_ties_even() as i64
 }
 
 /// `--days` as typed in an error: `0`, not `0.0`.
@@ -746,21 +419,10 @@ pub fn run_stats(days: f64, home: Option<&str>, now: Option<f64>) -> Result<Stat
         Some(t) => crate::clock::from_timestamp(t, crate::clock::utc())
             .ok_or_else(|| SmError::overflow("timestamp out of range for platform time_t"))?,
     };
-    use chrono::{Datelike, Timelike};
-    let now = Dt {
-        year: now_dt.year(),
-        month: now_dt.month(),
-        day: now_dt.day(),
-        hour: now_dt.hour(),
-        minute: now_dt.minute(),
-        second: now_dt.second(),
-        microsecond: now_dt.nanosecond() / 1000,
-        off_s: 0,
-        off_us: 0,
-    };
-    let since_us = now.instant() - days_us(days);
-    let since =
-        Dt::from_instant(since_us).ok_or_else(|| SmError::overflow("date value out of range"))?;
+    let since_us = now_dt.timestamp_micros() - days_us(days);
+    let since = chrono::DateTime::from_timestamp_micros(since_us)
+        .filter(|t| chrono::Datelike::year(t) >= 1)
+        .ok_or_else(|| SmError::overflow("date value out of range"))?;
     let (recall, never) = recall(&h, since_us)?;
     let mut top: Vec<(String, i64)> = never
         .into_iter()
@@ -810,7 +472,7 @@ pub fn run_stats(days: f64, home: Option<&str>, now: Option<f64>) -> Result<Stat
     let count = auto_backups(Some(h.as_str()))?.len() as i64;
     Ok(Stats {
         days,
-        since: since.isoformat_seconds(),
+        since: since.format("%Y-%m-%dT%H:%M:%S+00:00").to_string(),
         store,
         stale_total: stale.len() as i64,
         stale_repos: sorted_most_first(repos),
@@ -820,10 +482,6 @@ pub fn run_stats(days: f64, home: Option<&str>, now: Option<f64>) -> Result<Stat
         backups: (count, age.map(|a| round_ndigits(a, 1)).transpose()?),
         scopes: scope_counts,
     })
-}
-
-fn s(x: &str) -> PyValue {
-    PyValue::Str(x.into())
 }
 
 fn counts_value<K: AsRef<str>>(m: &IndexMap<K, i64>) -> PyValue {
@@ -966,78 +624,6 @@ impl Stats {
 mod tests {
     use super::*;
 
-    fn iso(s: &str) -> Option<String> {
-        fromisoformat_utc(s).map(|d| d.isoformat())
-    }
-
-    #[test]
-    fn fromisoformat_accepts_the_forms_python_accepts() {
-        assert_eq!(
-            iso("2026-11-05T07:54:00+05:30").as_deref(),
-            Some("2026-11-05T07:54:00+05:30")
-        );
-        assert_eq!(
-            iso("2026-11-05").as_deref(),
-            Some("2026-11-05T00:00:00+00:00")
-        );
-        assert_eq!(
-            iso("20261105T0754Z").as_deref(),
-            Some("2026-11-05T07:54:00+00:00")
-        );
-        assert_eq!(
-            iso("2026-11-05 07:54:00.5").as_deref(),
-            Some("2026-11-05T07:54:00.500000+00:00")
-        );
-        assert_eq!(iso("2026W01").as_deref(), Some("2025-12-29T00:00:00+00:00"));
-        assert_eq!(
-            iso("2026-12-31T24:00").as_deref(),
-            Some("2027-01-01T00:00:00+00:00")
-        );
-        assert_eq!(
-            iso("2026-01-01T00:00-05:30:15").as_deref(),
-            Some("2026-01-01T00:00:00-05:30:15")
-        );
-        // Python 3.15.1 gives each of these
-        assert_eq!(
-            iso("2026-11-05é07:54").as_deref(),
-            Some("2026-11-05T07:54:00+00:00")
-        );
-        assert_eq!(
-            iso("2026W013😀07").as_deref(),
-            Some("2025-12-31T07:00:00+00:00")
-        );
-        assert_eq!(
-            iso("2026-01-00T24:00").as_deref(),
-            Some("2026-01-01T00:00:00+00:00")
-        );
-        assert_eq!(
-            iso("0000-12-31T24:00").as_deref(),
-            Some("0001-01-01T00:00:00+00:00")
-        );
-    }
-
-    #[test]
-    fn fromisoformat_rejects_what_python_rejects() {
-        for bad in [
-            "",
-            "None",
-            "2026-1-01",
-            "2026-02-30",
-            "2026-01-01T24:01",
-            "2026-01-01T12:",
-            "2026-01-01T1",
-            "2026-01-01T00:00+24:00",
-            "2026-00-00T24:00",
-            "2026-00-28T24:00",
-            "2026-13-28T24:00",
-            "2026-11-05éé07:54",
-            "2026-11é05",
-            "2026-11-05T07:54é",
-        ] {
-            assert_eq!(iso(bad), None, "{bad}");
-        }
-    }
-
     #[test]
     fn days_must_be_in_range() {
         let dir = tempfile::tempdir().unwrap();
@@ -1060,10 +646,66 @@ mod tests {
     fn read_rows_counts_bad_lines() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("hook.log");
-        std::fs::write(&p, "{\"ts\": \"2026-01-01T00:00:00+00:00\", \"ids\": [\"a\"]}\n\nnot json\n[1]\n{\"ts\": 5}\n{\"ts\": 20260101}\n").unwrap();
+        std::fs::write(&p, "{\"ts\": \"2026-01-01T00:00:00+00:00\", \"ids\": [\"a\"]}\n\nnot json\n[1]\n{\"ts\": 5}\n{\"ts\": \"2026-01-01T00:00:00.250000Z\"}\n").unwrap();
         let (rows, bad) = read_rows(&PyPath::new(p.to_str().unwrap())).unwrap();
         assert_eq!((rows.len(), bad), (2, 3));
-        assert_eq!(rows[1].0.isoformat(), "2026-01-01T00:00:00+00:00");
+        assert_eq!(isoformat(&rows[1].0), "2026-01-01T00:00:00.250000+00:00");
+    }
+
+    #[test]
+    fn ts_reads_the_forms_sm_writes_and_skips_the_rest() {
+        let ts = |x: &str| ts_of(Some(&PyValue::Str(x.into())));
+        // 2026-01-01T00:00:00Z is epoch 1767225600 (2025-01-01 is 1735689600, plus 365 days)
+        for (text, us, iso) in [
+            (
+                "2026-01-01T00:00:00+00:00",
+                1_767_225_600_000_000,
+                "2026-01-01T00:00:00+00:00",
+            ),
+            (
+                "2026-01-01T00:00:00Z",
+                1_767_225_600_000_000,
+                "2026-01-01T00:00:00+00:00",
+            ),
+            (
+                "2026-01-01T00:00:00.000250+00:00",
+                1_767_225_600_000_250,
+                "2026-01-01T00:00:00.000250+00:00",
+            ),
+            (
+                "2026-01-01T00:00:00.000250Z",
+                1_767_225_600_000_250,
+                "2026-01-01T00:00:00.000250+00:00",
+            ),
+            (
+                "2026-01-01T00:00:00",
+                1_767_225_600_000_000,
+                "2026-01-01T00:00:00+00:00",
+            ),
+            (
+                "2026-01-01T05:30:00+05:30",
+                1_767_225_600_000_000,
+                "2026-01-01T05:30:00+05:30",
+            ),
+        ] {
+            let t = ts(text).unwrap_or_else(|| panic!("{text}"));
+            assert_eq!(
+                (t.timestamp_micros(), isoformat(&t).as_str()),
+                (us, iso),
+                "{text}"
+            );
+        }
+        for bad in [
+            "",
+            "None",
+            "2026-02-30T00:00:00+00:00",
+            "2026-01-01T25:00:00Z",
+            "yesterday",
+        ] {
+            assert_eq!(ts(bad), None, "{bad}");
+        }
+        assert_eq!(ts_of(Some(&PyValue::int(20_260_101))), None);
+        assert_eq!(ts_of(None), None);
     }
 
     #[test]

@@ -6,6 +6,7 @@ use crate::error::SmError;
 use crate::py::path::{PyPath, encode_text};
 use crate::py::str::{splitlines, strip_chars};
 use crate::py::value::PyValue;
+use crate::sources::{dict, s, value_get};
 use crate::store::connect::connect;
 
 pub const CONFIG_HEADER: &str = "\
@@ -28,14 +29,8 @@ pub const HOOK_TARGETS: [(&str, &str); 3] = [
 
 /// `DEFAULTS["automemory"]["root"]`.
 fn default_automemory_root() -> String {
-    let field = |v: &PyValue, key: &str| match v {
-        PyValue::Dict(pairs) => pairs
-            .iter()
-            .find(|(k, _)| matches!(k, PyValue::Str(s) if s == key))
-            .map(|(_, v)| v.clone()),
-        _ => None,
-    };
-    let root = field(&defaults(), "automemory").and_then(|a| field(&a, "root"));
+    let defaults = defaults();
+    let root = value_get(&defaults, "automemory").and_then(|a| value_get(a, "root"));
     match root {
         Some(v) => v.py_str(),
         None => unreachable!("DEFAULTS holds automemory.root"),
@@ -219,14 +214,6 @@ pub fn which(cmd: &str, path: Option<&str>) -> Option<String> {
         }
     }
     None
-}
-
-fn s(v: &str) -> PyValue {
-    PyValue::Str(v.into())
-}
-
-fn dict(pairs: Vec<(&str, PyValue)>) -> PyValue {
-    PyValue::Dict(pairs.into_iter().map(|(k, v)| (s(k), v)).collect())
 }
 
 /// The `sm` a hook should run: the one on PATH, else this binary with a note for stderr.

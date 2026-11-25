@@ -4,7 +4,6 @@
 //! agent's text replies.
 
 use std::collections::{HashMap, VecDeque};
-use std::io::BufRead;
 use std::sync::LazyLock;
 
 use crate::core::item::parse_as_of_epoch;
@@ -13,7 +12,7 @@ use crate::py::json::loads;
 use crate::py::path::PyPath;
 use crate::py::str::{PyRegex, slice, strip};
 use crate::py::value::{PyValue, type_name};
-use crate::sources::{dict_get, get_attr, iterate, sorted_paths, truthy};
+use crate::sources::{TextLines, dict_get, get_attr, iterate, sorted_paths, truthy};
 
 // Owner-prompt rule from the 2026-11-04 ingestion audit: main-thread user rows
 // whose turnOrigin is absent or "human", minus meta, sidechain and compact summary rows, minus
@@ -415,33 +414,6 @@ fn epoch_of(ts: &str) -> Result<Option<f64>, SmError> {
     Ok(Some(parse_as_of_epoch(Some(ts))?).filter(|t| *t != 0.0))
 }
 
-/// `path.open("rb")` read with `for raw in handle`: lines end at `\n` only, which they keep.
-struct ByteLines {
-    reader: std::io::BufReader<std::fs::File>,
-}
-
-impl ByteLines {
-    fn open(p: &PyPath) -> Result<ByteLines, SmError> {
-        let os = p.to_os();
-        let file = std::fs::File::open(&os).map_err(|e| SmError::from_io(&e, Some(&os)))?;
-        if file.metadata().is_ok_and(|m| m.is_dir()) {
-            return Err(SmError::is_a_directory(&os));
-        }
-        Ok(ByteLines {
-            reader: std::io::BufReader::new(file),
-        })
-    }
-
-    fn next_line(&mut self) -> Result<Option<Vec<u8>>, SmError> {
-        let mut line = Vec::new();
-        let n = self
-            .reader
-            .read_until(b'\n', &mut line)
-            .map_err(|e| SmError::from_io(&e, None))?;
-        Ok((n > 0).then_some(line))
-    }
-}
-
 fn contains(hay: &[u8], needle: &[u8]) -> bool {
     hay.windows(needle.len()).any(|w| w == needle)
 }
@@ -611,8 +583,8 @@ pub fn scan_transcript(
     // (tool id, time covered) of the puts that count, until a result shows an error
     let mut puts: Vec<(String, f64)> = Vec::new();
     let mut later = after.is_none();
-    let mut lines = ByteLines::open(path)?;
-    while let Some(raw) = lines.next_line()? {
+    let mut lines = TextLines::open(path)?;
+    while let Some(raw) = lines.next_bytes()? {
         if !contains(&raw, br#""type":"user""#) && !contains(&raw, br#""type":"assistant""#) {
             continue;
         }
@@ -773,9 +745,9 @@ pub fn lanes_put_until(path: &PyPath) -> Result<Option<f64>, SmError> {
     }
     let mut until: Option<f64> = None;
     for lane in sorted_paths(lane_dir.glob("*.jsonl")?) {
-        let mut lines = ByteLines::open(&lane)?;
+        let mut lines = TextLines::open(&lane)?;
         let mut puts: Vec<(String, f64)> = Vec::new();
-        while let Some(raw) = lines.next_line()? {
+        while let Some(raw) = lines.next_bytes()? {
             let put_row = contains(&raw, b"sm put") && contains(&raw, br#""type":"assistant""#);
             // an error result matters only after a put that counts (and parsing every error
             // row of a long lane costs seconds over a full scan)

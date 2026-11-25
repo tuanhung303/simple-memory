@@ -461,10 +461,10 @@ pub fn build_parser() -> Parser {
 
     let p_imp = sub.add_parser(
         "import",
-        "Import items from files (tasklog, handoff, legacy, proposal, automemory, sessions, jsonl, catch-up)",
+        "Import items from files (tasklog, handoff, proposal, automemory, sessions, jsonl, catch-up)",
     );
     let mut imp_sub = Subparsers::new(p_imp, "source_kind", true);
-    for kind in ["tasklog", "handoff", "legacy", "proposal"] {
+    for kind in ["tasklog", "handoff", "proposal"] {
         let p_kind = imp_sub.add_parser(
             kind,
             &format!("Import {kind} items from a file or directory"),

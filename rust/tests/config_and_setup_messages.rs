@@ -478,27 +478,6 @@ fn the_restore_steps_quote_a_home_path_that_holds_a_space() {
     );
 }
 
-#[test]
-fn a_damaged_file_that_is_not_the_store_gives_no_restore_steps() {
-    let (d, home) = scratch();
-    common::put(
-        &home,
-        &[
-            "--kind",
-            "fact",
-            "--tag",
-            "verified",
-            "--evidence",
-            "t",
-            "a",
-        ],
-    );
-    let old = d.path().join("old.db");
-    write(&old, "not a database at all, only some text");
-    let (code, _, err) = sm(&home, &["import", "legacy", old.to_str().unwrap()]);
-    assert_eq!((code, err.as_str()), (1, "error: file is not a database\n"));
-}
-
 /// The names in `<home>/backups`, sorted.
 fn backup_names(home: &Path) -> Vec<String> {
     let mut v: Vec<String> = std::fs::read_dir(home.join("backups"))

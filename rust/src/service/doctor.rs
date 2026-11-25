@@ -143,9 +143,8 @@ pub fn find_repo_dir(
     let mut names = vec![repo.to_string()];
     let mut alias_keys: Vec<String> = repo_aliases
         .iter()
-        .filter_map(|(k, v)| {
-            (v == repo && k != repo && !k.is_empty() && !k.contains('/')).then(|| k.clone())
-        })
+        .filter(|(k, v)| *v == repo && *k != repo && !k.is_empty() && !k.contains('/'))
+        .map(|(k, _)| k.clone())
         .collect();
     alias_keys.sort();
     names.extend(alias_keys);
@@ -500,7 +499,7 @@ fn passes_quick_check(db: impl AsRef<std::path::Path>, flags: OpenFlags) -> bool
 
 /// What to do after an `is_damaged` error: the newest backup that passes `quick_check` and the
 /// two steps that put it in place, or that there is none. Nothing when memory.db passes
-/// `quick_check`, since the error then came from another file (`sm import legacy <db>`).
+/// `quick_check`, since the error then came from another file.
 pub fn restore_steps(home: Option<&str>) -> Result<Vec<String>, SmError> {
     let h = get_home(home)?;
     let db = h.join("memory.db");
@@ -591,6 +590,21 @@ mod tests {
         let steps = restore_steps(h.to_str()).unwrap();
         assert!(steps[0].ends_with("memory-20261102-000000-auto.db:"), "{steps:?}");
         assert!(!steps[0].contains("holds items"), "{steps:?}");
+    }
+
+    #[test]
+    fn restore_steps_are_empty_when_the_store_passes_quick_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = dir.path();
+        Connection::open(h.join("memory.db"))
+            .unwrap()
+            .execute_batch("CREATE TABLE items (id TEXT)")
+            .unwrap();
+        std::fs::create_dir(h.join("backups")).unwrap();
+        let c = Connection::open(h.join("backups/memory-20261101-000000-auto.db")).unwrap();
+        c.execute_batch("CREATE TABLE items (id TEXT); INSERT INTO items VALUES ('a')")
+            .unwrap();
+        assert_eq!(restore_steps(h.to_str()).unwrap(), Vec::<String>::new());
     }
 
     #[test]

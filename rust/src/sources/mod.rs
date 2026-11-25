@@ -1,6 +1,5 @@
 pub mod automemory;
 pub mod handoff;
-pub mod legacy;
 pub mod proposal;
 pub mod tasklog;
 pub mod transcript;
@@ -8,6 +7,7 @@ pub mod transcript;
 pub mod turns;
 
 use std::borrow::Cow;
+use std::io::BufRead;
 use std::os::unix::fs::MetadataExt;
 
 #[cfg(test)]
@@ -81,9 +81,7 @@ pub(crate) fn sorted_paths(mut paths: Vec<PyPath>) -> Vec<PyPath> {
     paths
 }
 
-/// `open(path, encoding="utf-8", errors="replace")` read line by line: lines end at `\n`,
-/// `\r\n` or `\r`, each read as `\n` (universal newlines), and bad bytes become U+FFFD. The
-/// file is streamed, never read whole (transcripts reach 580 MB).
+/// A file read line by line, streamed, never read whole (transcripts reach 580 MB).
 pub(crate) struct TextLines {
     reader: std::io::BufReader<std::fs::File>,
 }
@@ -102,9 +100,10 @@ impl TextLines {
         })
     }
 
-    /// The next line, `\n` included when it had one; None at the end.
+    /// The next line of `open(path, encoding="utf-8", errors="replace")`, `\n` included when it
+    /// had one; None at the end. Lines end at `\n`, `\r\n` or `\r`, each read as `\n`
+    /// (universal newlines), and bad bytes become U+FFFD.
     pub(crate) fn next_line(&mut self) -> Result<Option<String>, SmError> {
-        use std::io::BufRead;
         let io = |e: std::io::Error| SmError::from_io(&e, None);
         let mut line: Vec<u8> = Vec::new();
         loop {
@@ -135,6 +134,16 @@ impl TextLines {
         } else {
             Some(String::from_utf8_lossy(&line).into_owned())
         })
+    }
+
+    /// The next line of `for raw in path.open("rb")`: lines end at `\n` only, which they keep.
+    pub(crate) fn next_bytes(&mut self) -> Result<Option<Vec<u8>>, SmError> {
+        let mut line = Vec::new();
+        let n = self
+            .reader
+            .read_until(b'\n', &mut line)
+            .map_err(|e| SmError::from_io(&e, None))?;
+        Ok((n > 0).then_some(line))
     }
 }
 
@@ -184,8 +193,27 @@ pub(crate) fn iterate(v: &PyValue) -> Result<Vec<Cow<'_, PyValue>>, SmError> {
 
 /// `data.get(key)` on a str key.
 pub(crate) fn dict_get<'a>(data: &'a [(PyValue, PyValue)], key: &str) -> Option<&'a PyValue> {
-    let k = PyValue::Str(key.into());
-    data.iter().find(|(dk, _)| dk.key_eq(&k)).map(|(_, v)| v)
+    data.iter()
+        .find(|(k, _)| matches!(k, PyValue::Str(s) if s == key))
+        .map(|(_, v)| v)
+}
+
+/// A Python str.
+pub(crate) fn s(v: &str) -> PyValue {
+    PyValue::Str(v.into())
+}
+
+/// A str-keyed dict.
+pub(crate) fn dict(pairs: Vec<(&str, PyValue)>) -> PyValue {
+    PyValue::Dict(pairs.into_iter().map(|(k, v)| (s(k), v)).collect())
+}
+
+/// `value.get(key)` on a str key; None when `value` is not a dict.
+pub(crate) fn value_get<'a>(v: &'a PyValue, key: &str) -> Option<&'a PyValue> {
+    match v {
+        PyValue::Dict(d) => dict_get(d, key),
+        _ => None,
+    }
 }
 
 /// `value.get(key)` where `value` must be a dict (`(row.get("message") or {}).get(...)`):
@@ -313,5 +341,21 @@ mod tests {
         }
         // Python: open(p).readlines() == ['a\n', 'b\n', 'c\n', '\n', 'd']
         assert_eq!(got, ["a\n", "b\n", "c\n", "\n", "d"]);
+    }
+
+    #[test]
+    fn text_lines_read_bytes_split_at_lf_only() {
+        let d = tempfile::tempdir_in(crate::sources::TEST_TMP).unwrap();
+        let p = d.path().join("t.bin");
+        std::fs::write(&p, b"a\r\nb\rc\n\n\xffd").unwrap();
+        let mut lines = TextLines::open(&PyPath::new(p.to_str().unwrap())).unwrap();
+        let mut got: Vec<Vec<u8>> = Vec::new();
+        while let Some(l) = lines.next_bytes().unwrap() {
+            got.push(l);
+        }
+        // Python: list(open(p, "rb")) == [b'a\r\n', b'b\rc\n', b'\n', b'\xffd']
+        assert_eq!(got, [&b"a\r\n"[..], b"b\rc\n", b"\n", b"\xffd"]);
+        let dir = TextLines::open(&PyPath::new(d.path().to_str().unwrap()));
+        assert_eq!(dir.err().unwrap().class, "IsADirectoryError");
     }
 }

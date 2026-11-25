@@ -3,6 +3,7 @@ use std::sync::LazyLock;
 
 use indexmap::IndexMap;
 use regex::Regex;
+use rusqlite::types::ValueRef;
 
 use crate::core::item::{Item, epoch_to_as_of, validate_as_of};
 use crate::core::refs::{RefsArg, RepoRoots, extract_refs, merge_refs};
@@ -11,8 +12,7 @@ use crate::error::{Base, SmError};
 use crate::py::json::loads;
 use crate::py::path::PyPath;
 use crate::py::str::{ci_literal, slice, splitlines, strip};
-use crate::py::value::PyValue;
-use crate::sources::legacy::{Cell, fetch_rows, open_uri, readonly_sqlite_uri};
+use crate::py::value::{PyValue, repr_bytes};
 use crate::sources::{TextLines, dict_get, mtime};
 
 /// `<tag>.*?(?:</tag>|$)` under DOTALL and IGNORECASE. Python's `$` also matches before a final
@@ -108,6 +108,94 @@ fn index_session_repos(
     Ok(mapping)
 }
 
+/// `readonly_sqlite_uri(db_path)`.
+fn readonly_sqlite_uri(db_path: &str) -> Result<String, SmError> {
+    let resolved = PyPath::new(db_path).expanduser()?.resolve()?;
+    let wal = PyPath::new(&format!("{resolved}-wal")).to_os();
+    let has_nonempty_wal = std::fs::metadata(&wal).is_ok_and(|m| m.is_file() && m.len() > 0);
+    if has_nonempty_wal {
+        return Ok(format!("file:{resolved}?mode=ro"));
+    }
+    Ok(format!("file:{resolved}?mode=ro&immutable=1"))
+}
+
+/// A cell as Python's sqlite3 returns it.
+#[derive(Clone, Debug, PartialEq)]
+enum Cell {
+    Null,
+    Int(i64),
+    Real(f64),
+    Text(String),
+    Blob(Vec<u8>),
+}
+
+impl Cell {
+    /// `str(value)`.
+    fn py_str(&self) -> String {
+        match self {
+            Cell::Null => "None".into(),
+            Cell::Int(n) => n.to_string(),
+            Cell::Real(x) => crate::py::float::repr(*x),
+            Cell::Text(s) => s.clone(),
+            Cell::Blob(b) => repr_bytes(b),
+        }
+    }
+
+    fn truthy(&self) -> bool {
+        match self {
+            Cell::Null => false,
+            Cell::Int(n) => *n != 0,
+            Cell::Real(x) => *x != 0.0,
+            Cell::Text(s) => !s.is_empty(),
+            Cell::Blob(b) => !b.is_empty(),
+        }
+    }
+}
+
+/// `sqlite3.connect(uri, uri=True)`: Python opens read-write-create and lets the URI's
+/// `mode=ro` make it read-only.
+fn open_uri(uri: &str) -> Result<rusqlite::Connection, SmError> {
+    let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+        | rusqlite::OpenFlags::SQLITE_OPEN_CREATE
+        | rusqlite::OpenFlags::SQLITE_OPEN_URI
+        | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    rusqlite::Connection::open_with_flags(uri, flags)
+        .map_err(|e| SmError::sqlite_open(&e, std::path::Path::new(uri)))
+}
+
+/// `conn.execute(sql).fetchall()`: each row's cells in column order.
+fn fetch_rows(conn: &rusqlite::Connection, sql: &str) -> Result<Vec<Vec<Cell>>, SmError> {
+    let mut stmt = conn.prepare(sql).map_err(|e| SmError::sqlite(&e))?;
+    let names: Vec<String> = stmt.column_names().map(String::from).collect();
+    let mut rows = stmt.query([]).map_err(|e| SmError::sqlite(&e))?;
+    let mut out = Vec::new();
+    while let Some(r) = rows.next().map_err(|e| SmError::sqlite(&e))? {
+        let mut cells = Vec::with_capacity(names.len());
+        for (i, name) in names.iter().enumerate() {
+            cells.push(match r.get_ref(i).map_err(|e| SmError::sqlite(&e))? {
+                ValueRef::Null => Cell::Null,
+                ValueRef::Integer(n) => Cell::Int(n),
+                ValueRef::Real(x) => Cell::Real(x),
+                ValueRef::Text(b) => match std::str::from_utf8(b) {
+                    Ok(s) => Cell::Text(s.to_string()),
+                    Err(_) => {
+                        return Err(SmError::from_python(
+                            "OperationalError",
+                            format!(
+                                "Could not decode to UTF-8 column '{name}' with text '{}'",
+                                String::from_utf8_lossy(b)
+                            ),
+                        ));
+                    }
+                },
+                ValueRef::Blob(b) => Cell::Blob(b.to_vec()),
+            });
+        }
+        out.push(cells);
+    }
+    Ok(out)
+}
+
 /// `int(r["id"])` as its decimal text.
 fn int_text(c: &Cell) -> Result<String, SmError> {
     Ok(match c {
@@ -163,7 +251,7 @@ pub fn load_turns(
     let mut seen_pairs: HashSet<(String, String)> = HashSet::new();
     let mut grouped: IndexMap<String, Vec<Item>> = IndexMap::new();
     for r in &rows {
-        let col = |i: usize| &r.cols[i].1;
+        let col = |i: usize| &r[i];
         let mut user_prompt = text_or_empty(col(2));
         let assistant_response = text_or_empty(col(3));
         if !seen_pairs.insert((user_prompt.clone(), assistant_response.clone())) {
@@ -532,6 +620,28 @@ mod tests {
                 .unwrap_err()
                 .python_text(),
             "OperationalError: no such table: turn_queue"
+        );
+    }
+
+    #[test]
+    fn readonly_uri_drops_immutable_only_for_a_nonempty_wal() {
+        let d = tempfile::tempdir_in(crate::sources::TEST_TMP).unwrap();
+        let f = d.path().join("check.db");
+        std::fs::write(&f, b"sqlite").unwrap();
+        let fs = f.to_str().unwrap();
+        assert_eq!(
+            readonly_sqlite_uri(fs).unwrap(),
+            format!("file:{fs}?mode=ro&immutable=1")
+        );
+        std::fs::write(format!("{fs}-wal"), b"").unwrap();
+        assert_eq!(
+            readonly_sqlite_uri(fs).unwrap(),
+            format!("file:{fs}?mode=ro&immutable=1")
+        );
+        std::fs::write(format!("{fs}-wal"), b"nonempty-wal").unwrap();
+        assert_eq!(
+            readonly_sqlite_uri(fs).unwrap(),
+            format!("file:{fs}?mode=ro")
         );
     }
 }

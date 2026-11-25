@@ -243,7 +243,7 @@ Modules follow a downward architecture (`cli` -> `service` -> `store` / `sources
 | `sm retire ID [--reason TEXT]` | Soft-retire an active item with no replacement (default reason: `manual`) |
 | `sm amend ID [...]` | Append-only update: create a new item with changed fields and supersede `ID` atomically |
 | `sm list [...]` | Browse items newest-first without a query (`--limit`, `--offset`, `--repo \| --all \| --in`, `--kind`, `--tag`, `--source`, `--since`, `--until`, `--status \| --include-history`, `--format`) |
-| `sm import tasklog\|handoff\|legacy\|proposal PATH` | Import YAML task logs, Markdown handoffs, legacy DBs, or proposal JSONL (`--apply`, `--dry-run`) |
+| `sm import tasklog\|handoff\|proposal PATH` | Import YAML task logs, Markdown handoffs, or proposal JSONL (`--apply`, `--dry-run`) |
 | `sm import automemory \| sessions \| jsonl \| catch-up` | Sync Claude memory files, summarize idle sessions, import JSONL, or run full catch-up |
 | `sm export [--include-history] [--repo R \| --all]` | Dump items sorted by ID as JSONL to stdout |
 | `sm upkeep [--dry-run] [--report]` | Retire older/claimed session handoffs; `--report` flags near-duplicates and stale items |

@@ -615,10 +615,15 @@ pub fn search_pool(
         &score_opts(&query_refs, f, o, Some(0)),
     )?;
     let items: Vec<Item> = scored.into_iter().map(|s| s.item).collect();
-    Ok(match cap {
-        Some(c) if c != 0 => (head(items, c), cap),
-        _ => (items, cap),
-    })
+    Ok((head_cap(items, cap), cap))
+}
+
+/// `items[:cap]` when the pool cap is set and nonzero, else all of `items`.
+pub fn head_cap<T>(items: Vec<T>, cap: Option<i64>) -> Vec<T> {
+    match cap {
+        Some(c) if c != 0 => head(items, c),
+        _ => items,
+    }
 }
 
 /// Python's `seq[:n]`: a negative n counts from the end.

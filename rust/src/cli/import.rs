@@ -1,4 +1,4 @@
-//! The `import tasklog|handoff|legacy|proposal|automemory|sessions|catch-up` commands and their
+//! The `import tasklog|handoff|proposal|automemory|sessions|catch-up` commands and their
 //! summary output.
 
 use crate::config::load_config;

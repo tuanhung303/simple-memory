@@ -26,6 +26,7 @@ use crate::service::show::run_show_many;
 use crate::service::supersede::run_supersede;
 use crate::service::upkeep::put_overlaps;
 use crate::service::usage::log_usage;
+use crate::sources::{dict, s, value_get};
 use crate::store::items::AmendPatch;
 use crate::store::search::StatusFilter;
 
@@ -238,25 +239,6 @@ pub enum Fail {
 impl From<SmError> for Fail {
     fn from(e: SmError) -> Self {
         Fail::Stop(e)
-    }
-}
-
-fn s(v: &str) -> PyValue {
-    PyValue::Str(v.to_string())
-}
-
-fn dict(pairs: Vec<(&str, PyValue)>) -> PyValue {
-    PyValue::Dict(pairs.into_iter().map(|(k, v)| (s(k), v)).collect())
-}
-
-/// `d.get(key)` on a str-keyed dict value.
-fn get<'a>(d: &'a PyValue, key: &str) -> Option<&'a PyValue> {
-    match d {
-        PyValue::Dict(p) => p
-            .iter()
-            .find(|(k, _)| matches!(k, PyValue::Str(x) if x == key))
-            .map(|(_, v)| v),
-        _ => None,
     }
 }
 
@@ -690,7 +672,7 @@ impl Server {
 
     /// `call_tool(params)`: a tool failure goes back to the model as a result it can correct.
     pub fn call_tool(&self, params: &PyValue, out: &mut Out) -> Result<PyValue, Fail> {
-        let name = match get(params, "name") {
+        let name = match value_get(params, "name") {
             Some(PyValue::Str(n)) if tool_schema(n).is_some() => n.clone(),
             other => {
                 let message = match other {
@@ -701,7 +683,7 @@ impl Server {
             }
         };
         let empty = PyValue::Dict(Vec::new());
-        let PyValue::Dict(args) = get(params, "arguments").unwrap_or(&empty) else {
+        let PyValue::Dict(args) = value_get(params, "arguments").unwrap_or(&empty) else {
             return Err(Fail::Rpc(rpc(
                 INVALID_PARAMS,
                 "tools/call arguments must be an object",
@@ -760,20 +742,20 @@ impl Server {
 
     /// `handle(msg)`: the response to one parsed message; None for a notification.
     pub fn handle(&self, msg: &PyValue, out: &mut Out) -> Result<Option<PyValue>, SmError> {
-        let method = match (msg, get(msg, "jsonrpc"), get(msg, "method")) {
+        let method = match (msg, value_get(msg, "jsonrpc"), value_get(msg, "method")) {
             (PyValue::Dict(_), Some(PyValue::Str(v)), Some(PyValue::Str(m))) if v == "2.0" => {
                 m.clone()
             }
             _ => {
-                let rid = get(msg, "id").cloned().unwrap_or(PyValue::None);
+                let rid = value_get(msg, "id").cloned().unwrap_or(PyValue::None);
                 return Ok(Some(error(rid, INVALID_REQUEST, "Invalid Request", None)));
             }
         };
-        let Some(rid) = get(msg, "id").cloned() else {
+        let Some(rid) = value_get(msg, "id").cloned() else {
             return Ok(None);
         };
         let empty = PyValue::Dict(Vec::new());
-        let params = get(msg, "params").unwrap_or(&empty);
+        let params = value_get(msg, "params").unwrap_or(&empty);
         let result = (|| -> Result<PyValue, Fail> {
             if !matches!(params, PyValue::Dict(_)) {
                 return Err(Fail::Rpc(rpc(INVALID_PARAMS, "params must be an object")));
@@ -805,12 +787,14 @@ impl Server {
 
     /// One revision 2026-07-28 request: check its `_meta`, answer with no connection state.
     fn modern(&self, method: &str, params: &PyValue, out: &mut Out) -> Result<PyValue, Fail> {
-        let meta = get(params, "_meta");
+        let meta = value_get(params, "_meta");
         let asked = match meta {
-            Some(m @ PyValue::Dict(_)) => match (get(m, META_VERSION), get(m, META_CAPABILITIES)) {
-                (Some(PyValue::Str(v)), Some(PyValue::Dict(_))) => v.clone(),
-                _ => return Err(meta_error()),
-            },
+            Some(m @ PyValue::Dict(_)) => {
+                match (value_get(m, META_VERSION), value_get(m, META_CAPABILITIES)) {
+                    (Some(PyValue::Str(v)), Some(PyValue::Dict(_))) => v.clone(),
+                    _ => return Err(meta_error()),
+                }
+            }
             _ => return Err(meta_error()),
         };
         if !MODERN_VERSIONS.contains(&asked.as_str()) {
@@ -931,13 +915,13 @@ pub fn is_modern(method: &str, params: &PyValue) -> bool {
     if method == "server/discover" {
         return true;
     }
-    let meta = get(params, "_meta").unwrap_or(&PyValue::None);
+    let meta = value_get(params, "_meta").unwrap_or(&PyValue::None);
     if method == "initialize" || *meta == PyValue::None {
         return false;
     }
     !matches!(meta, PyValue::Dict(_))
-        || get(meta, META_VERSION).is_some()
-        || get(meta, META_CAPABILITIES).is_some()
+        || value_get(meta, META_VERSION).is_some()
+        || value_get(meta, META_CAPABILITIES).is_some()
 }
 
 pub fn error(rid: PyValue, code: i64, message: &str, data: Option<PyValue>) -> PyValue {
@@ -962,7 +946,7 @@ pub fn server_info() -> PyValue {
 }
 
 fn initialize(params: &PyValue) -> Result<PyValue, Fail> {
-    let Some(PyValue::Str(asked)) = get(params, "protocolVersion") else {
+    let Some(PyValue::Str(asked)) = value_get(params, "protocolVersion") else {
         return Err(Fail::Rpc(rpc(
             INVALID_PARAMS,
             "initialize needs a protocolVersion string",
@@ -1005,7 +989,7 @@ pub fn answer_line(server: &Server, raw: &[u8], out: &mut Out) -> Result<Option<
             out.eprint(&format!("sm mcp: parse error: {}", e.msg))?;
             Some(error(PyValue::None, PARSE_ERROR, "Parse error", None))
         }
-        Ok(msg) => match get(&msg, "id").map(encode_reply) {
+        Ok(msg) => match value_get(&msg, "id").map(encode_reply) {
             // an id that cannot be written back is refused before the request runs
             Some(Err(e)) => {
                 out.eprint(&format!("sm mcp: reply error: {}", e.msg))?;
@@ -1027,7 +1011,7 @@ pub fn answer_line(server: &Server, raw: &[u8], out: &mut Out) -> Result<Option<
         Err(e) => {
             // a lone surrogate in an echoed method, tool name or version: answer, never stop
             out.eprint(&format!("sm mcp: reply error: {}", e.msg))?;
-            let rid = get(&resp, "id").cloned().unwrap_or(PyValue::None);
+            let rid = value_get(&resp, "id").cloned().unwrap_or(PyValue::None);
             encode_reply(&error(rid, INVALID_REQUEST, "Invalid Request", None))?
         }
     };
