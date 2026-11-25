@@ -3400,7 +3400,7 @@ fn argparse_import_cases() {
     assert_err(
         vec![Arg::Text("import".to_string()), Arg::Text("x".to_string())],
         2,
-        "sm import: error: argument source_kind: invalid choice: 'x' (choose from 'tasklog', 'handoff', 'legacy', 'proposal', 'automemory', 'sessions', 'jsonl', 'catch-up')",
+        "sm import: error: argument source_kind: invalid choice: 'x' (choose from 'tasklog', 'handoff', 'proposal', 'automemory', 'sessions', 'jsonl', 'catch-up')",
     );
     // case 223
     assert_err(
@@ -3410,7 +3410,7 @@ fn argparse_import_cases() {
             Arg::Text("p".to_string()),
         ],
         2,
-        "sm import: error: argument source_kind: invalid choice: 'tasklo', maybe you meant 'tasklog'? (choose from 'tasklog', 'handoff', 'legacy', 'proposal', 'automemory', 'sessions', 'jsonl', 'catch-up')",
+        "sm import: error: argument source_kind: invalid choice: 'tasklo', maybe you meant 'tasklog'? (choose from 'tasklog', 'handoff', 'proposal', 'automemory', 'sessions', 'jsonl', 'catch-up')",
     );
     // case 224
     assert_err(
@@ -3475,22 +3475,15 @@ fn argparse_import_cases() {
             ("apply", V::Bool(true)),
         ],
     );
-    // case 228
-    assert_ok_fields(
+    // case 228: the removed `import legacy` is an unknown source
+    assert_err(
         vec![
             Arg::Text("import".to_string()),
             Arg::Text("legacy".to_string()),
             Arg::Text("p".to_string()),
         ],
-        vec![],
-        vec![
-            ("version", V::None),
-            ("command", V::Str("import".to_string())),
-            ("source_kind", V::Str("legacy".to_string())),
-            ("path", V::Str("p".to_string())),
-            ("dry_run", V::Bool(false)),
-            ("apply", V::Bool(false)),
-        ],
+        2,
+        "sm import: error: argument source_kind: invalid choice: 'legacy' (choose from 'tasklog', 'handoff', 'proposal', 'automemory', 'sessions', 'jsonl', 'catch-up')",
     );
     // case 229
     assert_ok_fields(
@@ -4032,7 +4025,7 @@ fn argparse_import_cases() {
             Arg::Text("catchup".to_string()),
         ],
         2,
-        "sm import: error: argument source_kind: invalid choice: 'catchup', maybe you meant 'catch-up'? (choose from 'tasklog', 'handoff', 'legacy', 'proposal', 'automemory', 'sessions', 'jsonl', 'catch-up')",
+        "sm import: error: argument source_kind: invalid choice: 'catchup', maybe you meant 'catch-up'? (choose from 'tasklog', 'handoff', 'proposal', 'automemory', 'sessions', 'jsonl', 'catch-up')",
     );
     // case 264
     assert_err(

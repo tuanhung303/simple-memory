@@ -16,7 +16,6 @@ use crate::sources::automemory::{
     MemoryFile, SOURCE_PREFIX, discover, parse_memory_file, to_item, transcript_cwd,
 };
 use crate::sources::handoff::load_handoffs;
-use crate::sources::legacy::load_legacy;
 use crate::sources::proposal::load_proposals_with_rejects;
 use crate::sources::tasklog::load_tasklogs;
 use crate::sources::{SourceFile, mtime, truthy};
@@ -273,7 +272,6 @@ pub fn run_import(
     let items = match kind.as_str() {
         "tasklog" => scanned(load_tasklogs(path)?),
         "handoff" => scanned(load_handoffs(path, Some(&repo_roots(&cfg)?))?),
-        "legacy" => alias_repos(load_legacy(path, Some(&repo_roots(&cfg)?))?, &al),
         "proposal" => {
             let (items, n) = load_proposals_with_rejects(path)?;
             rejected = n as i64;

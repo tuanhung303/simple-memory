@@ -1,6 +1,5 @@
 pub mod automemory;
 pub mod handoff;
-pub mod legacy;
 pub mod proposal;
 pub mod tasklog;
 pub mod transcript;

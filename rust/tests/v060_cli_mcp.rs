@@ -850,7 +850,7 @@ fn help_names_defaults_separators_stdin_and_what_apply_writes() {
         ),
         (
             &["--help"][..],
-            "Import items from files (tasklog, handoff, legacy, proposal, automemory, sessions, jsonl, catch-up)",
+            "Import items from files (tasklog, handoff, proposal, automemory, sessions, jsonl, catch-up)",
         ),
         (
             &["import", "tasklog", "--help"][..],

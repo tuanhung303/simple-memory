@@ -2024,21 +2024,10 @@ fn cli_supersedes_typo_dash_query_budget_and_one_line_errors() {
         lengths.iter().max().unwrap() - lengths.iter().min().unwrap() <= 5,
         "{lengths:?}"
     );
-    // Item 19: malformed YAML and bad SQLite path print a one-line message to stderr and exit 1
+    // Item 19: malformed YAML prints a one-line message to stderr and exits 1
     let bad_yaml = tmp.join("bad.yaml");
     write(&bad_yaml, "id: [unclosed\n  broken: :\n");
     let (code, _, err) = sm(&home, &["import", "tasklog", bad_yaml.to_str().unwrap()]);
-    assert_eq!(code, 1);
-    assert!(
-        !err.trim().contains('\n') && err.starts_with("error:"),
-        "{err}"
-    );
-    let bad_db = tmp.join("not_a_sqlite_dir");
-    std::fs::create_dir(&bad_db).unwrap();
-    let (code, _, err) = sm(
-        &home,
-        &["import", "legacy", bad_db.to_str().unwrap(), "--dry-run"],
-    );
     assert_eq!(code, 1);
     assert!(
         !err.trim().contains('\n') && err.starts_with("error:"),
