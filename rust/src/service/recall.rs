@@ -31,14 +31,12 @@ use crate::py::value::PyValue;
 use crate::service::capture::timeout_expired;
 use crate::service::capture::{Completed, Run, Stdio as TraceStdio, run_process, trace_spawn};
 use crate::service::query::{
-    LocalFound, QueryArgs, StrList, default_bias_from_cfg, keyword_aliases, resolve_scope_biases,
-    run_local_query, run_query, scope_df,
+    LocalFound, QueryArgs, StrList, default_bias_from_cfg, keyword_aliases, prefix_overlaps,
+    resolve_scope_biases, run_local_query, run_query, scope_df,
 };
 use crate::sources::{s, value_get};
 use crate::store::connect::connect;
-use crate::store::search::{
-    Filters, SearchOpts, count_scope, head as search_head, ids_matching, search_scored,
-};
+use crate::store::search::{Filters, SearchOpts, count_scope, head, ids_matching, search_scored};
 
 pub const DEFAULT_HAIKU_MIN_IDF: f64 = 3.0;
 /// Both idf floors, the model's `min_idf` and the local `local_min_idf`, apply only from this many
@@ -1392,12 +1390,6 @@ pub fn catch_up_failure_line(home: &PyPath) -> Result<String, SmError> {
 }
 
 /// Python `seq[:n]`.
-fn head<T: Clone>(v: &[T], n: i64) -> Vec<T> {
-    let len = v.len() as i64;
-    let end = if n < 0 { (len + n).max(0) } else { n.min(len) };
-    v[..end as usize].to_vec()
-}
-
 fn ids_value(items: &[Item]) -> PyValue {
     PyValue::List(items.iter().map(|it| s(&it.id)).collect())
 }
@@ -1418,11 +1410,6 @@ pub fn haiku_min_idf(hook_cfg: &PyValue) -> Result<f64, SmError> {
             }
         }
     }
-}
-
-fn prefix_overlaps(a: &str, b: &str) -> bool {
-    let (short, long) = if a.len() <= b.len() { (a, b) } else { (b, a) };
-    short.len() >= 4 && short.bytes().all(|b| b.is_ascii_alphabetic()) && long.starts_with(short)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1461,7 +1448,7 @@ fn haiku_search_and_floor(
         scope_biases: &scope_biases,
     };
     let (scored, _) = search_scored(&conn, query, &f, &opts, Some(0))?;
-    let scored = search_head(scored, fetch_limit);
+    let scored = head(scored, fetch_limit);
     if scored.is_empty() {
         return Ok((Vec::new(), Vec::new()));
     }
@@ -1804,7 +1791,7 @@ pub fn run_prompt_hook(
                     rewrite_ms,
                     db_ms,
                     &query,
-                    head(&kept, limit),
+                    head(kept, limit),
                     dropped,
                     cause,
                     matched_scopes,
@@ -1966,7 +1953,7 @@ pub fn run_prompt_hook(
         rewrite_ms,
         db_ms,
         &query,
-        head(&kept, limit),
+        head(kept, limit),
         dropped,
         "",
         matched_scopes,

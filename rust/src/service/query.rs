@@ -27,8 +27,8 @@ use crate::service::recall::{HAIKU_FLOOR_MIN_SCOPE, is_stopword};
 use crate::sources::value_get;
 use crate::store::connect::connect;
 use crate::store::search::{
-    Filters, KeywordAliases, SearchOpts, count_matches, count_scope, head, ids_matching, search,
-    search_pool, search_scored,
+    Filters, KeywordAliases, SearchOpts, count_matches, count_scope, head, head_cap, ids_matching,
+    search, search_pool, search_scored,
 };
 
 pub const MAX_MISSING_TERMS: usize = 5;
@@ -367,7 +367,7 @@ pub fn scope_df<S: AsRef<str>>(
     Ok(out)
 }
 
-fn prefix_overlaps(a: &str, b: &str) -> bool {
+pub(crate) fn prefix_overlaps(a: &str, b: &str) -> bool {
     let (short, long) = if a.len() <= b.len() { (a, b) } else { (b, a) };
     short.len() >= 4 && short.bytes().all(|b| b.is_ascii_alphabetic()) && long.starts_with(short)
 }
@@ -682,10 +682,7 @@ fn other_repos(
             let (mut scored, cap) = search_scored(conn, query_text, &all, o, None)?;
             let cap = drop_filler_hits(conn, &mut scored, cap, topic, &all)?;
             let items: Vec<Item> = scored.into_iter().map(|s| s.item).collect();
-            match cap {
-                Some(c) if c != 0 => (head(items, c), cap),
-                _ => (items, cap),
-            }
+            (head_cap(items, cap), cap)
         }
     };
     let in_scope = |r: &str| f.repo.as_deref() == Some(r) || r == "global" || r == "unassigned";
