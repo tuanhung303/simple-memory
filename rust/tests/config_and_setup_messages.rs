@@ -206,7 +206,7 @@ fn a_default_bias_scope_the_query_refuses_is_named_by_config_doctor_and_catch_up
     );
     let cfg = home.join("config.toml");
     let no_table = format!(
-        "unknown scope: acmee; {} has no [scopes] table (README: Multi-repo scopes and maintenance)",
+        "unknown scope: acmee; {} lists no scopes: add acmee = [\"repo:<name>\"] under a single [scopes] header (README: Multi-repo scopes and maintenance)",
         cfg.display()
     );
     for (scopes, value, why) in [
@@ -267,7 +267,7 @@ fn a_default_bias_scope_the_query_refuses_is_named_by_config_doctor_and_catch_up
 fn every_scope_reader_names_the_config_file_when_it_has_no_scopes_table() {
     let (_d, home) = scratch();
     let want = format!(
-        "unknown scope: acme; {}/config.toml has no [scopes] table (README: Multi-repo scopes and maintenance)",
+        "unknown scope: acme; {}/config.toml lists no scopes: add acme = [\"repo:<name>\"] under a single [scopes] header (README: Multi-repo scopes and maintenance)",
         home.display()
     );
     for args in [

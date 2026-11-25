@@ -1996,7 +1996,7 @@ fn query_names_an_unknown_repo_a_dropped_repo_and_a_config_with_no_scopes() {
         (
             2,
             format!(
-                "unknown scope: acme; {}/config.toml has no [scopes] table (README: Multi-repo scopes and maintenance)\n",
+                "unknown scope: acme; {}/config.toml lists no scopes: add acme = [\"repo:<name>\"] under a single [scopes] header (README: Multi-repo scopes and maintenance)\n",
                 home.display()
             )
         )
