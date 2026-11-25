@@ -113,10 +113,7 @@ fn caught(e: &SmError) -> bool {
 
 /// `" ".join(str(exc).split())`.
 fn one_line(msg: &str) -> String {
-    msg.split(crate::py::str::isspace)
-        .filter(|w| !w.is_empty())
-        .collect::<Vec<_>>()
-        .join(" ")
+    crate::py::str::split(msg).join(" ")
 }
 
 /// The name the traceback's last line gives: `module.Class` outside builtins
@@ -126,15 +123,6 @@ fn qualified_name(class: &str) -> &str {
         "SubprocessError" => "subprocess.SubprocessError",
         "TimeoutExpired" => "subprocess.TimeoutExpired",
         "CalledProcessError" => "subprocess.CalledProcessError",
-        "YAMLError" => "yaml.error.YAMLError",
-        "MarkedYAMLError" => "yaml.error.MarkedYAMLError",
-        "ScannerError" => "yaml.scanner.ScannerError",
-        "ParserError" => "yaml.parser.ParserError",
-        "ComposerError" => "yaml.composer.ComposerError",
-        "ConstructorError" => "yaml.constructor.ConstructorError",
-        "ReaderError" => "yaml.reader.ReaderError",
-        "JSONDecodeError" => "json.decoder.JSONDecodeError",
-        "UnsupportedOperation" => "io.UnsupportedOperation",
         other => other,
     }
 }

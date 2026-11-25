@@ -355,9 +355,7 @@ pub fn toml_key(key: &str) -> String {
     {
         return key.to_string();
     }
-    let mut out = String::new();
-    crate::py::json::encode_str(key, false, &mut out);
-    out
+    toml_key_json(key)
 }
 
 /// `_toml_value`: bool, int, float (repr), str (JSON), list; any other value is a TypeError.
@@ -520,8 +518,9 @@ pub fn scopes(cfg: &PyValue) -> Result<Scopes, SmError> {
 }
 
 /// The matchers of each path and of every path below it, deduplicated in first-seen order; an
-/// unknown path is an `UNKNOWN_SCOPE` error that lists the known ones, or with no `[scopes]`
-/// table, names the config.toml to add one to.
+/// unknown path is an `UNKNOWN_SCOPE` error that lists the known ones, or with no scopes, names
+/// the config.toml and the line to add (`sm init` writes an empty `[scopes]` header, and a second
+/// header breaks the file).
 pub fn scope_matchers<S: AsRef<str>>(scopes: &Scopes, paths: &[S]) -> Result<Vec<String>, SmError> {
     let mut out = Vec::new();
     let mut seen = std::collections::HashSet::new();
@@ -530,8 +529,9 @@ pub fn scope_matchers<S: AsRef<str>>(scopes: &Scopes, paths: &[S]) -> Result<Vec
             let known: Vec<&str> = scopes.iter().map(|(k, _)| k.as_str()).collect();
             let msg = if known.is_empty() {
                 format!(
-                    "unknown scope: {p}; {} has no [scopes] table (README: Multi-repo scopes and maintenance)",
-                    get_home(None)?.join("config.toml")
+                    "unknown scope: {p}; {} lists no scopes: add {} = [\"repo:<name>\"] under a single [scopes] header (README: Multi-repo scopes and maintenance)",
+                    get_home(None)?.join("config.toml"),
+                    toml_key(p)
                 )
             } else {
                 format!("unknown scope: {p}; known: {}", known.join(", "))

@@ -16,22 +16,17 @@ use crate::py::value::{PyValue, type_name};
 #[derive(Clone, Debug)]
 pub struct Opts {
     pub ensure_ascii: bool,
-    pub allow_nan: bool,
     pub sort_keys: bool,
     /// The indent string (`indent=2` is two spaces; a negative int is ""); None is one line.
     pub indent: Option<String>,
-    /// `(item_separator, key_separator)`; None is `(", ", ": ")`, or `(",", ": ")` with an indent.
-    pub separators: Option<(String, String)>,
 }
 
 impl Default for Opts {
     fn default() -> Self {
         Opts {
             ensure_ascii: true,
-            allow_nan: true,
             sort_keys: false,
             indent: None,
-            separators: None,
         }
     }
 }
@@ -54,15 +49,11 @@ impl Opts {
 
 /// `json.dumps(v, **opts)`.
 pub fn dumps(v: &PyValue, opts: &Opts) -> Result<String, SmError> {
-    let (item_sep, key_sep) = match &opts.separators {
-        Some((a, b)) => (a.clone(), b.clone()),
-        None if opts.indent.is_some() => (",".to_string(), ": ".to_string()),
-        None => (", ".to_string(), ": ".to_string()),
-    };
+    // Python's separators: `(",", ": ")` with an indent, else `(", ", ": ")`
+    let item_sep = if opts.indent.is_some() { "," } else { ", " };
     let mut enc = Encoder {
         opts,
         item_sep,
-        key_sep,
         out: String::new(),
     };
     if v.nesting() > SHALLOW {
@@ -101,8 +92,7 @@ pub fn from_json(v: &serde_json::Value) -> PyValue {
 
 struct Encoder<'a> {
     opts: &'a Opts,
-    item_sep: String,
-    key_sep: String,
+    item_sep: &'static str,
     out: String,
 }
 
@@ -117,24 +107,18 @@ pub fn int_text(s: &str) -> Result<String, SmError> {
 }
 
 impl Encoder<'_> {
-    fn float(&self, x: f64) -> Result<String, SmError> {
+    fn float(x: f64) -> String {
         if x.is_finite() {
-            return Ok(float::repr(x));
+            return float::repr(x);
         }
-        if !self.opts.allow_nan {
-            return Err(SmError::value(format!(
-                "Out of range float values are not JSON compliant: {}",
-                float::repr(x)
-            )));
-        }
-        Ok(if x.is_nan() {
+        if x.is_nan() {
             "NaN"
         } else if x > 0.0 {
             "Infinity"
         } else {
             "-Infinity"
         }
-        .to_string())
+        .to_string()
     }
 
     fn newline(&mut self, depth: usize) {
@@ -162,10 +146,7 @@ impl Encoder<'_> {
             PyValue::Bool(true) => self.out.push_str("true"),
             PyValue::Bool(false) => self.out.push_str("false"),
             PyValue::Int(s) => self.out.push_str(&int_text(s)?),
-            PyValue::Float(x) => {
-                let s = self.float(*x)?;
-                self.out.push_str(&s);
-            }
+            PyValue::Float(x) => self.out.push_str(&Self::float(*x)),
             PyValue::Str(s) => encode_str(s, self.opts.ensure_ascii, &mut self.out),
             PyValue::List(items) | PyValue::Tuple(items) => {
                 if items.is_empty() {
@@ -175,8 +156,7 @@ impl Encoder<'_> {
                 self.out.push('[');
                 for (i, it) in items.iter().enumerate() {
                     if i > 0 {
-                        let sep = self.item_sep.clone();
-                        self.out.push_str(&sep);
+                        self.out.push_str(self.item_sep);
                     }
                     self.newline(depth + 1);
                     self.value(it, depth + 1)?;
@@ -197,13 +177,11 @@ impl Encoder<'_> {
                 for (i, (k, val)) in order.into_iter().enumerate() {
                     let key = self.key(k)?;
                     if i > 0 {
-                        let sep = self.item_sep.clone();
-                        self.out.push_str(&sep);
+                        self.out.push_str(self.item_sep);
                     }
                     self.newline(depth + 1);
                     encode_str(&key, self.opts.ensure_ascii, &mut self.out);
-                    let sep = self.key_sep.clone();
-                    self.out.push_str(&sep);
+                    self.out.push_str(": ");
                     self.value(val, depth + 1)?;
                 }
                 self.newline(depth);
@@ -224,7 +202,7 @@ impl Encoder<'_> {
     fn key(&self, k: &PyValue) -> Result<String, SmError> {
         match k {
             PyValue::Str(s) => Ok(s.clone()),
-            PyValue::Float(x) => self.float(*x),
+            PyValue::Float(x) => Ok(Self::float(*x)),
             PyValue::Bool(b) => Ok(if *b { "true" } else { "false" }.into()),
             PyValue::None => Ok("null".into()),
             PyValue::Int(s) => int_text(s),
@@ -818,14 +796,6 @@ mod tests {
             ),
             "[-Infinity]"
         );
-        let strict = Opts {
-            allow_nan: false,
-            ..Opts::default()
-        };
-        assert_eq!(
-            d(PyValue::Float(f64::NAN), &strict),
-            "ValueError: Out of range float values are not JSON compliant: nan"
-        );
         let tk = PyValue::Dict(vec![(
             PyValue::Tuple(vec![PyValue::int(1)]),
             PyValue::int(1),
@@ -857,7 +827,7 @@ mod tests {
     }
 
     #[test]
-    fn dumps_indent_sort_and_separators() {
+    fn dumps_indent_and_sort() {
         let inner = PyValue::Dict(vec![(s("b"), PyValue::List(vec![]))]);
         let v = PyValue::Dict(vec![(
             s("a"),
@@ -881,17 +851,6 @@ mod tests {
                 }
             ),
             "{\n\t\"x\": 1\n}"
-        );
-        let compact = Opts {
-            separators: Some((",".into(), ":".into())),
-            ..Opts::default()
-        };
-        assert_eq!(
-            d(
-                PyValue::List(vec![PyValue::int(1), PyValue::List(vec![PyValue::int(2)])]),
-                &compact
-            ),
-            "[1,[2]]"
         );
         let keys = PyValue::Dict(vec![
             (s("b"), PyValue::int(1)),

@@ -263,10 +263,38 @@ fn an_unknown_path_exits_2_and_lists_the_known_ones() {
         (
             2,
             format!(
-                "unknown scope: acme; {}/config.toml has no [scopes] table (README: Multi-repo scopes and maintenance)\n",
+                "unknown scope: acme; {}/config.toml lists no scopes: add acme = [\"repo:<name>\"] under a single [scopes] header (README: Multi-repo scopes and maintenance)\n",
                 bare.display()
             )
         )
+    );
+}
+
+#[test]
+fn the_no_scopes_hint_on_an_init_config_leads_to_a_working_scope() {
+    // E1(d): sm init writes an empty [scopes] header, so the hint must not ask for a new one
+    let (_d, home) = scratch();
+    assert_eq!(sm(&home, &["init"]).0, 0);
+    let (code, _, err) = sm(&home, &["query", "kiwi", "--in", "team"]);
+    assert_eq!(
+        (code, err),
+        (
+            2,
+            format!(
+                "unknown scope: team; {}/config.toml lists no scopes: add team = [\"repo:<name>\"] under a single [scopes] header (README: Multi-repo scopes and maintenance)\n",
+                home.display()
+            )
+        )
+    );
+    let cfg = home.join("config.toml");
+    let text = std::fs::read_to_string(&cfg).unwrap();
+    assert_eq!(text.matches("\n[scopes]\n").count(), 1);
+    let fixed = text.replace("\n[scopes]\n", "\n[scopes]\nteam = [\"repo:kiwi-web\"]\n");
+    std::fs::write(&cfg, fixed).unwrap();
+    let (code, out, err) = sm(&home, &["query", "kiwi", "--in", "team"]);
+    assert_eq!(
+        (code, out.as_str(), err.as_str()),
+        (0, "missing: kiwi=0\n", "")
     );
 }
 

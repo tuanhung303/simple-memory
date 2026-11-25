@@ -761,16 +761,33 @@ pub fn run_lookup(query_text: &str, a: &QueryArgs) -> Result<Lookup, SmError> {
         .iter()
         .flat_map(|s| s.why.terms_matched.iter())
         .collect();
-    let mut missing = Vec::new();
-    for t in terms {
-        if !held.contains(&t) && is_hint_term(&t) && !(has_content && is_stopword(&t)) {
-            let fts = term_fts(&t);
-            let n = count_matches(&conn, &fts, &f)?;
-            if n > 0 && (t == full_folded || t == pos_folded) {
-                continue;
+    let lacks = |p: &str| {
+        !held.contains(&p.to_string()) && is_hint_term(p) && !(has_content && is_stopword(p))
+    };
+    // an identifier (`blast-radius`) is one missing term, though its pieces rank on their own
+    let mut footer_terms: Vec<String> = Vec::new();
+    for tok in py::str::split(&pos_folded) {
+        let pieces = crate::core::terms::word_runs(tok);
+        let t = match pieces[..] {
+            [] => continue,
+            [p] if lacks(p) => p,
+            [_, _, ..] if pieces.iter().any(|p| lacks(p)) => {
+                tok.trim_matches(|c| !py::str::is_word(c))
             }
-            missing.push((t, n, fts));
+            _ => continue,
+        };
+        if !footer_terms.iter().any(|f| f == t) {
+            footer_terms.push(t.to_string());
         }
+    }
+    let mut missing = Vec::new();
+    for t in footer_terms {
+        let fts = term_fts(&t);
+        let n = count_matches(&conn, &fts, &f)?;
+        if n > 0 && (t == full_folded || t == pos_folded) {
+            continue;
+        }
+        missing.push((t, n, fts));
     }
     missing.truncate(MAX_MISSING_TERMS);
     let other_scope = f.repo.as_deref().is_some_and(|r| !r.is_empty()) && !f.include_all_repos;
