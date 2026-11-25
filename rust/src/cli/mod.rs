@@ -113,10 +113,7 @@ fn caught(e: &SmError) -> bool {
 
 /// `" ".join(str(exc).split())`.
 fn one_line(msg: &str) -> String {
-    msg.split(crate::py::str::isspace)
-        .filter(|w| !w.is_empty())
-        .collect::<Vec<_>>()
-        .join(" ")
+    crate::py::str::split(msg).join(" ")
 }
 
 /// The name the traceback's last line gives: `module.Class` outside builtins
