@@ -455,47 +455,22 @@ fn fromtimestamp_local(ts: f64) -> Result<(NaiveDateTime, i32), SmError> {
         frac += 1e6;
         intpart -= 1.0;
     }
-    // time_t is i64: [-2^63, 2^63).
-    if !(-(2f64.powi(63))..2f64.powi(63)).contains(&intpart) {
-        return Err(SmError::overflow(
-            "timestamp out of range for platform time_t",
-        ));
-    }
-    let secs = intpart as i64;
-    let days = secs.div_euclid(86400);
-    let year = civil_year(days);
-    if year - 1900 > i32::MAX as i64 || year - 1900 < i32::MIN as i64 {
-        return Err(SmError::from_python(
-            "OSError",
-            "[Errno 84] Value too large to be stored in data type",
-        ));
-    }
-    if !(1..=9999).contains(&year) {
+    // `as` saturates, and chrono refuses what is past its +-262143 years
+    let utc = DateTime::from_timestamp(intpart as i64, frac as u32 * 1000)
+        .ok_or_else(|| SmError::overflow(clock::TIME_T_RANGE))?
+        .naive_utc();
+    if !(1..=9999).contains(&utc.year()) {
         return Err(SmError::value(format!(
-            "year must be in 1..9999, not {year}"
+            "year must be in 1..9999, not {}",
+            utc.year()
         )));
     }
-    let utc = DateTime::from_timestamp(secs, frac as u32 * 1000)
-        .expect("a year in 1..9999 is a valid time")
-        .naive_utc();
     let local_off = clock::local_offset_seconds_at(utc.and_utc().timestamp());
     let local = utc
         .checked_add_signed(Duration::seconds(local_off as i64))
         .filter(in_range)
         .ok_or_else(|| SmError::overflow("date value out of range"))?;
     Ok((local, local_off))
-}
-
-/// The proleptic Gregorian year of a day count from 1970-01-01 (Hinnant's civil_from_days).
-fn civil_year(days: i64) -> i64 {
-    let z = days as i128 + 719468;
-    let era = z.div_euclid(146097);
-    let doe = z - era * 146097;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    (yoe + era * 400 + i128::from(m <= 2)) as i64
 }
 
 /// `epoch_to_as_of(ts)`.
@@ -907,9 +882,10 @@ mod tests {
                 utc_to_local_iso(9999, 12, 31, 17, 0, 0)
             );
         }
+        // by hand: 0000-01-01 is day -719528, so day -729166.7 falls 26.4 years before it
         assert_eq!(
-            epoch_to_as_of(1e17).unwrap_err().python_text(),
-            "OSError: [Errno 84] Value too large to be stored in data type"
+            epoch_to_as_of(-6.3e10).unwrap_err().python_text(),
+            "ValueError: year must be in 1..9999, not -27"
         );
         assert_eq!(
             epoch_to_as_of(f64::INFINITY).unwrap_err().python_text(),
