@@ -6,8 +6,9 @@
 //!   Unlike Python, a literal escape `\n`, `\r` or `\t` before the core also passes (two chars on).
 //! - `\b` before a word char (`\bBearer`, `\bsig=`, ...) is `(?<!\w)`, with Python's `\w` from
 //!   `py::str`, and `\s` is Python's `\s`.
-//! - re.IGNORECASE letters are sre's sets (`py::str::ci_chars`): `i` also matches U+0130 and
-//!   U+0131, `k` U+212A, `s` U+017F. A pattern that matches less than Python's leaks a secret.
+//! - Key names and markers match case-insensitively in ASCII only: Python's re.IGNORECASE also
+//!   takes U+0130 and U+0131 for `i`, U+212A for `k` and U+017F for `s`, and those keys are left
+//!   (redaction blocks the common secret shapes).
 //! - key_value and the `<private>` tag are scanners: Python's backtracking over them is
 //!   deterministic once the spans are fixed (see `key_value_find`), and a scan is linear where
 //!   Python's search is quadratic on a long run of key chars.
@@ -20,7 +21,7 @@ use regex::Regex;
 
 use crate::core::item::{Item, compute_content_hash};
 use crate::core::refs::{RefsArg, extract_refs, split_refs};
-use crate::py::str::{S_INNER, W_INNER, ci_chars, ci_set, is_word, isspace};
+use crate::py::str::{S_INNER, W_INNER, is_word, isspace};
 
 /// Counts per kind, in the order Python's dict gets them.
 pub type Counts = IndexMap<String, i64>;
@@ -48,21 +49,11 @@ fn run(t: &str, i: usize, pred: impl Fn(char) -> bool) -> (usize, usize) {
     (t.len(), n)
 }
 
-/// An ASCII literal under re.IGNORECASE, one sre set per char.
-fn ci_seq(lit: &str) -> Vec<Vec<char>> {
-    lit.chars().map(ci_chars).collect()
-}
-
-/// Does `t` at `i` start with the IGNORECASE literal `seq`? Gives the end.
-fn ci_at(t: &str, i: usize, seq: &[Vec<char>]) -> Option<usize> {
-    let mut it = t[i..].char_indices();
-    for set in seq {
-        let (_, c) = it.next()?;
-        if !set.contains(&c) {
-            return None;
-        }
-    }
-    Some(it.next().map_or(t.len(), |(off, _)| i + off))
+/// Does `t` at `i` start with the ASCII literal `lit`, ignoring ASCII case?
+fn starts_ci(t: &str, i: usize, lit: &str) -> bool {
+    t.as_bytes()
+        .get(i..i + lit.len())
+        .is_some_and(|b| b.eq_ignore_ascii_case(lit.as_bytes()))
 }
 
 /// A pattern `(?<![X])core`: the regex is `(?:\A|[^X])(?:core)`.
@@ -240,44 +231,24 @@ static SECRET_PATTERNS: LazyLock<Vec<(&'static str, Matcher)>> = LazyLock::new(|
 
 // ---------------------------------------------------------------- key_value
 
-/// `[A-Za-z0-9_.-]` under re.IGNORECASE (adds U+0130, U+0131, U+017F, U+212A).
-static KEY_SET: LazyLock<Vec<char>> = LazyLock::new(|| {
-    ci_set(
-        ('A'..='Z')
-            .chain('a'..='z')
-            .chain('0'..='9')
-            .chain(['_', '.', '-']),
-    )
-});
-
+/// `[A-Za-z0-9_.-]`.
 fn key_char(c: char) -> bool {
-    if c.is_ascii() {
-        c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-')
-    } else {
-        KEY_SET.binary_search(&c).is_ok()
-    }
+    c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-')
 }
 
 /// The AWS secret access key names; they also take `kv_aws_secret`.
 const ACCESS_KEY_WORDS: [&str; 2] = ["secret_access_key", "secretaccesskey"];
 
-/// `(?:password|...|apikey)(?:_key|key|_value|s)?` as IGNORECASE char sets, every word with every
-/// suffix (and none).
-static KEY_TAILS: LazyLock<Vec<Vec<Vec<char>>>> = LazyLock::new(|| {
+/// `(?:password|...|apikey)(?:_key|key|_value|s)?`, every word with every suffix (and none).
+static KEY_TAILS: LazyLock<Vec<String>> = LazyLock::new(|| {
     let words = ["password", "passwd", "secret", "token", "api_key", "apikey"];
     let suffixes = ["", "_key", "key", "_value", "s"];
     words
         .iter()
         .chain(&ACCESS_KEY_WORDS)
-        .flat_map(|w| suffixes.iter().map(move |s| ci_seq(&format!("{w}{s}"))))
+        .flat_map(|w| suffixes.iter().map(move |s| format!("{w}{s}")))
         .collect()
 });
-
-static ACCESS_KEY_TAILS: LazyLock<Vec<Vec<Vec<char>>>> =
-    LazyLock::new(|| ACCESS_KEY_WORDS.iter().map(|w| ci_seq(w)).collect());
-
-/// `\[REDACTED:` under re.IGNORECASE.
-static REDACTED_SEQ: LazyLock<Vec<Vec<char>>> = LazyLock::new(|| ci_seq("[REDACTED:"));
 
 /// `_V`: `[^\s"'`\],;}{]` (no char in it has a case).
 fn is_v(c: char) -> bool {
@@ -293,12 +264,12 @@ fn skip_space(t: &str, i: usize) -> usize {
     run(t, i, isspace).0
 }
 
-/// Does the key run end with one of `tails`?
-fn ends_with_any(seg: &str, tails: &[Vec<Vec<char>>]) -> bool {
-    let longest = tails.iter().map(Vec::len).max().unwrap_or(0);
-    let tail: Vec<char> = seg.chars().rev().take(longest).collect();
-    tails.iter().any(|seq| {
-        seq.len() <= tail.len() && seq.iter().rev().zip(&tail).all(|(set, c)| set.contains(c))
+/// Does the key run end with one of `tails`, ignoring ASCII case?
+fn ends_with_any(seg: &str, tails: &[impl AsRef<str>]) -> bool {
+    let seg = seg.as_bytes();
+    tails.iter().any(|tail| {
+        let tail = tail.as_ref().as_bytes();
+        seg.len() >= tail.len() && seg[seg.len() - tail.len()..].eq_ignore_ascii_case(tail)
     })
 }
 
@@ -346,7 +317,7 @@ fn past_markers(t: &str, w: usize, mut end: usize) -> usize {
 /// `(?!\[REDACTED:)(?![0-9]+(?!V))V{8,}["']?` at `w`: the end of the match. A value that starts
 /// with a marker is taken only when more of the value follows it.
 fn kv_value(t: &str, w: usize) -> Option<usize> {
-    if ci_at(t, w, &REDACTED_SEQ).is_some() && !marker_then_more(t, w) {
+    if starts_ci(t, w, "[REDACTED:") && !marker_then_more(t, w) {
         return None;
     }
     // `[0-9]+(?!V)`: digits are V, so only the longest digit run can end before a non-V char
@@ -382,7 +353,7 @@ fn kv_bare(t: &str, i: usize) -> Option<usize> {
         return None;
     }
     // a value that starts with a marker is a token: it goes on over `:` and `/` as `kv_value` does
-    if ci_at(t, w, &REDACTED_SEQ).is_some() {
+    if starts_ci(t, w, "[REDACTED:") {
         let close = run(t, w, is_v).0;
         return marker_then_more(t, w).then(|| past_markers(t, w, close));
     }
@@ -487,7 +458,7 @@ fn key_value_find(t: &str, pos: usize) -> Option<(usize, usize)> {
         let (e, _) = run(t, r0, key_char);
         let seg = &t[r0..e];
         if ends_with_any(seg, &KEY_TAILS)
-            && let Some(end) = kv_after_key(t, e, ends_with_any(seg, &ACCESS_KEY_TAILS))
+            && let Some(end) = kv_after_key(t, e, ends_with_any(seg, &ACCESS_KEY_WORDS))
         {
             let start = if r0 > pos && matches!(b[r0 - 1], b'"' | b'\'') {
                 r0 - 1
@@ -516,7 +487,7 @@ fn through_pairs(t: &str, mut end: usize) -> usize {
         if !ends_with_any(seg, &KEY_TAILS) {
             return end;
         }
-        match kv_after_key(t, k, ends_with_any(seg, &ACCESS_KEY_TAILS)) {
+        match kv_after_key(t, k, ends_with_any(seg, &ACCESS_KEY_WORDS)) {
             Some(e) => end = e,
             None => return end,
         }
@@ -563,9 +534,6 @@ fn signature_spans_with(
 
 // ---------------------------------------------------------------- private blocks
 
-/// `private` under re.IGNORECASE.
-static PRIVATE_SEQ: LazyLock<Vec<Vec<char>>> = LazyLock::new(|| ci_seq("private"));
-
 /// One `<private>` tag: its byte span and whether it closes.
 struct Tag {
     start: usize,
@@ -573,7 +541,7 @@ struct Tag {
     close: bool,
 }
 
-/// `_PRIVATE_TAG_RE.finditer`: `<(/?)private\b[^>]*>` under re.IGNORECASE. `\b` after `e` is
+/// `_PRIVATE_TAG_RE.finditer`: `<(/?)private\b[^>]*>`, ignoring ASCII case. `\b` after `e` is
 /// "no word char next", and `[^>]*>` ends at the first `>`.
 fn private_tags(text: &str) -> Vec<Tag> {
     let b = text.as_bytes();
@@ -583,9 +551,11 @@ fn private_tags(text: &str) -> Vec<Tag> {
         let start = pos + off;
         pos = start + 1;
         let close = b.get(pos) == Some(&b'/');
-        let Some(k) = ci_at(text, pos + usize::from(close), &PRIVATE_SEQ) else {
+        let at = pos + usize::from(close);
+        if !starts_ci(text, at, "private") {
             continue;
-        };
+        }
+        let k = at + "private".len();
         if char_at(text, k).is_some_and(is_word) {
             continue;
         }
@@ -967,8 +937,7 @@ mod tests {
         assert_eq!(r("explain the <private> tag"), "explain the <private> tag");
         assert_eq!(r("a </private> b"), "a </private> b");
         assert_eq!(r(""), "");
-        // Python's re.I: U+0130 and U+0131 match i; `private\b` needs a non-word char after
-        assert_eq!(r("a <PRİVATE>b</prıvate> c"), "a [REDACTED:private] c");
+        // `private\b` needs a non-word char after
         assert_eq!(
             r("a <privates>b</privates> c"),
             "a <privates>b</privates> c"
@@ -1702,34 +1671,21 @@ mod tests {
 
     #[test]
     fn ignorecase_and_python_classes_catch_what_the_regex_crate_would_miss() {
-        // each is redacted by Python 3.15.1; a plain [iI] class would leave the first two, and the
-        // regex crate's \s would leave the Bearer one
-        assert_eq!(
-            redact_text("APİ_KEY=Zx9Qw8Er7Ty6", None, None),
-            "[REDACTED:key_value]"
-        );
-        assert_eq!(
-            redact_text("apı_key=Zx9Qw8Er7Ty6", None, None),
-            "[REDACTED:key_value]"
-        );
-        assert_eq!(
-            redact_text("PAſſWORD: Hunter2Secret99", None, None),
-            "[REDACTED:key_value]"
-        );
-        assert_eq!(
-            redact_text("to\u{212a}en=Zx9Qw8Er7Ty6", None, None),
-            "[REDACTED:key_value]"
-        );
-        // U+0130 is in the key's [A-Za-z0-9_.-] under re.I: it joins the key before, and it
-        // blocks the key's end after (Python leaves the second one)
-        assert_eq!(
-            redact_text("\u{130}_password=Zx9Qw8Er7Ty6", None, None),
-            "[REDACTED:key_value]"
-        );
-        assert_eq!(
-            redact_text("pa\u{17f}\u{17f}word\u{130}=Zx9Qw8Er7Ty6", None, None),
-            "pa\u{17f}\u{17f}word\u{130}=Zx9Qw8Er7Ty6"
-        );
+        // each is redacted by Python 3.15.1; the regex crate's \s would leave the Bearer one
+        // key names match in any ASCII case, with or without a suffix
+        for key in [
+            "Api_Key",
+            "PASSWD",
+            "SecretAccessKey",
+            "tOkEnS",
+            "x.API_KEY_VALUE",
+        ] {
+            assert_eq!(
+                redact_text(&format!("{key}=Zx9Qw8Er7Ty6"), None, None),
+                "[REDACTED:key_value]",
+                "{key}"
+            );
+        }
         // \x1c is \s to Python between the key and `=`
         assert_eq!(
             redact_text("token\x1c=Zx9Qw8Er7Ty6", None, None),
