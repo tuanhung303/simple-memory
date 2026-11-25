@@ -6,8 +6,8 @@ use crate::cli::query::{
     HOOK_REFS_CHARS, HOOK_TITLE_CHARS, compact_refs, refs_without_source, shlex_quote,
 };
 use crate::config::load_config;
-use crate::core::rank::clip;
 use crate::core::item::Item;
+use crate::core::rank::clip;
 use crate::error::SmError;
 use crate::py;
 use crate::py::argparse::Namespace;

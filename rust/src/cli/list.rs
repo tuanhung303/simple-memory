@@ -1,12 +1,7 @@
 //! The `list` command with its brief, text, and JSON formatters.
 
-use std::collections::BTreeSet;
-
-use crate::cli::query::{
-    HEADER_REFS_CHARS, HOOK_TITLE_CHARS, MAX_TOTAL_CHARS, MIN_TEXT_CHARS, compact_refs,
-    refs_without_source, shlex_quote, status_marker,
-};
-use crate::core::rank::{clip, match_snippet};
+use crate::cli::query::{brief_line, item_header, shlex_quote, text_caps};
+use crate::core::rank::match_snippet;
 use crate::error::SmError;
 use crate::py;
 use crate::py::argparse::{Namespace, Value};
@@ -15,7 +10,7 @@ use crate::py::value::PyValue;
 use crate::service::list::{
     DEFAULT_LIST_LIMIT, ListArgs, ListPage, list_json, list_next_cmds, run_list,
 };
-use crate::service::query::{StrList, item_text, item_tokens, split_list};
+use crate::service::query::{StrList, item_text, split_list};
 use crate::service::usage::log_usage;
 use crate::store::search::StatusFilter;
 
@@ -116,93 +111,28 @@ fn footer_lines(page: &ListPage, ns: &Namespace) -> Vec<String> {
 }
 
 pub fn format_list_brief(page: &ListPage, footer: &[String]) -> String {
-    let mut lines: Vec<String> = Vec::new();
-    for (i, it) in page.items.iter().enumerate() {
-        let rank = page.offset as i128 + i as i128 + 1;
-        let title = clip(&py::str::split(&it.title).join(" "), HOOK_TITLE_CHARS);
-        let marker = status_marker(it).map_or_else(String::new, |m| format!(" [{m}]"));
-        lines.push(format!(
-            "[{}] #{rank} {} {} {} {} ~{} tok{marker}: {title}",
-            it.id,
-            it.repo,
-            it.kind,
-            it.tag,
-            py::str::slice(&it.as_of, None, Some(10)),
-            item_tokens(it)
-        ));
-    }
+    let mut lines: Vec<String> = page
+        .items
+        .iter()
+        .enumerate()
+        .map(|(i, it)| brief_line(it, page.offset as i128 + i as i128 + 1))
+        .collect();
     lines.extend(footer.iter().cloned());
     lines.join("\n")
 }
 
 pub fn format_list_text(page: &ListPage, footer: &[String]) -> String {
-    let mut headers: Vec<String> = Vec::new();
-    let mut texts: Vec<String> = Vec::new();
-    for (i, it) in page.items.iter().enumerate() {
-        let rank = page.offset as i128 + i as i128 + 1;
-        let mut parts = vec![
-            format!("[{}]", it.id),
-            format!("#{rank}"),
-            format!("repo={}", it.repo),
-            format!("kind={}", it.kind),
-            format!("tag={}", it.tag),
-            format!("as_of={}", it.as_of),
-            format!("~{} tok", item_tokens(it)),
-        ];
-        if !it.source.is_empty() {
-            parts.push(format!("source={}", it.source));
-        }
-        let refs = refs_without_source(it);
-        if !refs.is_empty() {
-            parts.push(format!("refs={}", compact_refs(&refs, HEADER_REFS_CHARS)));
-        }
-        if let Some(m) = status_marker(it) {
-            parts.push(m);
-        }
-        headers.push(parts.join(" "));
-        texts.push(item_text(it));
-    }
-    let lens: Vec<i64> = texts.iter().map(|t| py::str::len(t) as i64).collect();
-    let footer_chars: i64 = footer.iter().map(|l| py::str::len(l) as i64 + 1).sum();
-    let total_overhead: i64 = headers
+    let headers: Vec<String> = page
+        .items
         .iter()
-        .map(|h| py::str::len(h) as i64 + 4)
-        .sum::<i64>()
-        + footer_chars;
-    let floor: i64 = lens.iter().map(|&n| n.min(MIN_TEXT_CHARS as i64)).sum();
-    let avail_text = floor.max(MAX_TOTAL_CHARS as i64 - total_overhead);
-
-    let mut caps = lens.clone();
-    if caps.iter().sum::<i64>() > avail_text {
-        let mut remaining = avail_text;
-        let mut undecided: BTreeSet<usize> = (0..texts.len()).collect();
-        while !undecided.is_empty() {
-            let k = undecided.len() as i64;
-            let share = remaining.div_euclid(k);
-            let short: Vec<usize> = undecided
-                .iter()
-                .copied()
-                .filter(|&i| lens[i] <= share)
-                .collect();
-            if short.is_empty() {
-                let rem = remaining.rem_euclid(k);
-                for (pos, &i) in undecided.iter().enumerate() {
-                    let extra = i64::from((pos as i64) < rem);
-                    caps[i] = (share + extra).max(0);
-                }
-                break;
-            }
-            for i in short {
-                caps[i] = lens[i];
-                remaining -= lens[i];
-                undecided.remove(&i);
-            }
-        }
-    }
-
+        .enumerate()
+        .map(|(i, it)| item_header(it, page.offset as i128 + i as i128 + 1, None))
+        .collect();
+    let texts: Vec<String> = page.items.iter().map(item_text).collect();
+    let caps = text_caps(&headers, &texts, footer);
     let mut blocks: Vec<String> = Vec::new();
     for ((header, text), &cap) in headers.iter().zip(&texts).zip(&caps) {
-        let snippet = match_snippet(text, &[], &[], cap.max(0) as usize);
+        let snippet = match_snippet(text, &[], &[], cap);
         blocks.push(format!("{header}\n  {snippet}"));
     }
     blocks.extend(footer.iter().cloned());

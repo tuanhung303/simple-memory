@@ -3,6 +3,7 @@
 
 use std::collections::BTreeSet;
 
+use crate::core::item::Item;
 use crate::core::rank::{Why, clip, match_snippet};
 use crate::core::tags::retired_label;
 use crate::error::SmError;
@@ -340,36 +341,35 @@ fn footer_lines(lk: &Lookup, ns: &Namespace, limit: &LimitText) -> Vec<String> {
     lines
 }
 
-/// One block per hit; hits and footer stay inside
-/// MAX_TOTAL_CHARS, each text keeping at least min(len, MIN_TEXT_CHARS).
-pub fn format_query_text(lk: &Lookup, footer: &[String]) -> String {
-    let mut headers: Vec<String> = Vec::new();
-    let mut texts: Vec<String> = Vec::new();
-    for (i, s) in lk.hits.iter().enumerate() {
-        let it = &s.item;
-        let mut parts = vec![
-            format!("[{}]", it.id),
-            format!("#{}", i + 1),
-            format!("repo={}", it.repo),
-            format!("kind={}", it.kind),
-            format!("tag={}", it.tag),
-            format!("as_of={}", it.as_of),
-            format!("~{} tok", item_tokens(it)),
-            format!("why={}", why_text(&s.why)),
-        ];
-        if !it.source.is_empty() {
-            parts.push(format!("source={}", it.source));
-        }
-        let refs = refs_without_source(it);
-        if !refs.is_empty() {
-            parts.push(format!("refs={}", compact_refs(&refs, HEADER_REFS_CHARS)));
-        }
-        if let Some(m) = status_marker(it) {
-            parts.push(m);
-        }
-        headers.push(parts.join(" "));
-        texts.push(item_text(it));
+/// One header line: id, rank, repo, kind, tag, as_of and tokens, then `why` when given, then
+/// source, refs and status.
+pub fn item_header(it: &Item, rank: i128, why: Option<String>) -> String {
+    let mut parts = vec![
+        format!("[{}]", it.id),
+        format!("#{rank}"),
+        format!("repo={}", it.repo),
+        format!("kind={}", it.kind),
+        format!("tag={}", it.tag),
+        format!("as_of={}", it.as_of),
+        format!("~{} tok", item_tokens(it)),
+    ];
+    parts.extend(why);
+    if !it.source.is_empty() {
+        parts.push(format!("source={}", it.source));
     }
+    let refs = refs_without_source(it);
+    if !refs.is_empty() {
+        parts.push(format!("refs={}", compact_refs(&refs, HEADER_REFS_CHARS)));
+    }
+    if let Some(m) = status_marker(it) {
+        parts.push(m);
+    }
+    parts.join(" ")
+}
+
+/// A cap per text so headers, texts and footer stay inside MAX_TOTAL_CHARS, each text keeping
+/// at least min(len, MIN_TEXT_CHARS); short texts keep all, the long ones split the rest.
+pub fn text_caps(headers: &[String], texts: &[String], footer: &[String]) -> Vec<usize> {
     let lens: Vec<i64> = texts.iter().map(|t| py::str::len(t) as i64).collect();
     let footer_chars: i64 = footer.iter().map(|l| py::str::len(l) as i64 + 1).sum();
     let total_overhead: i64 = headers
@@ -407,38 +407,57 @@ pub fn format_query_text(lk: &Lookup, footer: &[String]) -> String {
             }
         }
     }
+    caps.into_iter().map(|c| c.max(0) as usize).collect()
+}
 
+/// One block per hit; hits and footer stay inside
+/// MAX_TOTAL_CHARS, each text keeping at least min(len, MIN_TEXT_CHARS).
+pub fn format_query_text(lk: &Lookup, footer: &[String]) -> String {
+    let headers: Vec<String> = lk
+        .hits
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            item_header(
+                &s.item,
+                i as i128 + 1,
+                Some(format!("why={}", why_text(&s.why))),
+            )
+        })
+        .collect();
+    let texts: Vec<String> = lk.hits.iter().map(|s| item_text(&s.item)).collect();
+    let caps = text_caps(&headers, &texts, footer);
     let mut blocks: Vec<String> = Vec::new();
     for (((s, header), text), &cap) in lk.hits.iter().zip(&headers).zip(&texts).zip(&caps) {
-        let snippet = match_snippet(
-            text,
-            &s.why.terms_matched,
-            &s.why.ref_hits,
-            cap.max(0) as usize,
-        );
+        let snippet = match_snippet(text, &s.why.terms_matched, &s.why.ref_hits, cap);
         blocks.push(format!("{header}\n  {snippet}"));
     }
     blocks.extend(footer.iter().cloned());
     blocks.join("\n")
 }
 
+/// One brief line: id, rank, repo, kind, tag, date, tokens and status, then the clipped title.
+pub fn brief_line(it: &Item, rank: i128) -> String {
+    let title = clip(&py::str::split(&it.title).join(" "), HOOK_TITLE_CHARS);
+    let marker = status_marker(it).map_or_else(String::new, |m| format!(" [{m}]"));
+    format!(
+        "[{}] #{rank} {} {} {} {} ~{} tok{marker}: {title}",
+        it.id,
+        it.repo,
+        it.kind,
+        it.tag,
+        py::str::slice(&it.as_of, None, Some(10)),
+        item_tokens(it)
+    )
+}
+
 pub fn format_query_brief(lk: &Lookup, footer: &[String]) -> String {
-    let mut lines: Vec<String> = Vec::new();
-    for (i, s) in lk.hits.iter().enumerate() {
-        let it = &s.item;
-        let title = clip(&py::str::split(&it.title).join(" "), HOOK_TITLE_CHARS);
-        let marker = status_marker(it).map_or_else(String::new, |m| format!(" [{m}]"));
-        lines.push(format!(
-            "[{}] #{} {} {} {} {} ~{} tok{marker}: {title}",
-            it.id,
-            i + 1,
-            it.repo,
-            it.kind,
-            it.tag,
-            py::str::slice(&it.as_of, None, Some(10)),
-            item_tokens(it)
-        ));
-    }
+    let mut lines: Vec<String> = lk
+        .hits
+        .iter()
+        .enumerate()
+        .map(|(i, s)| brief_line(&s.item, i as i128 + 1))
+        .collect();
     lines.extend(footer.iter().cloned());
     lines.join("\n")
 }
