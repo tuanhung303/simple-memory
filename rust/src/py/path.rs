@@ -235,11 +235,6 @@ impl PyPath {
         realpath(&self.s).map(|s| PyPath::new(&s))
     }
 
-    /// `path.exists()` (follows links; any error is False).
-    pub fn exists(&self) -> bool {
-        std::fs::metadata(self.to_os()).is_ok()
-    }
-
     pub fn is_file(&self) -> bool {
         std::fs::metadata(self.to_os()).is_ok_and(|m| m.is_file())
     }
@@ -1174,6 +1169,6 @@ mod tests {
             missing.read_text(Errors::Strict).unwrap_err().python_text(),
             format!("FileNotFoundError: [Errno 2] No such file or directory: '{missing}'")
         );
-        assert!(!missing.exists() && !missing.is_file() && p.is_dir() && !p.is_file());
+        assert!(!missing.is_file() && !missing.is_dir() && p.is_dir() && !p.is_file());
     }
 }

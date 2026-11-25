@@ -291,14 +291,6 @@ impl RepoRoots {
         Ok(RepoRoots { roots: out })
     }
 
-    /// `RepoRoots.names`: every child of every root, longest first.
-    pub fn names(&self) -> Vec<String> {
-        let set: HashSet<&String> = self.roots.iter().flat_map(|(_, _, n)| n.iter()).collect();
-        let mut v: Vec<String> = set.into_iter().cloned().collect();
-        sort_names(&mut v);
-        v
-    }
-
     /// `repo_from_key(key)`: the root child a Claude Code project key names, else "unassigned".
     pub fn repo_from_key(&self, key: &str) -> String {
         for (_, tail, names) in &self.roots {

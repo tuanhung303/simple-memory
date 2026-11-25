@@ -635,7 +635,7 @@ mod tests {
         let home = PyPath::new(dir.path().to_str().unwrap());
         let _held = catchup_lock(&home).unwrap();
         assert_eq!(run_catchup(Some(home.as_str())).unwrap(), None);
-        assert!(!home.join("catchup.log").exists());
+        assert!(!home.join("catchup.log").to_os().exists());
     }
 
     #[test]

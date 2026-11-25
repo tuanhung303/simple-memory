@@ -24,32 +24,9 @@ pub const ALL_TAGS: [&str; 9] = [
     LEGACY_NA_TAG,
 ];
 pub const EVIDENCE_REQUIRED_TAGS: [&str; 2] = ["executed", "verified"];
-pub const LEGACY_TAG_MAP: [(&str, &str); 2] = [("inferred", "derived"), ("speculated", "prior")];
 pub const VALID_KINDS: [&str; 6] = ["fact", "decision", "learning", "episode", "task", "handoff"];
 pub const RETIRED_LABEL: &str = "file deleted";
 pub const RETIRED_TAG_PREFIX: &str = "retired:";
-
-/// `map_legacy_tag(raw_tag)` -> (canonical_tag, extra_tag_to_keep).
-pub fn map_legacy_tag(raw_tag: Option<&str>) -> (String, Option<String>) {
-    let Some(raw) = raw_tag.filter(|r| !r.is_empty()) else {
-        return (LEGACY_NA_TAG.into(), None);
-    };
-    let cleaned = lower(strip(raw));
-    if cleaned.is_empty() {
-        return (LEGACY_NA_TAG.into(), None);
-    }
-    let mapped = LEGACY_TAG_MAP
-        .iter()
-        .find(|(k, _)| *k == cleaned)
-        .map_or(cleaned.as_str(), |(_, v)| *v);
-    if VALID_TAGS.contains(&mapped) {
-        return (mapped.into(), None);
-    }
-    if mapped == LEGACY_NA_TAG {
-        return (LEGACY_NA_TAG.into(), None);
-    }
-    (LEGACY_NA_TAG.into(), Some(cleaned))
-}
 
 /// `validate_tag(tag, evidence="", allow_na=False)`.
 pub fn validate_tag(
@@ -191,20 +168,6 @@ mod tests {
             "Tag 'executed' needs non-empty evidence: a command, a sha, a file:line or a quote"
         );
 
-        assert_eq!(map_legacy_tag(Some("inferred")), ("derived".into(), None));
-        assert_eq!(map_legacy_tag(Some("speculated")), ("prior".into(), None));
-        assert_eq!(map_legacy_tag(Some("verified")), ("verified".into(), None));
-        assert_eq!(
-            map_legacy_tag(Some("user-stated")),
-            ("n/a".into(), Some("user-stated".into()))
-        );
-        assert_eq!(
-            map_legacy_tag(Some(" Heard ")),
-            ("n/a".into(), Some("heard".into()))
-        );
-        assert_eq!(map_legacy_tag(Some(" N/A")), ("n/a".into(), None));
-        assert_eq!(map_legacy_tag(None), ("n/a".into(), None));
-        assert_eq!(map_legacy_tag(Some("\x1c")), ("n/a".into(), None));
         assert_eq!(
             append_tag(Some("alpha, beta"), "as_of:mtime"),
             "alpha, beta, as_of:mtime"

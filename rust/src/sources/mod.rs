@@ -3,8 +3,6 @@ pub mod handoff;
 pub mod proposal;
 pub mod tasklog;
 pub mod transcript;
-#[cfg(test)]
-pub mod turns;
 
 use std::borrow::Cow;
 use std::io::BufRead;

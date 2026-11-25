@@ -125,21 +125,6 @@ pub fn split(s: &str) -> Vec<&str> {
     split_ws(s, None)
 }
 
-/// `s.split(sep, maxsplit)`; an empty `sep` raises ValueError as in Python.
-pub fn split_sep<'a>(
-    s: &'a str,
-    sep: &str,
-    maxsplit: Option<usize>,
-) -> Result<Vec<&'a str>, SmError> {
-    if sep.is_empty() {
-        return Err(SmError::value("empty separator"));
-    }
-    Ok(match maxsplit {
-        Some(m) => s.splitn(m + 1, sep).collect(),
-        None => s.split(sep).collect(),
-    })
-}
-
 fn is_line_break(c: char) -> bool {
     matches!(
         c,
@@ -1055,25 +1040,6 @@ impl PyRegex {
     pub fn sub(&self, text: &str, repl: &str, count: usize) -> String {
         self.sub_with(text, count, |_| repl.to_string())
     }
-
-    /// `pattern.split(text)` for a pattern with no groups (a group's text would join the list).
-    #[cfg(test)]
-    pub fn split<'t>(&self, text: &'t str) -> Result<Vec<&'t str>, SmError> {
-        let groups = self.re.captures_len() - 1 - usize::from(self.trail.is_some());
-        if groups > 0 {
-            return Err(SmError::value(
-                "PyRegex::split takes a pattern with no groups",
-            ));
-        }
-        let mut out = Vec::new();
-        let mut last = 0;
-        for m in self.finditer(text) {
-            out.push(&text[last..m.start()]);
-            last = m.end();
-        }
-        out.push(&text[last..]);
-        Ok(out)
-    }
 }
 
 // ---------------------------------------------------------------- parity
@@ -1111,17 +1077,6 @@ mod tests {
         assert_eq!(split_ws("  a b  c  ", Some(1)), vec!["a", "b  c  "]);
         assert_eq!(split_ws("", Some(0)), Vec::<&str>::new());
         assert_eq!(split_ws("  a  ", Some(0)), vec!["a  "]);
-    }
-
-    #[test]
-    fn split_with_sep() {
-        assert_eq!(split_sep("a,,b", ",", None).unwrap(), vec!["a", "", "b"]);
-        assert_eq!(split_sep("a,b,c", ",", Some(1)).unwrap(), vec!["a", "b,c"]);
-        assert_eq!(split_sep("", ",", None).unwrap(), vec![""]);
-        assert_eq!(
-            split_sep("a", "", None).unwrap_err().python_text(),
-            "ValueError: empty separator"
-        );
     }
 
     #[test]
@@ -1219,20 +1174,6 @@ mod tests {
         let re = PyRegex::new("x*").unwrap();
         assert_eq!(re.sub("abxd", "-", 0), "-a-b--d-");
         assert_eq!(re.sub("abxd", "-", 2), "-a-bxd");
-        assert_eq!(
-            PyRegex::new(r"\s*").unwrap().split("a b").unwrap(),
-            ["", "a", "", "b", ""]
-        );
-        assert_eq!(PyRegex::new(r"[\s,]+").unwrap().split("").unwrap(), [""]);
-        // Python would put group text in the list (re.split("(a)", "bab") == ["b", "a", "b"]).
-        assert!(
-            PyRegex::new("(a)")
-                .unwrap()
-                .split("bab")
-                .unwrap_err()
-                .python_text()
-                .contains("no groups")
-        );
         assert_eq!(findall("", "ab"), ["", "", ""]);
     }
 

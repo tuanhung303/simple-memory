@@ -2528,7 +2528,7 @@ mod tests {
             .map(|r| r.fallback),
             Some(String::new())
         );
-        assert!(!state.exists());
+        assert!(!state.to_os().exists());
     }
 
     #[test]
