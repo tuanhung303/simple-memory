@@ -3358,7 +3358,10 @@ fn handoff_missing_repo_never_inserts_unassigned_over_known_repo() {
 
     // 1) Normal import resolves concrete repo = alpha.
     let res1 = import(&home, "handoff", &hf, false, false);
-    assert_eq!((res1.inserted, res1.by_repo.get("alpha").copied()), (1, Some(1)));
+    assert_eq!(
+        (res1.inserted, res1.by_repo.get("alpha").copied()),
+        (1, Some(1))
+    );
 
     // 2) Hide alpha so RepoRoots::scan can no longer see it (simulating netjail deny_read_paths).
     std::fs::remove_dir_all(&alpha).unwrap();
@@ -3377,7 +3380,10 @@ fn handoff_missing_repo_never_inserts_unassigned_over_known_repo() {
     let res2 = import(&home, "handoff", &hf, false, false);
     assert_eq!((res2.inserted, res2.deduped), (0, 1));
     assert_eq!(
-        common::column(&home, "SELECT repo || ':' || status FROM items ORDER BY rowid"),
+        common::column(
+            &home,
+            "SELECT repo || ':' || status FROM items ORDER BY rowid"
+        ),
         vec!["alpha:active"]
     );
 }

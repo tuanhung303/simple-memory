@@ -1967,7 +1967,10 @@ mod tests {
             put_items_batch(&conn, &[ho("m_bad", "unassigned", "v2")], false).unwrap();
         assert_eq!((ins, dup, sup), (0, 1, 0));
         assert_eq!(get_item(&conn, "m_bad").unwrap(), None);
-        assert_eq!(get_item(&conn, "m_alpha").unwrap().unwrap().status, "active");
+        assert_eq!(
+            get_item(&conn, "m_alpha").unwrap().unwrap().status,
+            "active"
+        );
 
         // Same when the concrete repo row was already superseded by a newer item in that repo.
         let sup_item = Item {
@@ -2007,7 +2010,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!((ins, dup, sup), (1, 0, 1));
-        assert_eq!(get_item(&conn, "m_cross_new").unwrap().unwrap().repo, "unassigned");
+        assert_eq!(
+            get_item(&conn, "m_cross_new").unwrap().unwrap().repo,
+            "unassigned"
+        );
 
         // Standalone unassigned handoffs with no concrete repo row still import normally.
         let solo = Item {
@@ -2017,7 +2023,10 @@ mod tests {
         };
         let (ins, dup, sup, ..) = put_items_batch(&conn, &[solo], false).unwrap();
         assert_eq!((ins, dup, sup), (1, 0, 0));
-        assert_eq!(get_item(&conn, "m_solo").unwrap().unwrap().repo, "unassigned");
+        assert_eq!(
+            get_item(&conn, "m_solo").unwrap().unwrap().repo,
+            "unassigned"
+        );
     }
 
     #[test]

@@ -726,7 +726,9 @@ mod tests {
         let id = "20261101-090000-baba-y";
         std::fs::write(
             &t,
-            format!("id: {id}\ntitle: T {id}\nas_of: 2026-11-01T09:00:00+00:00\nresults:\n  - done\n"),
+            format!(
+                "id: {id}\ntitle: T {id}\nas_of: 2026-11-01T09:00:00+00:00\nresults:\n  - done\n"
+            ),
         )
         .unwrap();
         let h = home.to_str().unwrap();
@@ -756,14 +758,20 @@ mod tests {
                 .env("GIT_COMMITTER_EMAIL", "t@t")
                 .output()
                 .unwrap();
-            assert!(o.status.success(), "{args:?}: {}", String::from_utf8_lossy(&o.stderr));
+            assert!(
+                o.status.success(),
+                "{args:?}: {}",
+                String::from_utf8_lossy(&o.stderr)
+            );
         };
         git_run(&["init", "-q"]);
         let t = tl_dir.join("090000-baba-y.yaml");
         let id = "20261101-090000-baba-y";
         std::fs::write(
             &t,
-            format!("id: {id}\ntitle: T {id}\nas_of: 2026-11-01T09:00:00+00:00\nresults:\n  - done\n"),
+            format!(
+                "id: {id}\ntitle: T {id}\nas_of: 2026-11-01T09:00:00+00:00\nresults:\n  - done\n"
+            ),
         )
         .unwrap();
         git_run(&["add", "."]);
@@ -787,7 +795,12 @@ mod tests {
         let cfg = load_config(Some(h)).unwrap();
         let c = retire_missing(&PyPath::new(h), &cfg, false).unwrap();
         assert_eq!(
-            (c["candidates"], c["retired"], c["on_branch"], c["no_folder"]),
+            (
+                c["candidates"],
+                c["retired"],
+                c["on_branch"],
+                c["no_folder"]
+            ),
             (1, 0, 1, 0)
         );
     }
@@ -815,7 +828,9 @@ mod tests {
         let id = "20261101-090000-baba-y";
         std::fs::write(
             &t,
-            format!("id: {id}\ntitle: T {id}\nas_of: 2026-11-01T09:00:00+00:00\nresults:\n  - done\n"),
+            format!(
+                "id: {id}\ntitle: T {id}\nas_of: 2026-11-01T09:00:00+00:00\nresults:\n  - done\n"
+            ),
         )
         .unwrap();
         let h = home.to_str().unwrap();
@@ -826,7 +841,9 @@ mod tests {
         assert!(err.msg.contains("git rev-parse failed"), "{}", err.msg);
         let conn = connect(&home.join("memory.db").to_string_lossy(), None).unwrap();
         let status: String = conn
-            .query_row("SELECT status FROM items WHERE kind = 'task'", [], |r| r.get(0))
+            .query_row("SELECT status FROM items WHERE kind = 'task'", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(status, "active");
     }
@@ -851,14 +868,20 @@ mod tests {
                 .env("GIT_COMMITTER_EMAIL", "t@t")
                 .output()
                 .unwrap();
-            assert!(o.status.success(), "{args:?}: {}", String::from_utf8_lossy(&o.stderr));
+            assert!(
+                o.status.success(),
+                "{args:?}: {}",
+                String::from_utf8_lossy(&o.stderr)
+            );
         };
         git_run(&repo, &["init", "-q"]);
         let t = tl_dir.join("090000-baba-y.yaml");
         let id = "20261101-090000-baba-y";
         std::fs::write(
             &t,
-            format!("id: {id}\ntitle: T {id}\nas_of: 2026-11-01T09:00:00+00:00\nresults:\n  - done\n"),
+            format!(
+                "id: {id}\ntitle: T {id}\nas_of: 2026-11-01T09:00:00+00:00\nresults:\n  - done\n"
+            ),
         )
         .unwrap();
         git_run(&repo, &["add", "."]);
@@ -882,7 +905,12 @@ mod tests {
         let cfg = load_config(Some(h)).unwrap();
         let c = retire_missing(&PyPath::new(h), &cfg, false).unwrap();
         assert_eq!(
-            (c["candidates"], c["retired"], c["on_branch"], c["no_folder"]),
+            (
+                c["candidates"],
+                c["retired"],
+                c["on_branch"],
+                c["no_folder"]
+            ),
             (1, 0, 1, 0)
         );
     }
