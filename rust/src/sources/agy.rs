@@ -61,6 +61,30 @@ fn arg_text(raw: &str) -> String {
     }
 }
 
+/// agy cuts a tool argument over 2048 chars to its head plus this marker.
+const CUT_ARG: &str = "\n<truncated ";
+/// agy keeps only a preview of a long tool output in the log; the note names the full file.
+const CUT_OUTPUT: &str = "You can find the full output in a file at file://";
+
+/// The full output a cut `GENERIC` row names, read only from this conversation's
+/// `.system_generated/steps/` folder; "" when the row is whole or the file is gone.
+fn full_output(log: &PyPath, content: &str) -> String {
+    let Some((_, rest)) = content.split_once(CUT_OUTPUT) else {
+        return String::new();
+    };
+    let named = rest.split(char::is_whitespace).next().unwrap_or("");
+    let named = named.strip_suffix('.').unwrap_or(named);
+    let steps = format!("{}/", log.parent().parent().join("steps").as_str());
+    if !named.starts_with(&steps) || named.split('/').any(|part| part == "..") {
+        return String::new();
+    }
+    let file = PyPath::new(named);
+    if !file.is_file() {
+        return String::new();
+    }
+    file.read_text(Errors::Replace).unwrap_or_default()
+}
+
 /// An argument that is one absolute path (a `file://` URI counts), else None.
 fn arg_path(text: &str) -> Option<&str> {
     let p = text.strip_prefix("file://").unwrap_or(text);
@@ -70,7 +94,8 @@ fn arg_path(text: &str) -> Option<&str> {
 /// `scan_agy(path, dialogue_chars, after)`: stream one agy log into a SessionScan, as
 /// `scan_transcript` does a Claude Code one. Owner prompts are `USER_INPUT` rows from
 /// `USER_EXPLICIT`; agent text is `PLANNER_RESPONSE` content. A commit is a new
-/// `[<branch> <sha>] <subject>` line in a `GENERIC` output row after a step that ran `git commit`.
+/// `[<branch> <sha>] <subject>` line in a `GENERIC` output row (or the full output file a cut
+/// row names) after a step that ran `git commit` or whose command agy cut.
 /// Tool paths come from every row; with `after`, prompts, commits, ids, writes and the dialogue
 /// come only from rows later than it.
 pub fn scan_agy(
@@ -126,7 +151,10 @@ pub fn scan_agy(
             if !later {
                 continue;
             }
-            for m in COMMIT_LINE_RE.finditer(content) {
+            let full = full_output(path, content);
+            let mut found = COMMIT_LINE_RE.finditer(content);
+            found.extend(COMMIT_LINE_RE.finditer(&full));
+            for m in found {
                 let sha = m.group(1).unwrap_or("");
                 if scan.shas.iter().any(|s| s == sha) {
                     continue;
@@ -170,7 +198,9 @@ pub fn scan_agy(
                     if name != "run_command" || str_of(Some(key)) != "CommandLine" {
                         continue;
                     }
-                    if later && COMMIT_RE.search(&text).is_some() && !text.contains("--dry-run") {
+                    // a cut command may hide its `git commit`; the output lines still decide
+                    let may_commit = COMMIT_RE.search(&text).is_some() || text.contains(CUT_ARG);
+                    if later && may_commit && !text.contains("--dry-run") {
                         commit_step = true;
                     }
                     if puts_to_store(&text) {

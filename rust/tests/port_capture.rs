@@ -1801,3 +1801,61 @@ fn agy_work_after_an_item_needs_min_prompts_of_its_own() {
             .starts_with("Owner: step 0 of the late work")
     );
 }
+
+#[test]
+fn agy_commit_in_a_cut_command_counts_from_the_full_output_file_in_its_steps_folder() {
+    let env = Env::new();
+    env.agy_config();
+    let generated = env.agy_root().join(AGY_A).join(".system_generated");
+    let output = generated.join("steps/9/output.txt");
+    common::write(&output, "Total 3\r\n[main abc1234] cut commit\r\n");
+    // a file outside the steps folder, or reached through "..", is not read
+    let outside = env.tmp.join("elsewhere/output.txt");
+    common::write(&outside, "[main fed4321] outside\n");
+    let dotdot = generated.join("evil.txt");
+    common::write(&dotdot, "[main 0dd0dd0] dotdot\n");
+    let note = |file: &str| {
+        format!(
+            "Created At: {AGY_TS}\nThe tool's output was truncated due to being too long. You can \
+             find the full output in a file at file://{file}.\n\nHere is a preview:\nTotal 3"
+        )
+    };
+    let mut rows = agy_rows(5, "cut", &[]);
+    // agy keeps the head of a long argument, still JSON-escaped, and a marker
+    let cut = format!("{}\n<truncated 1928 bytes>", r#""set -e\necho one"#);
+    rows.push(
+        json!({"step_index": 8, "source": "MODEL", "type": "PLANNER_RESPONSE", "status": "DONE",
+        "created_at": AGY_TS, "tool_calls": [{"name": "run_command", "args": {"CommandLine": cut}}]}),
+    );
+    let steps = generated.join("steps");
+    for file in [
+        output.display().to_string(),
+        outside.display().to_string(),
+        format!("{}/../evil.txt", steps.display()),
+    ] {
+        rows.push(
+            json!({"step_index": 9, "source": "MODEL", "type": "GENERIC", "status": "DONE",
+            "created_at": AGY_TS, "content": note(&file)}),
+        );
+    }
+    env.agy(AGY_A, &rows, now_epoch() - 2.0 * HOUR);
+    let (code_rc, _, err) = env.sm(&["import", "sessions"]);
+    assert_eq!(code_rc, 0, "{err}");
+    let got = cards(&env.home);
+    assert_eq!(got.len(), 1);
+    let card = &got[0];
+    assert!(
+        card.body.ends_with(&format!(
+            "\n\nSession {AGY_A}: owner prompts 5, commits 1, last active 2027-01-15T08:00:00+00:00."
+        )),
+        "{}",
+        card.body
+    );
+    let refs: Vec<&str> = card.refs.split_whitespace().collect();
+    assert_eq!(refs[0], "abc1234");
+    assert!(
+        !card.refs.contains("fed4321") && !card.refs.contains("0dd0dd0"),
+        "{}",
+        card.refs
+    );
+}
