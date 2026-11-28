@@ -86,7 +86,7 @@ rust/
 ├── src/
 │   ├── core/                    pure domain logic: fold, refs, terms (stands_as_word), rank, tags, item, redact, dedup
 │   ├── store/                   all SQLite queries: connect, items, search, related, stats, transfer, upkeep
-│   ├── sources/                 parsers: tasklog, handoff, automemory, transcript, proposal, turns (test-only)
+│   ├── sources/                 parsers: tasklog, handoff, automemory, transcript, agy, proposal, turns (test-only)
 │   ├── service/                 command orchestration: put, query, list, show, related, supersede, retire, amend, recall, capture, catchup, import_, upkeep, doctor, stats, transfer, backup, setup, usage, mcp
 │   ├── cli/                     parser (args.rs), formatting, process entrypoint
 │   ├── py/                      CPython-compatible text, TOML, YAML, JSON, table, path helpers

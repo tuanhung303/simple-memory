@@ -1,8 +1,8 @@
-//! Session cards: one `episode` item per Claude Code session that did real work and left no
-//! item. Also holds `run_process`, the subprocess runner for capture, catch-up, and config lookups,
+//! Session cards: one `episode` item per Claude Code session or agy conversation that did real
+//! work and left no item. Also holds `run_process`, the subprocess runner for capture, catch-up, and config lookups,
 //! with optional spawn tracing under `#[cfg(feature = "parity")]`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 
 use indexmap::IndexMap;
@@ -12,12 +12,13 @@ use serde_json::json;
 
 use crate::config::{Aliases, get_db_path, get_home, project_dir_repo, resolve_repo};
 use crate::core::item::{Item, epoch_to_as_of, new_item_id, parse_as_of_epoch, validate_as_of};
-use crate::core::refs::{RefsArg, item_refs, merge_refs};
+use crate::core::refs::{RefsArg, RepoRoots, item_refs, merge_refs};
 use crate::error::{Base, SmError};
 use crate::py::path::{Errors, PyPath};
 use crate::py::str::{ci_chars, isspace, slice, splitlines, strip, strip_chars};
 use crate::py::value::{PyValue, type_name};
 use crate::service::import_::{cfg_get, float_of, int_of};
+use crate::sources::agy::{self, conversation_id, dispatched_ids, scan_agy};
 use crate::sources::transcript::{SessionScan, lanes_put_until, scan_transcript};
 use crate::sources::{dict_get, get_attr, mtime, truthy};
 use crate::store::connect::connect;
@@ -648,6 +649,49 @@ fn card_repo(
     })
 }
 
+/// The repo of an agy conversation: the root child its tool-call paths name most (aliases
+/// applied; a tie goes to the one named first), else "unassigned".
+fn agy_repo(scan: &SessionScan, aliases: &Aliases, roots: &RepoRoots) -> String {
+    let mut counts: IndexMap<String, i64> = IndexMap::new();
+    for p in &scan.tool_paths {
+        let repo = roots.repo_from_path(p);
+        if repo != "unassigned" {
+            let repo = aliases.get(&repo).cloned().unwrap_or(repo);
+            *counts.entry(repo).or_default() += 1;
+        }
+    }
+    let mut best: Option<(&String, i64)> = None;
+    for (repo, n) in &counts {
+        if best.is_none_or(|(_, m)| *n > m) {
+            best = Some((repo, *n));
+        }
+    }
+    best.map_or_else(|| "unassigned".to_string(), |(r, _)| r.clone())
+}
+
+/// Where a transcript comes from; it picks the reader.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Origin {
+    Claude,
+    Agy,
+}
+
+impl Origin {
+    fn scan(self, path: &PyPath, chars: i64, after: Option<f64>) -> Result<SessionScan, SmError> {
+        match self {
+            Origin::Claude => scan_transcript(path, chars, after),
+            Origin::Agy => scan_agy(path, chars, after),
+        }
+    }
+
+    fn session_id(self, path: &PyPath) -> String {
+        match self {
+            Origin::Claude => path.stem().to_string(),
+            Origin::Agy => conversation_id(path),
+        }
+    }
+}
+
 // ---------------------------------------------------------------- cards
 
 /// (title, bullets) from Haiku; raises on a failed call or an
@@ -856,6 +900,7 @@ fn work_kind(prompts: i64, commits: i64, min_prompts: i64) -> &'static str {
 /// candidate part is read again, for its own card.
 fn decide(
     scan: SessionScan,
+    origin: Origin,
     path: &PyPath,
     min_prompts: i64,
     hex8: &Covers,
@@ -866,11 +911,19 @@ fn decide(
     if kind != "candidate" {
         return Ok((kind, scan));
     }
+    // an agy conversation needs `min_prompts` owner prompts; a commit is not enough
+    if origin == Origin::Agy && scan.prompts < min_prompts {
+        return Ok(("light", scan));
+    }
     let after = |v: &[f64], t: f64| v.iter().filter(|x| **x > t).count() as i64;
     let work_after = |cover: Option<f64>| match cover {
         None => true,
         Some(t) => {
-            let (p, c) = (after(&scan.prompt_times, t), after(&scan.commit_times, t));
+            let p = after(&scan.prompt_times, t);
+            let c = match origin {
+                Origin::Claude => after(&scan.commit_times, t),
+                Origin::Agy => 0,
+            };
             work_kind(p, c, min_prompts) == "candidate"
         }
     };
@@ -897,7 +950,7 @@ fn decide(
     if !work_after(Some(t)) {
         return Ok(("covered", scan));
     }
-    Ok(("candidate", scan_transcript(path, dialogue_chars, Some(t))?))
+    Ok(("candidate", origin.scan(path, dialogue_chars, Some(t))?))
 }
 
 pub const COUNT_KEYS: [&str; 10] = [
@@ -973,6 +1026,19 @@ pub fn capture_sessions(
         None => Vec::new(),
     };
     let hook_cfg = get_or_empty(cfg, "prompt_hook");
+    // agy is optional: an empty `agy_root`, or a folder that is not there, reads no conversation
+    let agy_root = match cfg_get(cap_cfg, "agy_root")?.py_str() {
+        r if r.is_empty() => None,
+        r => Some(PyPath::new(&r).expanduser()?).filter(PyPath::is_dir),
+    };
+    let dispatched: HashSet<String> = match &agy_root {
+        Some(_) => dispatched_ids(&PyPath::new(agy::LEDGER).expanduser()?)?,
+        None => HashSet::new(),
+    };
+    let repo_roots = match &agy_root {
+        Some(_) => RepoRoots::scan(&roots)?,
+        None => RepoRoots::default(),
+    };
 
     let mut counts: IndexMap<&'static str, i64> = COUNT_KEYS.iter().map(|k| (*k, 0)).collect();
     let mut by_repo: IndexMap<String, i64> = IndexMap::new();
@@ -980,13 +1046,21 @@ pub fn capture_sessions(
     let conn = connect(get_db_path(Some(home_path.as_str()))?.as_str(), None)?;
     let body = (|| -> Result<(), SmError> {
         let (hex8, full) = covering_ids(&conn)?;
-        let mut transcripts: Vec<(f64, u64, PyPath)> = Vec::new();
-        for path in root.glob("*/*.jsonl")? {
+        let mut transcripts: Vec<(f64, u64, PyPath, Origin)> = Vec::new();
+        let claude = root
+            .glob("*/*.jsonl")?
+            .into_iter()
+            .map(|p| (p, Origin::Claude));
+        let agy_logs = match &agy_root {
+            Some(r) => r.glob(agy::LOG_GLOB)?,
+            None => Vec::new(),
+        };
+        for (path, origin) in claude.chain(agy_logs.into_iter().map(|p| (p, Origin::Agy))) {
             let os = path.to_os();
             let md = std::fs::metadata(&os).map_err(|e| SmError::from_io(&e, Some(&os)))?;
             let mt = mtime(&path)?;
             if oldest <= mt {
-                transcripts.push((mt, md.len(), path));
+                transcripts.push((mt, md.len(), path, origin));
             }
         }
         transcripts.sort_by(|a, b| {
@@ -995,11 +1069,11 @@ pub fn capture_sessions(
                 .then(b.1.cmp(&a.1))
                 .then_with(|| b.2.as_str().split('/').cmp(a.2.as_str().split('/')))
         });
-        for (mt, size, path) in transcripts {
+        for (mt, size, path, origin) in transcripts {
             if cap.is_some_and(|c| counts["candidates"] >= c) {
                 break;
             }
-            let sid = path.stem().to_string();
+            let sid = origin.session_id(&path);
             if mt > newest {
                 counts["active"] += 1;
                 continue;
@@ -1013,13 +1087,23 @@ pub fn capture_sessions(
                 counts["unchanged"] += 1;
                 continue;
             }
+            // a dispatched run reports to the Claude session that started it, which gets the card
+            if origin == Origin::Agy && dispatched.contains(&sid) {
+                counts["headless"] += 1;
+                state_set(&mut state, &sid, &path, size, mt, "headless");
+                continue;
+            }
             counts["scanned"] += 1;
             let chars = int_of(cfg_get(cap_cfg, "dialogue_chars")?)?;
-            let scan = scan_transcript(&path, chars, None)?;
-            let (mut decision, scan) = decide(scan, &path, min_prompts, &hex8, &full, chars)?;
+            let scan = origin.scan(&path, chars, None)?;
+            let (mut decision, scan) =
+                decide(scan, origin, &path, min_prompts, &hex8, &full, chars)?;
             let mut repo = String::new();
             if decision == "candidate" {
-                repo = card_repo(&scan, path.parent().name(), &al, &roots)?;
+                repo = match origin {
+                    Origin::Claude => card_repo(&scan, path.parent().name(), &al, &roots)?,
+                    Origin::Agy => agy_repo(&scan, &al, &repo_roots),
+                };
                 if repo.is_empty() {
                     decision = "unmapped";
                 }

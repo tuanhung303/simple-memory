@@ -29,7 +29,7 @@ static HARNESS_RE: LazyLock<PyRegex> = LazyLock::new(|| {
 });
 // Python: `\bgit\b(?:\s+-C\s+\S+)?(?:\s+-c\s+\S+)*\s+commit\b`. Every way on after `git` starts
 // with `\s`, which is never a word char, so the inner `\b` always holds and is left out.
-static COMMIT_RE: LazyLock<PyRegex> = LazyLock::new(|| {
+pub(crate) static COMMIT_RE: LazyLock<PyRegex> = LazyLock::new(|| {
     PyRegex::new(r"\bgit(?:\s+-C\s+\S+)?(?:\s+-c\s+\S+)*\s+commit\b").expect("commit pattern")
 });
 static SM_PUT_RE: LazyLock<PyRegex> =
@@ -45,13 +45,13 @@ static HELP_RE: LazyLock<PyRegex> =
 // holds when the char before it is `[` or a non-word char, so the lazy run before the sha is
 // empty or ends on `[^\]\n\w]`. Both ways end the sha at the line's first `]`, and only one can
 // match (the empty way needs every char up to it to be hex), so `?` needs no lazy `??`.
-static COMMIT_LINE_RE: LazyLock<PyRegex> = LazyLock::new(|| {
+pub(crate) static COMMIT_LINE_RE: LazyLock<PyRegex> = LazyLock::new(|| {
     PyRegex::new(r"(?m)^\[(?:[^\]\n]*?[^\]\n\w])?([0-9a-f]{7,40})\] (.+)$")
         .expect("commit line pattern")
 });
 // Task id `<YYYYMMDD>-<HHMMSS>-<sid8>-<slug>-<4hex>`; the lookahead keeps a handoff name
 // (`<date>-<time>-<session uuid>`) from matching.
-static TASK_ID_RE: LazyLock<PyRegex> = LazyLock::new(|| {
+pub(crate) static TASK_ID_RE: LazyLock<PyRegex> = LazyLock::new(|| {
     PyRegex::new(r"\b\d{8}-\d{6}-[0-9a-f]{8}-[a-z0-9-]+-[0-9a-f]{4}(?![\w-])")
         .expect("task id pattern")
 });
@@ -61,7 +61,7 @@ const WRITE_TOOLS: [(&str, &str); 4] = [
     ("MultiEdit", "file_path"),
     ("NotebookEdit", "notebook_path"),
 ];
-const MAX_MESSAGE_CHARS: isize = 3000;
+pub(crate) const MAX_MESSAGE_CHARS: isize = 3000;
 const MAX_PATHS: usize = 200;
 
 /// The `SessionScan` dataclass.
@@ -87,6 +87,10 @@ pub struct SessionScan {
     pub dialogue: Vec<String>,
     /// The scan counts only rows after this time (epoch s); None: every row.
     pub after: Option<f64>,
+    /// Each absolute path a tool call names, once per mention, from every row: an agy
+    /// conversation has no cwd, so its repo is the one these paths name most. Empty for a Claude
+    /// Code transcript.
+    pub tool_paths: Vec<String>,
 }
 
 /// `value == "<s>"`: only a str equals a str.
@@ -177,7 +181,7 @@ fn result_text(block: &[(PyValue, PyValue)]) -> Result<String, SmError> {
 
 /// `_Dialogue`: keep the first `half` characters of messages and the last `half` characters
 /// after them.
-struct Dialogue {
+pub(crate) struct Dialogue {
     half: i64,
     head: Vec<String>,
     head_chars: i64,
@@ -187,7 +191,7 @@ struct Dialogue {
 }
 
 impl Dialogue {
-    fn new(half: i64) -> Dialogue {
+    pub(crate) fn new(half: i64) -> Dialogue {
         Dialogue {
             half,
             head: Vec::new(),
@@ -198,7 +202,7 @@ impl Dialogue {
         }
     }
 
-    fn add(&mut self, text: String) {
+    pub(crate) fn add(&mut self, text: String) {
         let n = text.chars().count() as i64;
         if self.head_chars + n <= self.half && self.tail.is_empty() {
             self.head.push(text);
@@ -214,7 +218,7 @@ impl Dialogue {
         }
     }
 
-    fn lines(self) -> Vec<String> {
+    pub(crate) fn lines(self) -> Vec<String> {
         let mut out = self.head;
         if self.dropped {
             out.push("[...]".into());
@@ -224,7 +228,7 @@ impl Dialogue {
     }
 }
 
-fn add_unique(target: &mut Vec<String>, value: &str) {
+pub(crate) fn add_unique(target: &mut Vec<String>, value: &str) {
     if !value.is_empty() && !target.iter().any(|t| t == value) && target.len() < MAX_PATHS {
         target.push(value.to_string());
     }
@@ -378,7 +382,7 @@ fn heredoc_end(raw: &[u8], at: usize, word: &[u8], dash: bool) -> usize {
 /// True when a Bash command runs an `sm put` that writes to the default store: outside quoted
 /// text, a put with no help flag in its own command and no `HOME=` or `SIMPLE_MEMORY_HOME=`
 /// before it.
-fn puts_to_store(command: &str) -> bool {
+pub(crate) fn puts_to_store(command: &str) -> bool {
     let bare = blank_quotes(command);
     // a match that starts on a blanked byte touches a quote, which glues to its word (`"x"sm`)
     let unquoted = |at: usize| bare.as_bytes()[at] == command.as_bytes()[at];
@@ -410,11 +414,11 @@ fn errored_tool_id(block: &[(PyValue, PyValue)]) -> Option<&str> {
 }
 
 /// The epoch seconds of a transcript timestamp; None when it does not parse.
-fn epoch_of(ts: &str) -> Result<Option<f64>, SmError> {
+pub(crate) fn epoch_of(ts: &str) -> Result<Option<f64>, SmError> {
     Ok(Some(parse_as_of_epoch(Some(ts))?).filter(|t| *t != 0.0))
 }
 
-fn contains(hay: &[u8], needle: &[u8]) -> bool {
+pub(crate) fn contains(hay: &[u8], needle: &[u8]) -> bool {
     hay.windows(needle.len()).any(|w| w == needle)
 }
 
@@ -555,7 +559,7 @@ fn loads_bytes(b: &[u8]) -> Result<PyValue, SmError> {
 }
 
 /// `json.loads(raw)`, with a JSONDecodeError as None.
-fn row_of(raw: &[u8]) -> Result<Option<PyValue>, SmError> {
+pub(crate) fn row_of(raw: &[u8]) -> Result<Option<PyValue>, SmError> {
     match loads_bytes(raw) {
         Ok(v) => Ok(Some(v)),
         Err(e) if e.python_name() == "JSONDecodeError" => Ok(None),
@@ -731,7 +735,7 @@ pub fn scan_transcript(
 }
 
 /// The newest time of the puts that count.
-fn newest(puts: &[(String, f64)]) -> Option<f64> {
+pub(crate) fn newest(puts: &[(String, f64)]) -> Option<f64> {
     puts.iter().map(|p| p.1).reduce(f64::max)
 }
 
@@ -1028,6 +1032,7 @@ mod tests {
                     "Owner: Two".into()
                 ],
                 after: None,
+                tool_paths: vec![],
             }
         );
     }

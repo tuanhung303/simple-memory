@@ -244,7 +244,7 @@ Modules follow a downward architecture (`cli` -> `service` -> `store` / `sources
 | `sm amend ID [...]` | Append-only update: create a new item with changed fields and supersede `ID` atomically |
 | `sm list [...]` | Browse items newest-first without a query (`--limit`, `--offset`, `--repo \| --all \| --in`, `--kind`, `--tag`, `--source`, `--since`, `--until`, `--status \| --include-history`, `--format`) |
 | `sm import tasklog\|handoff\|proposal PATH` | Import YAML task logs, Markdown handoffs, or proposal JSONL (`--apply`, `--dry-run`) |
-| `sm import automemory \| sessions \| jsonl \| catch-up` | Sync Claude memory files, summarize idle sessions, import JSONL, or run full catch-up |
+| `sm import automemory \| sessions \| jsonl \| catch-up` | Sync Claude memory files, summarize idle Claude Code sessions and agy conversations, import JSONL, or run full catch-up |
 | `sm export [--include-history] [--repo R \| --all]` | Dump items sorted by ID as JSONL to stdout |
 | `sm upkeep [--dry-run] [--report]` | Retire older/claimed session handoffs; `--report` flags near-duplicates and stale items |
 | `sm backup [--keep N]` | Checked SQLite backup in `backups/` |
@@ -272,14 +272,14 @@ Counters that `sm import catch-up` (one line per part), `sm doctor --imports` an
 | `inserted` | items stored in this run |
 | `failed_rows` | files or rows that could not be imported (`sm doctor --imports` names the files) |
 | `unreadable` | files that could not be parsed |
-| `unmapped` | memory files, or sessions, whose folder maps to no repo (set `[repos] roots`) |
+| `unmapped` | memory files, or Claude Code sessions, whose folder maps to no repo (set `[repos] roots`); an agy conversation takes the repo its tool-call paths name most, else `unassigned` |
 | `stored_tasks_without_file`, `stored_without_file` | active items whose file is gone |
 | `added`, `updated`, `retired`, `unchanged` | memory files: new item, changed item, item retired because its file is gone, no change |
 | `made`, `deleted`, `items` | backup: copies made, old copies removed, items in the copy |
 | `sessions`, `superseded` | upkeep: sessions that had older handoffs, handoffs retired for the newest one |
 | `handoffs_without_session` | active handoffs whose file name holds no session id; upkeep cannot pair them, and prints this on every run |
 | `scanned`, `unchanged`, `active` | sessions: transcripts read, already seen, still in use |
-| `headless`, `light`, `covered` | sessions that need no card: no prompt, few prompts and no commit, an item already covers it |
+| `headless`, `light`, `covered` | sessions that need no card: no prompt (or an agy run that `agy-dispatch.sh` started, listed in `~/.gemini/agy-ledger.jsonl`), few prompts and no commit (agy: under `min_prompts`, commit or not), an item already covers it |
 | `candidates`, `carded`, `plain` | sessions: cards wanted, cards stored, cards made without Haiku |
 | `candidates`, `retired`, `in_worktree`, `on_branch`, `no_folder` | retire_missing: task items whose file is gone; retired; kept because the file is in another checkout or on a branch; repo folder not found |
 | `deleted` | prune: hook state files older than 14 days removed |
@@ -297,7 +297,7 @@ Counters that `sm import catch-up` (one line per part), `sm doctor --imports` an
 - `[prompt_hook]`: `enabled`, `model` (`"haiku"` or `"none"`), `timeout`, `limit`, `claude_bin`, `extra_stopwords`, `min_idf` (default `3.0`; `0.0` disables), `local_min_idf` (default `8.0`; `0.0` disables), and `[prompt_hook.projects]` project codes.
 - `[catch_up]`: `enabled`, `interval_minutes` (default `10`).
 - `[upkeep]`: `tasklog_roots` and `handoff_dirs`.
-- `[capture]`: `enabled`, `root` (`~/.claude/projects`), `idle_minutes`, `since_days`, `min_prompts`, `max_per_run`, `model`, `timeout`, `dialogue_chars`.
+- `[capture]`: `enabled`, `root` (`~/.claude/projects`), `agy_root` (`~/.gemini/antigravity-cli/brain`, agy conversation logs; `""` turns it off, a missing folder reads nothing), `idle_minutes`, `since_days`, `min_prompts`, `max_per_run`, `model`, `timeout`, `dialogue_chars`.
 - `[automemory]`: `enabled`, `root` (`~/.claude/projects`).
 - `[scopes]` and `[backup]`: Path matchers plus backup `interval_hours` (`24`) and `keep` (`7`).
 

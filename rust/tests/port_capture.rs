@@ -1456,3 +1456,348 @@ fn state_file_that_is_not_an_object_raises() {
     assert_eq!(err.class, "TypeError");
     assert!(err.msg.contains("expected an object"), "{}", err.msg);
 }
+
+// ---------------------------------------------------------------- agy conversations
+
+const AGY_A: &str = "a9a9a9a9-1111-4111-8111-00000000000a";
+const AGY_B: &str = "b9b9b9b9-2222-4222-8222-00000000000b";
+const AGY_TS: &str = "2027-01-15T08:00:00Z";
+
+/// A step row of an agy log: text plus tool calls, each `(name, key, value)` with the value
+/// JSON-encoded as agy 1.5.16 writes most args.
+fn agy_step(text: &str, calls: &[(&str, &str, &str)]) -> Value {
+    let calls: Vec<Value> = calls
+        .iter()
+        .map(|(name, key, value)| {
+            json!({"name": name, "args": {*key: serde_json::to_string(value).unwrap()}})
+        })
+        .collect();
+    let mut row = json!({"step_index": 1, "source": "MODEL", "type": "PLANNER_RESPONSE",
+        "status": "DONE", "created_at": AGY_TS, "model": "m"});
+    if !text.is_empty() {
+        row["content"] = json!(text);
+    }
+    if !calls.is_empty() {
+        row["tool_calls"] = json!(calls);
+    }
+    row
+}
+
+/// `prompts` owner prompts "step N of the <work> work", each with agy's metadata block and a
+/// reply step that reads each of `paths`, plus the rows that are not prompts.
+fn agy_rows(prompts: usize, work: &str, paths: &[&str]) -> Vec<Value> {
+    let mut rows = vec![
+        json!({"step_index": 0, "source": "SYSTEM_SDK", "type": "USER_INPUT",
+        "status": "DONE", "created_at": AGY_TS, "content": "<USER_REQUEST>\nsdk note\n</USER_REQUEST>"}),
+    ];
+    for n in 0..prompts {
+        rows.push(json!({"step_index": 2, "source": "USER_EXPLICIT", "type": "USER_INPUT",
+            "status": "DONE", "created_at": AGY_TS,
+            "content": format!("<USER_REQUEST>\nstep {n} of the {work} work\n</USER_REQUEST>\n\
+                <ADDITIONAL_METADATA>\nThe current local time is: 2027-01-15T15:00:00+07:00.\n</ADDITIONAL_METADATA>")}));
+        rows.push(
+            json!({"step_index": 3, "source": "SYSTEM_SDK", "type": "EPHEMERAL_MESSAGE",
+            "status": "DONE", "created_at": AGY_TS, "content": "clock"}),
+        );
+        let calls: Vec<(&str, &str, &str)> =
+            paths.iter().map(|p| ("read_file", "Path", *p)).collect();
+        rows.push(agy_step(&format!("Done with step {n}."), &calls));
+    }
+    rows
+}
+
+impl Env {
+    fn agy_root(&self) -> PathBuf {
+        self.tmp.join("brain")
+    }
+
+    /// The log of conversation `id` under the agy root, written with `mtime`.
+    fn agy(&self, id: &str, rows: &[Value], mtime: f64) -> PathBuf {
+        let log = self
+            .agy_root()
+            .join(id)
+            .join(".system_generated/logs/transcript.jsonl");
+        write_rows(&log, rows, mtime)
+    }
+
+    /// `[capture] agy_root` set, `[repos] roots` = `<tmp>/code` holding beta and gamma, and
+    /// beta aliased to beta-main.
+    fn agy_config(&self) -> PathBuf {
+        let code = self.tmp.join("code");
+        for name in ["beta", "gamma"] {
+            std::fs::create_dir_all(code.join(name)).unwrap();
+        }
+        self.write_config(
+            &format!("agy_root = \"{}\"", self.agy_root().display()),
+            &format!(
+                "[repos]\nroots = [\"{}\"]\n[repo_aliases]\nbeta = \"beta-main\"\n",
+                code.display()
+            ),
+            Some(&self.stub.join("claude")),
+        );
+        code
+    }
+
+    /// `sm <args>` with the clock offset fixed, as a user runs it.
+    fn sm(&self, args: &[&str]) -> (i32, String, String) {
+        common::sm_env(&self.home, args, &[("SM_UTC_OFFSET", "+00:00")])
+    }
+}
+
+fn now_epoch() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs_f64()
+}
+
+#[test]
+fn agy_conversation_gets_one_card_with_the_repo_its_paths_name_most() {
+    let env = Env::new();
+    let code = env.agy_config();
+    let beta = code.join("beta/src/a.py");
+    let gamma = code.join("gamma/x.py");
+    let (beta, gamma) = (beta.to_str().unwrap(), gamma.to_str().unwrap());
+    // beta: 5 reads + 1 write = 6 (aliased to beta-main); gamma: 5 reads + 2 views = 7, wins
+    let mut rows = agy_rows(5, "beta", &[beta, gamma, "/etc/hosts"]);
+    // a commit line in the output of a step that ran no commit is not a commit
+    rows.push(
+        json!({"step_index": 8, "source": "MODEL", "type": "GENERIC", "status": "DONE",
+        "created_at": AGY_TS, "content": "Showing lines 1-1\n[main 9999999] an old subject"}),
+    );
+    rows.push(agy_step(
+        "",
+        &[
+            ("view_file", "AbsolutePath", &format!("file://{gamma}")),
+            ("view_file", "AbsolutePath", gamma),
+            (
+                "run_command",
+                "CommandLine",
+                "git commit -m 'fix beta loader'",
+            ),
+        ],
+    ));
+    rows.push(
+        json!({"step_index": 9, "source": "MODEL", "type": "GENERIC", "status": "DONE",
+        "created_at": AGY_TS, "content": "Command exited with code 0.\n\nCommand output:\n\
+         [main abc1234] fix beta loader\r\n 1 file changed\r\n"}),
+    );
+    rows.push(agy_step("", &[("write_file", "Path", beta)]));
+    let log = env.agy(AGY_A, &rows, now_epoch() - 2.0 * HOUR);
+    let (code_rc, out, err) = env.sm(&["import", "sessions"]);
+    assert_eq!(code_rc, 0, "{err}");
+    assert_eq!(
+        out.lines().collect::<Vec<_>>(),
+        [
+            "import sessions (applied): scanned=1 unchanged=0 active=0 headless=0 light=0 covered=0 \
+             unmapped=0 candidates=1 carded=1 plain=0",
+            "  repo gamma: 1",
+        ]
+    );
+    let got = cards(&env.home);
+    assert_eq!(got.len(), 1);
+    let card = &got[0];
+    assert_eq!(card.repo, "gamma");
+    assert_eq!(card.source, format!("session:{AGY_A}"));
+    assert_eq!(card.evidence, log.to_str().unwrap());
+    assert_eq!(card.tags, "session-card");
+    assert_eq!(card.title, "Alpha parser fixed and pushed");
+    assert_eq!(card.as_of, "2027-01-15T08:00:00+00:00");
+    assert!(
+        card.body.ends_with(&format!(
+            "\n\nSession {AGY_A}: owner prompts 5, commits 1, last active 2027-01-15T08:00:00+00:00."
+        )),
+        "{}",
+        card.body
+    );
+    let refs: Vec<&str> = card.refs.split_whitespace().collect();
+    assert_eq!(refs[..2], ["abc1234", beta]);
+    let calls = env.calls();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].hook, "0");
+    assert!(
+        calls[0].stdin.starts_with(
+            "Owner: step 0 of the beta work\n\nAgent: Done with step 0.\n\nOwner: step 1"
+        ),
+        "{}",
+        calls[0].stdin
+    );
+}
+
+#[test]
+fn repo_alias_names_the_repo_of_an_agy_conversation() {
+    let env = Env::new();
+    let code = env.agy_config();
+    let (beta, gamma) = (code.join("beta/a.py"), code.join("gamma/b.py"));
+    let (beta, gamma) = (beta.to_str().unwrap(), gamma.to_str().unwrap());
+    // beta twice per step, gamma once: beta-main
+    env.agy(
+        AGY_A,
+        &agy_rows(5, "beta", &[gamma, beta, beta]),
+        now_epoch() - 2.0 * HOUR,
+    );
+    let (_, out, err) = env.sm(&["import", "sessions", "--dry-run"]);
+    assert_eq!(
+        out.lines().nth(1),
+        Some("  repo beta-main: 1"),
+        "{out}{err}"
+    );
+}
+
+#[test]
+fn dispatched_agy_run_gets_no_card() {
+    let env = Env::new();
+    let code = env.agy_config();
+    let beta = code.join("beta/a.py");
+    let rows = agy_rows(6, "beta", &[beta.to_str().unwrap()]);
+    let t = now_epoch() - 2.0 * HOUR;
+    env.agy(AGY_A, &rows, t);
+    env.agy(AGY_B, &rows, t);
+    let task = env.tmp.join("dispatch/run-1");
+    common::write(&task.join("session.id"), &format!("{AGY_B}\n"));
+    let gone = env.tmp.join("dispatch/run-gone");
+    common::write(
+        &env.tmp.join(".gemini/agy-ledger.jsonl"),
+        &format!(
+            "{}\nnot json\n{}\n{{\"label\": \"no task dir\"}}\n",
+            json!({"task_dir": task, "status": "SUCCESS"}),
+            json!({"task_dir": gone, "status": "ERROR"})
+        ),
+    );
+    let (rc, out, err) = env.sm(&["import", "sessions"]);
+    assert_eq!(rc, 0, "{err}");
+    assert_eq!(
+        out.lines().next(),
+        Some(
+            "import sessions (applied): scanned=1 unchanged=0 active=0 headless=1 light=0 covered=0 \
+             unmapped=0 candidates=1 carded=1 plain=0"
+        )
+    );
+    assert_eq!(sources(&env.home), [format!("session:{AGY_A}")]);
+    // the second run reads neither again
+    let (_, out, _) = env.sm(&["import", "sessions"]);
+    assert!(
+        out.starts_with("import sessions (applied): scanned=0 unchanged=2 "),
+        "{out}"
+    );
+}
+
+#[test]
+fn agy_needs_min_prompts_and_idle_time_and_maps_no_path_to_unassigned() {
+    let env = Env::new();
+    env.agy_config();
+    let t = now_epoch() - 2.0 * HOUR;
+    // 4 prompts and a commit: light (a commit does not stand in for prompts)
+    let mut few = agy_rows(4, "few", &[]);
+    few.push(agy_step(
+        "",
+        &[("run_command", "CommandLine", "git commit -m x")],
+    ));
+    few.push(json!({"type": "GENERIC", "created_at": AGY_TS, "content": "[main def5678] x"}));
+    env.agy(AGY_A, &few, t);
+    // 5 prompts naming no repo path: a card in unassigned
+    env.agy(AGY_B, &agy_rows(5, "home", &["/etc/hosts"]), t);
+    // still in use
+    env.agy(SID_C, &agy_rows(9, "busy", &[]), now_epoch() - 600.0);
+    let (_, out, err) = env.sm(&["import", "sessions", "--dry-run"]);
+    assert_eq!(
+        out.lines().collect::<Vec<_>>(),
+        [
+            "import sessions (dry-run): scanned=2 unchanged=0 active=1 headless=0 light=1 \
+             covered=0 unmapped=0 candidates=1 carded=0 plain=0",
+            "  repo unassigned: 1",
+        ],
+        "{err}"
+    );
+}
+
+#[test]
+fn empty_agy_root_turns_the_source_off_and_a_missing_one_reads_nothing() {
+    let env = Env::new();
+    env.agy(AGY_A, &agy_rows(5, "x", &[]), now_epoch() - 2.0 * HOUR);
+    let off = "import sessions (dry-run): scanned=0 unchanged=0 active=0 headless=0 light=0 \
+               covered=0 unmapped=0 candidates=0 carded=0 plain=0";
+    env.write_config("agy_root = \"\"", "", None);
+    let (rc, out, err) = env.sm(&["import", "sessions", "--dry-run"]);
+    assert_eq!((rc, out.trim_end()), (0, off), "{err}");
+    let missing = env.tmp.join("no-brain");
+    env.write_config(&format!("agy_root = \"{}\"", missing.display()), "", None);
+    let (rc, out, err) = env.sm(&["import", "sessions", "--dry-run"]);
+    assert_eq!((rc, out.trim_end()), (0, off), "{err}");
+}
+
+#[test]
+fn agy_conversation_that_ran_sm_put_or_is_named_by_an_item_is_covered() {
+    let env = Env::new();
+    env.agy_config();
+    let t = now_epoch() - 2.0 * HOUR;
+    let mut put = agy_rows(5, "put", &[]);
+    put.push(agy_step(
+        "",
+        &[("run_command", "CommandLine", "sm put 'done' --tag executed")],
+    ));
+    env.agy(AGY_A, &put, t);
+    env.agy(AGY_B, &agy_rows(5, "named", &[]), t);
+    store_at(&env.home, "task:x", &format!("brain/{AGY_B}"), "2099-01-01");
+    let (_, out, err) = env.sm(&["import", "sessions", "--dry-run"]);
+    assert!(
+        out.starts_with(
+            "import sessions (dry-run): scanned=2 unchanged=0 active=0 headless=0 light=0 \
+             covered=2 unmapped=0 candidates=0"
+        ),
+        "{out}{err}"
+    );
+}
+
+#[test]
+fn agy_work_after_an_item_needs_min_prompts_of_its_own() {
+    let env = Env::new();
+    env.agy_config();
+    let t = now_epoch() - 2.0 * HOUR;
+    let at = |rows: Vec<Value>, ts: &str| -> Vec<Value> {
+        rows.into_iter()
+            .map(|mut r| {
+                r["created_at"] = json!(ts);
+                r
+            })
+            .collect()
+    };
+    // A: 5 prompts, an item up to 09:00, 5 more prompts at 10:00: a card of the later part
+    let mut a = at(agy_rows(5, "early", &[]), "2027-01-15T08:00:00Z");
+    a.extend(at(agy_rows(5, "late", &[]), "2027-01-15T10:00:00Z"));
+    env.agy(AGY_A, &a, t);
+    // B: an item up to 09:00, then 1 prompt and a commit: covered
+    let mut b = at(agy_rows(5, "early", &[]), "2027-01-15T08:00:00Z");
+    let mut late = agy_rows(1, "late", &[]);
+    late.push(agy_step(
+        "",
+        &[("run_command", "CommandLine", "git commit -m y")],
+    ));
+    late.push(json!({"type": "GENERIC", "content": "[main aaa1111] y"}));
+    b.extend(at(late, "2027-01-15T10:00:00Z"));
+    env.agy(AGY_B, &b, t);
+    // one item names both (two equal items would dedupe into one)
+    let evidence = format!("brain/{AGY_A} brain/{AGY_B}");
+    store_at(&env.home, "task:ab", &evidence, "2027-01-15T09:00:00+00:00");
+    let (rc, out, err) = env.sm(&["import", "sessions"]);
+    assert_eq!(rc, 0, "{err}");
+    assert!(
+        out.contains(" covered=1 unmapped=0 candidates=1 carded=1 "),
+        "{out}"
+    );
+    let got = cards(&env.home);
+    assert_eq!(got.len(), 1);
+    assert!(
+        got[0].body.ends_with(&format!(
+            "Session {AGY_A}, work after 2027-01-15T09:00:00+00:00: owner prompts 5, commits 0, \
+             last active 2027-01-15T10:00:00+00:00."
+        )),
+        "{}",
+        got[0].body
+    );
+    assert!(
+        env.calls()[0]
+            .stdin
+            .starts_with("Owner: step 0 of the late work")
+    );
+}

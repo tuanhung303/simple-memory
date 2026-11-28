@@ -79,6 +79,7 @@ pub fn defaults() -> PyValue {
             dict(vec![
                 ("enabled", PyValue::Bool(true)),
                 ("root", s("~/.claude/projects")),
+                ("agy_root", s("~/.gemini/antigravity-cli/brain")),
                 ("idle_minutes", int(60)),
                 ("since_days", int(14)),
                 ("min_prompts", int(5)),
@@ -168,7 +169,7 @@ pub const NOTES: &[(&str, &str)] = &[
     ),
     (
         "capture",
-        "Session cards for idle Claude Code sessions with real work and no item (Haiku).",
+        "Session cards for idle Claude Code sessions and agy conversations (agy_root; \"\" turns it off) with real work and no item (Haiku).",
     ),
     (
         "automemory",
