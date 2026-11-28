@@ -56,7 +56,7 @@ fn env() -> Env {
     write(
         &home.join("config.toml"),
         &format!(
-            "[automemory]\nroot = \"{}\"\n[capture]\nroot = \"{}\"\n[upkeep]\ntasklog_roots = [\"{}\"]\nhandoff_dirs = []\n",
+            "[automemory]\nroot = \"{}\"\n[capture]\nroot = \"{}\"\nagy_root = \"\"\n[upkeep]\ntasklog_roots = [\"{}\"]\nhandoff_dirs = []\n",
             am.display(),
             transcripts.display(),
             gh.display()
@@ -2407,7 +2407,7 @@ fn catchup_on_a_new_home_skips_the_backup() {
     write(
         &home.join("config.toml"),
         &format!(
-            "[automemory]\nroot = \"{0}\"\n[capture]\nroot = \"{0}\"\n[upkeep]\ntasklog_roots = []\nhandoff_dirs = []\n",
+            "[automemory]\nroot = \"{0}\"\n[capture]\nroot = \"{0}\"\nagy_root = \"\"\n[upkeep]\ntasklog_roots = []\nhandoff_dirs = []\n",
             empty.display()
         ),
     );
@@ -2447,7 +2447,7 @@ fn catchup_skips_automemory_and_sessions_when_off() {
     write(
         &home.join("config.toml"),
         &format!(
-            "[automemory]\nroot = \"{0}\"\n[capture]\nroot = \"{0}\"\n",
+            "[automemory]\nroot = \"{0}\"\n[capture]\nroot = \"{0}\"\nagy_root = \"\"\n",
             gone.display()
         ),
     );
@@ -2542,7 +2542,7 @@ fn cli_env() -> Env {
     write(
         &home.join("config.toml"),
         &format!(
-            "[automemory]\nroot = \"{}\"\n[capture]\nroot = \"{}\"\n[upkeep]\ntasklog_roots = []\nhandoff_dirs = []\n",
+            "[automemory]\nroot = \"{}\"\n[capture]\nroot = \"{}\"\nagy_root = \"\"\n[upkeep]\ntasklog_roots = []\nhandoff_dirs = []\n",
             am.display(),
             transcripts.display()
         ),

@@ -953,7 +953,7 @@ fn decide(
     Ok(("candidate", origin.scan(path, dialogue_chars, Some(t))?))
 }
 
-pub const COUNT_KEYS: [&str; 10] = [
+pub const COUNT_KEYS: [&str; 11] = [
     "scanned",
     "unchanged",
     "active",
@@ -964,6 +964,7 @@ pub const COUNT_KEYS: [&str; 10] = [
     "candidates",
     "carded",
     "plain",
+    "unreadable",
 ];
 
 /// The dict `capture_sessions` returns.
@@ -1095,9 +1096,19 @@ pub fn capture_sessions(
             }
             counts["scanned"] += 1;
             let chars = int_of(cfg_get(cap_cfg, "dialogue_chars")?)?;
-            let scan = origin.scan(&path, chars, None)?;
-            let (mut decision, scan) =
-                decide(scan, origin, &path, min_prompts, &hex8, &full, chars)?;
+            let read = origin
+                .scan(&path, chars, None)
+                .and_then(|scan| decide(scan, origin, &path, min_prompts, &hex8, &full, chars));
+            // a file that is not UTF-8 (a log cut inside a character) skips only that file;
+            // the state entry retries it once it changes
+            let (mut decision, scan) = match read {
+                Err(e) if e.python_name() == "UnicodeDecodeError" => {
+                    counts["unreadable"] += 1;
+                    state_set(&mut state, &sid, &path, size, mt, "unreadable");
+                    continue;
+                }
+                r => r?,
+            };
             let mut repo = String::new();
             if decision == "candidate" {
                 repo = match origin {

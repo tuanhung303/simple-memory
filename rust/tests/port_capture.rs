@@ -200,8 +200,14 @@ impl Env {
         let bin = claude_bin
             .map(|b| format!("[prompt_hook]\nclaude_bin = \"{}\"\n", b.display()))
             .unwrap_or_default();
+        // agy stays off unless the test sets it: the default agy_root is under the real HOME
+        let agy = if capture_extra.contains("agy_root") {
+            ""
+        } else {
+            "agy_root = \"\"\n"
+        };
         let text = format!(
-            "[capture]\nroot = \"{}\"\n{capture_extra}\n{bin}{other}",
+            "[capture]\nroot = \"{}\"\n{agy}{capture_extra}\n{bin}{other}",
             self.root.display()
         );
         common::write(&self.home.join("config.toml"), &text);
@@ -1321,7 +1327,7 @@ fn cli_import_sessions_dry_run_prints_counts() {
         out.lines().collect::<Vec<_>>(),
         [
             "import sessions (dry-run): scanned=1 unchanged=0 active=0 headless=0 light=0 covered=0 \
-             unmapped=0 candidates=1 carded=0 plain=0",
+             unmapped=0 candidates=1 carded=0 plain=0 unreadable=0",
             "  repo alpha: 1",
         ]
     );
@@ -1590,7 +1596,7 @@ fn agy_conversation_gets_one_card_with_the_repo_its_paths_name_most() {
         out.lines().collect::<Vec<_>>(),
         [
             "import sessions (applied): scanned=1 unchanged=0 active=0 headless=0 light=0 covered=0 \
-             unmapped=0 candidates=1 carded=1 plain=0",
+             unmapped=0 candidates=1 carded=1 plain=0 unreadable=0",
             "  repo gamma: 1",
         ]
     );
@@ -1670,7 +1676,7 @@ fn dispatched_agy_run_gets_no_card() {
         out.lines().next(),
         Some(
             "import sessions (applied): scanned=1 unchanged=0 active=0 headless=1 light=0 covered=0 \
-             unmapped=0 candidates=1 carded=1 plain=0"
+             unmapped=0 candidates=1 carded=1 plain=0 unreadable=0"
         )
     );
     assert_eq!(sources(&env.home), [format!("session:{AGY_A}")]);
@@ -1704,7 +1710,7 @@ fn agy_needs_min_prompts_and_idle_time_and_maps_no_path_to_unassigned() {
         out.lines().collect::<Vec<_>>(),
         [
             "import sessions (dry-run): scanned=2 unchanged=0 active=1 headless=0 light=1 \
-             covered=0 unmapped=0 candidates=1 carded=0 plain=0",
+             covered=0 unmapped=0 candidates=1 carded=0 plain=0 unreadable=0",
             "  repo unassigned: 1",
         ],
         "{err}"
@@ -1716,7 +1722,7 @@ fn empty_agy_root_turns_the_source_off_and_a_missing_one_reads_nothing() {
     let env = Env::new();
     env.agy(AGY_A, &agy_rows(5, "x", &[]), now_epoch() - 2.0 * HOUR);
     let off = "import sessions (dry-run): scanned=0 unchanged=0 active=0 headless=0 light=0 \
-               covered=0 unmapped=0 candidates=0 carded=0 plain=0";
+               covered=0 unmapped=0 candidates=0 carded=0 plain=0 unreadable=0";
     env.write_config("agy_root = \"\"", "", None);
     let (rc, out, err) = env.sm(&["import", "sessions", "--dry-run"]);
     assert_eq!((rc, out.trim_end()), (0, off), "{err}");
@@ -1857,5 +1863,96 @@ fn agy_commit_in_a_cut_command_counts_from_the_full_output_file_in_its_steps_fol
         !card.refs.contains("fed4321") && !card.refs.contains("0dd0dd0"),
         "{}",
         card.refs
+    );
+}
+
+#[test]
+fn agy_full_output_through_a_symlink_or_past_the_size_cap_is_not_read() {
+    let env = Env::new();
+    env.agy_config();
+    let generated = env.agy_root().join(AGY_A).join(".system_generated");
+    // steps/9 links to a folder outside the conversation
+    let outside = env.tmp.join("secret");
+    common::write(&outside.join("out.txt"), "[main 5ec5ec5] outside subject\n");
+    std::fs::create_dir_all(generated.join("steps")).unwrap();
+    std::os::unix::fs::symlink(&outside, generated.join("steps/9")).unwrap();
+    // steps/10 holds a commit line only past the first 16 MiB
+    let big = generated.join("steps/10/output.txt");
+    let mut text = "x".repeat(16 * 1024 * 1024);
+    text.push_str("\n[main b16b16b] past the cap\n");
+    common::write(&big, &text);
+    let note = |file: String| {
+        json!({"step_index": 9, "source": "MODEL", "type": "GENERIC", "status": "DONE",
+        "created_at": AGY_TS, "content": format!("The tool's output was truncated due to being \
+        too long. You can find the full output in a file at file://{file}.\n\nHere is a preview:\nx")})
+    };
+    let mut rows = agy_rows(5, "link", &[]);
+    rows.push(agy_step(
+        "",
+        &[("run_command", "CommandLine", "git commit -m a")],
+    ));
+    rows.push(note(format!("{}/steps/9/out.txt", generated.display())));
+    rows.push(note(big.display().to_string()));
+    env.agy(AGY_A, &rows, now_epoch() - 2.0 * HOUR);
+    let (rc, _, err) = env.sm(&["import", "sessions"]);
+    assert_eq!(rc, 0, "{err}");
+    let got = cards(&env.home);
+    assert_eq!(got.len(), 1);
+    assert!(
+        got[0].body.contains("owner prompts 5, commits 0,"),
+        "{}",
+        got[0].body
+    );
+    assert!(
+        !got[0].refs.contains("5ec5ec5") && !got[0].refs.contains("b16b16b"),
+        "{}",
+        got[0].refs
+    );
+}
+
+#[test]
+fn a_file_that_is_not_utf8_is_counted_unreadable_and_the_run_goes_on() {
+    let env = Env::new();
+    let code = env.agy_config();
+    let t = now_epoch() - 2.0 * HOUR;
+    // agy was writing a row when the log was read: it ends inside "ử"
+    let beta = code.join("beta/a.py");
+    let log = env.agy(AGY_A, &agy_rows(5, "beta", &[beta.to_str().unwrap()]), t);
+    let mut bytes = std::fs::read(&log).unwrap();
+    bytes.extend_from_slice(b"{\"type\":\"USER_INPUT\",\"content\":\"s\xe1\xbb");
+    std::fs::write(&log, bytes).unwrap();
+    set_mtime(&log, t);
+    // a whole agy conversation, and a ledger with a row and a session.id that are not UTF-8
+    env.agy(AGY_B, &agy_rows(5, "beta", &[beta.to_str().unwrap()]), t);
+    let task = env.tmp.join("dispatch/run-1");
+    std::fs::create_dir_all(&task).unwrap();
+    std::fs::write(task.join("session.id"), b"\xff\xfe\n").unwrap();
+    let ledger = env.tmp.join(".gemini/agy-ledger.jsonl");
+    let mut rows = b"{\"task_dir\": \"\xff\"}\n".to_vec();
+    rows.extend_from_slice(format!("{}\n", json!({"task_dir": task})).as_bytes());
+    common::write(&ledger, "");
+    std::fs::write(&ledger, rows).unwrap();
+    // a Claude Code transcript that is not UTF-8 either
+    let bad = env.transcript(SID_A, &work_rows(&env.repo, 5), t);
+    let mut bytes = std::fs::read(&bad).unwrap();
+    bytes.extend_from_slice(b"{\"type\":\"user\",\"x\":\"\xff\"}\n");
+    std::fs::write(&bad, bytes).unwrap();
+    set_mtime(&bad, t);
+    let (rc, out, err) = env.sm(&["import", "sessions"]);
+    assert_eq!(rc, 0, "{err}");
+    assert_eq!(
+        out.lines().collect::<Vec<_>>(),
+        [
+            "import sessions (applied): scanned=3 unchanged=0 active=0 headless=0 light=0 covered=0 \
+             unmapped=0 candidates=1 carded=1 plain=0 unreadable=2",
+            "  repo beta-main: 1",
+        ]
+    );
+    assert_eq!(sources(&env.home), [format!("session:{AGY_B}")]);
+    // the state remembers the unreadable files until they change
+    let (_, out, _) = env.sm(&["import", "sessions"]);
+    assert!(
+        out.starts_with("import sessions (applied): scanned=0 unchanged=3 "),
+        "{out}"
     );
 }

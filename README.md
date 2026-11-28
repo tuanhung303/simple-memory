@@ -271,7 +271,7 @@ Counters that `sm import catch-up` (one line per part), `sm doctor --imports` an
 | `not_stored` | files with no item yet, or whose body changed since the import |
 | `inserted` | items stored in this run |
 | `failed_rows` | files or rows that could not be imported (`sm doctor --imports` names the files) |
-| `unreadable` | files that could not be parsed |
+| `unreadable` | files that could not be parsed (sessions: a transcript or agy log that is not UTF-8, such as one cut inside a character; read again once it changes) |
 | `unmapped` | memory files, or Claude Code sessions, whose folder maps to no repo (set `[repos] roots`); an agy conversation takes the repo its tool-call paths name most, else `unassigned` |
 | `stored_tasks_without_file`, `stored_without_file` | active items whose file is gone |
 | `added`, `updated`, `retired`, `unchanged` | memory files: new item, changed item, item retired because its file is gone, no change |

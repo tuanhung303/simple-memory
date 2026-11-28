@@ -482,7 +482,7 @@ fn a_malformed_prompt_hook_does_not_raise_before_a_claude_call() {
     std::fs::create_dir_all(&root).unwrap();
     std::fs::write(
         format!("{home}/config.toml"),
-        format!("[capture]\nroot = \"{root}\"\n"),
+        format!("[capture]\nroot = \"{root}\"\nagy_root = \"\"\n"),
     )
     .unwrap();
     let mut cfg = simple_memory::config::load_config(Some(&home)).unwrap();

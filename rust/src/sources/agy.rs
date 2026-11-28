@@ -7,9 +7,10 @@
 //! no link from a tool output to its call (agy 1.5.16, probed 2026-11-28).
 
 use std::collections::HashSet;
+use std::io::Read;
 
 use crate::error::SmError;
-use crate::py::path::{Errors, PyPath};
+use crate::py::path::{Errors, PyPath, decode_text};
 use crate::py::str::{slice, strip};
 use crate::py::value::PyValue;
 use crate::sources::transcript::{
@@ -65,9 +66,12 @@ fn arg_text(raw: &str) -> String {
 const CUT_ARG: &str = "\n<truncated ";
 /// agy keeps only a preview of a long tool output in the log; the note names the full file.
 const CUT_OUTPUT: &str = "You can find the full output in a file at file://";
+/// The most of a full output file read (the largest real one was 9.8 MB, 2026-11-28).
+const MAX_OUTPUT_BYTES: u64 = 16 * 1024 * 1024;
 
 /// The full output a cut `GENERIC` row names, read only from this conversation's
-/// `.system_generated/steps/` folder; "" when the row is whole or the file is gone.
+/// `.system_generated/steps/` folder (after symlinks resolve) and only its first
+/// MAX_OUTPUT_BYTES; "" when the row is whole or the file is gone or outside.
 fn full_output(log: &PyPath, content: &str) -> String {
     let Some((_, rest)) = content.split_once(CUT_OUTPUT) else {
         return String::new();
@@ -78,11 +82,22 @@ fn full_output(log: &PyPath, content: &str) -> String {
     if !named.starts_with(&steps) || named.split('/').any(|part| part == "..") {
         return String::new();
     }
-    let file = PyPath::new(named);
-    if !file.is_file() {
+    let (Ok(real), Ok(real_steps)) = (
+        std::fs::canonicalize(named),
+        std::fs::canonicalize(steps.trim_end_matches('/')),
+    ) else {
+        return String::new();
+    };
+    if !real.starts_with(&real_steps) || !real.is_file() {
         return String::new();
     }
-    file.read_text(Errors::Replace).unwrap_or_default()
+    let mut bytes = Vec::new();
+    let read =
+        std::fs::File::open(&real).and_then(|f| f.take(MAX_OUTPUT_BYTES).read_to_end(&mut bytes));
+    match read {
+        Ok(_) => decode_text(&bytes, Errors::Replace).unwrap_or_default(),
+        Err(_) => String::new(),
+    }
 }
 
 /// An argument that is one absolute path (a `file://` URI counts), else None.
@@ -217,8 +232,8 @@ pub fn scan_agy(
 }
 
 /// The conversation ids agy-dispatch started (the `session.id` in each ledger row's
-/// `task_dir`); empty when the ledger file is missing. A row whose folder or id file is gone
-/// names no id.
+/// `task_dir`); empty when the ledger file is missing. A row that is not UTF-8 JSON, or whose
+/// folder or id file is gone or unreadable, names no id.
 pub fn dispatched_ids(ledger: &PyPath) -> Result<HashSet<String>, SmError> {
     let mut ids = HashSet::new();
     if !ledger.is_file() {
@@ -226,7 +241,8 @@ pub fn dispatched_ids(ledger: &PyPath) -> Result<HashSet<String>, SmError> {
     }
     let mut lines = TextLines::open(ledger)?;
     while let Some(raw) = lines.next_bytes()? {
-        let Some(PyValue::Dict(row)) = row_of(&raw)? else {
+        // a row that is not UTF-8 JSON names no id, like one that is not JSON
+        let Ok(Some(PyValue::Dict(row))) = row_of(&raw) else {
             continue;
         };
         let dir = str_of(dict_get(&row, "task_dir"));
@@ -234,11 +250,12 @@ pub fn dispatched_ids(ledger: &PyPath) -> Result<HashSet<String>, SmError> {
             continue;
         }
         let id_file = PyPath::new(dir).join("session.id");
-        if id_file.is_file() {
-            let id = strip(&id_file.read_text(Errors::Strict)?).to_string();
-            if !id.is_empty() {
-                ids.insert(id);
-            }
+        // an id file that cannot be read as UTF-8 names no id
+        if id_file.is_file()
+            && let Ok(text) = id_file.read_text(Errors::Strict)
+            && !strip(&text).is_empty()
+        {
+            ids.insert(strip(&text).to_string());
         }
     }
     Ok(ids)
